@@ -97,16 +97,13 @@ The following examples all use the prompt "test one two" with a fixed seed of `-
 - half(fp16) UNET and half(fp16) latents [`--latents-half`]
 - full(fp32) UNET and full(fp32) latents [`--unet-full`]
   
-<img src="./examples/fp16_unet_fp32_latents.png" width="30%" height=25%/>
-<img src="./examples/fp16_unet_fp16_latents.png" width="30%" height=25%/>
-<img src="./examples/fp32_unet_fp32_latents.png" width="30%" height=25%/>
+<img src="./examples/fp16_unet_fp32_latents.png" width="30%" height=25%/> <img src="./examples/fp16_unet_fp16_latents.png" width="30%" height=25%/> <img src="./examples/fp32_unet_fp32_latents.png" width="30%" height=25%/>
 
 Visualization of the difference between outputs in this example (highlighting of pixels where the differences are greater than a 1% fuzz threshold):
 - half(fp16) latents compared to full(fp32) latents (with UNET at full(fp32) precision)
 - half(fp16) UNET compared to full(fp32) UNET (with latents at full(fp32) precision)
 
-<img src="./examples/compare_latent_precision.png" width="30%" height=25%/>
-<img src="./examples/compare_unet_precision.png" width="30%" height=25%/>
+<img src="./examples/compare_latent_precision.png" width="30%" height=25%/> <img src="./examples/compare_unet_precision.png" width="30%" height=25%/>
 
 #
 # Discord bot
