@@ -1,3 +1,11 @@
+# pyproject if present
+pyproject.toml
+# repo specific files
+outputs/
+bot_token.py
+config.json
+diffusion_pytorch_model.bin
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
