@@ -99,7 +99,7 @@ def main():
 
     # if interpolation is requested, run interpolation instead!
     if args.interpolation_targets is not None:
-        # swap places between UNET and VAE to speed up large batch decode. then swap back.
+        # swap places between UNET and VAE to speed up large batch decode.
         unet = unet.to(IO_DEVICE)
         vae = vae.to(DIFFUSION_DEVICE)
         create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae)
@@ -107,7 +107,7 @@ def main():
 
     init_image = None
     if args.init_img_path is not None:
-        init_image = Image.open(args.init_img_path).convert("RGB") #.resize((args.width, args.height))
+        init_image = Image.open(args.init_img_path).convert("RGB")
     args.strength = args.strength if args.strength < 1.0 else 1.0
     args.strength = args.strength if args.strength > 0.0 else 0.0
     generate_exec = generate_segmented(tokenizer=tokenizer,text_encoder=text_encoder,unet=unet,vae=vae,IO_DEVICE=IO_DEVICE,UNET_DEVICE=DIFFUSION_DEVICE,rate_nsfw=rate_nsfw,half_precision_latents=args.half_latents)
@@ -118,7 +118,6 @@ def main():
         out, SUPPLEMENTARY = generate_exec(prompts*args.n_samples, width=args.width, height=args.height, steps=args.steps, gs=args.guidance_scale, seed=args.seed, sched_name=args.sched_name, eta=args.ddim_eta, eta_seed=args.eta_seed, init_image=init_image, img_strength=args.strength, animate=args.animate, save_latents=save_latents)
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
-        #print(f"latent is {final_latent.element_size()*final_latent.nelement()} Bytes: {final_latent.nelement()} items with size of {final_latent.element_size()} - shape: {final_latent.size()}")
         PIL_animation_frames = argdict.pop("image_sequence")
         argdict.pop("time")
         if argdict["width"] == 512:
@@ -156,15 +155,7 @@ def main():
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
                     torch.cuda.empty_cache()
-                    #tqdm.write(f"Memory alloc: {torch.cuda.memory_allocated(0)}")
-                """
-                for obj in gc.get_objects():
-                    try:
-                        if (torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data))) and not isinstance(obj, torch.nn.parameter.Parameter):
-                            print(type(obj), obj.size())
-                    except:
-                        pass
-                """
+
                 next_frame = out[0]
                 frames.append(next_frame.copy())
                 resampling_filter = Image.Resampling.BILINEAR
@@ -175,6 +166,7 @@ def main():
                 if args.img_rotation !=0 or args.img_zoom !=0:
                     enhancer_sharpen = ImageEnhance.Sharpness(next_frame)
                     next_frame = enhancer_sharpen.enhance(args.cycle_sharpen)
+                    # contrast does not seem to decay too much. Keep unchanged.
                     #enhancer_contrast = ImageEnhance.Contrast(next_frame)
                     #next_frame = enhancer_contrast.enhance(1.1)
                 init_image = next_frame
@@ -248,24 +240,12 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
     vae.to(IO_DEVICE)
     text_encoder.to(IO_DEVICE)
     unet.to(UNET_DEVICE)
-    # print(f"{type(tokenizer)} {type(text_encoder)} {type(unet)} {type(vae)}")
     def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
             torch.cuda.empty_cache()
         with torch.no_grad():
-            # animate create image_sequence of PIL images in SUPPLEMENTARY
-            # high_beta uses scheduler default betas instead of SD pipline default betas
-            # eta sets randomness when using ddim
-            # eta_seed sets secondary seed for this randomness (same seed, some eta, varied eta_seed can do variations)
             START_TIME = time()
-            #prompt = ["a photograph of an astronaut riding a horse"]
-            #height = 512                        # default height of Stable Diffusion
-            #width = 512                         # default width of Stable Diffusion
-            
-            #num_inference_steps = 100           # Number of denoising steps
-            #guidance_scale = 7.5                # Scale for classifier-free guidance
-            #generator = torch.manual_seed(0)    # Seed generator to create the initial latent noise
 
             SUPPLEMENTARY = {
                 "io" : {
@@ -305,12 +285,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
             generator_eta = torch.manual_seed(eta_seed)
             generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
-            """if init_image is not None:
-                generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
-            else:
-                generator_unet = torch.manual_seed(seed)"""
-            
-            # generator_io = torch.Generator(IO_DEVICE).manual_seed(seed)
+
             batch_size = len(prompt)
             sched_name = sched_name.lower().strip()
             SUPPLEMENTARY["io"]["sched_name"]=sched_name
@@ -325,7 +300,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             SUPPLEMENTARY["io"]["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in SUPPLEMENTARY["io"]["text_readback"]]
             SUPPLEMENTARY["io"]["attention"] = text_input.attention_mask.cpu().numpy().tolist()
             # TODO: implement custom attention masks!
-            # tqdm.write(str(SUPPLEMENTARY["io"]["text_readback"]))
+
             text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE))[0]
             max_length = text_input.input_ids.shape[-1]
             uncond_input = tokenizer([""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt")
@@ -458,14 +433,12 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             pil_images, has_nsfw = to_pil(image)
             SUPPLEMENTARY["io"]["nsfw"] = has_nsfw
             if animate:
-                # send items to device temporarily instead (inline)
-                #for item in SUPPLEMENTARY["latent"]["latent_sequence"]:
-                #     item = item.to(IO_DEVICE)
                 # swap places between UNET and VAE to speed up large batch decode. then swap back.
                 unet.to(IO_DEVICE)
                 vae.to(DIFFUSION_DEVICE)
                 torch.cuda.synchronize()
                 with torch.no_grad():
+                    # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
                     SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae.decode(item.to(DIFFUSION_DEVICE) * (1 / 0.18215)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
                 torch.cuda.synchronize()
                 vae.to(IO_DEVICE)
@@ -477,20 +450,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
 
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False):
-    if isinstance(imgs, dict):
-        pass
-        # for raw pipeline output, deprecated. also probably incorrect.
-        """
-        if len(imgs["sample"]) == 0:
-            multiple_images = True
-            img = imgs["sample"][0]
-            imgs = imgs["sample"]
-        else:
-            multiple_images = False
-            imgs = imgs["sample"]
-            img = image_autogrid(imgs)
-        """
-    elif isinstance(imgs, list):
+    if isinstance(imgs, list):
         if len(imgs) > 1:
             multiple_images = True
             img = image_autogrid(imgs)
@@ -500,7 +460,6 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
     else:
         multiple_images = False
         img = imgs
-    #raise TypeError(f"save_output requires image input to be either dict, list[Image] or Image, got {type(imgs)}")
 
     grid_latent_string = tensor_to_encoded_string(latents)
     # keep original shape: tensor[image_index][...], by creating tensor with only one index
@@ -620,7 +579,6 @@ def get_safety_checker(device="cpu", safety_model_id = "CompVis/stable-diffusion
         x_image = x_image_in.copy()
         safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
         safety_checker_input.to(device)
-        #with Suppress_out(): # does not work, use env var instead!
         x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
         if True in has_nsfw_concept:
             tqdm.write("Warning: potential NSFW content detected!")
@@ -697,10 +655,6 @@ def create_interpolation(a, b, steps, vae):
     with torch.no_grad():
         # processing images in target device one-by-one saves VRAM.
         image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
-        #image_sequence = to_pil(vae.decode(interpolated.to(DIFFUSION_DEVICE) * (1 / 0.18215)))
-    # currently a waste of time, as the program exits after this is done.
-    #vae = vae.to(IO_DEVICE)
-    #unet = unet.to(DIFFUSION_DEVICE)
     save_animations([image_sequence])
 
 class Suppress_out:
