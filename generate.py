@@ -371,12 +371,12 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             starting_timestep = 0
             # initial noise latents
             if init_image is None:
-                SUPPLEMENTARY["io"]["strength"] = img_strength
                 latents = torch.randn((batch_size, unet.in_channels, height // 8, width // 8), device=IO_DEVICE, generator=generator_unet)
                 if half_precision_latents:
                     latents = latents.to(dtype=torch.float16)
                 latents = latents.to(UNET_DEVICE)
             else:
+                SUPPLEMENTARY["io"]["strength"] = img_strength
                 init_image = init_image.resize((width,height), resample=Image.Resampling.LANCZOS)
                 image_processing = np.array(init_image).astype(np.float32) / 255.0
                 image_processing = image_processing[None].transpose(0, 3, 1, 2)
