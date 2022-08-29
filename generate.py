@@ -105,9 +105,18 @@ def main():
         create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae)
         exit()
 
+    # fix values to multiples of 64 before init image resize in case of img2img cycling
+    args.width = int(args.width/64)*64
+    args.height = int(args.height/64)*64
     init_image = None
     if args.init_img_path is not None:
         init_image = Image.open(args.init_img_path).convert("RGB")
+        if init_image.size != (args.width,args.height):
+            # if lanczos resampling is required, apply a small amount of post-sharpening
+            init_image = init_image.resize((args.width, args.height), resample=Image.Resampling.LANCZOS)
+            enhancer_sharpen = ImageEnhance.Sharpness(init_image)
+            init_image = enhancer_sharpen.enhance(1.15)
+
     args.strength = args.strength if args.strength < 1.0 else 1.0
     args.strength = args.strength if args.strength > 0.0 else 0.0
     generate_exec = generate_segmented(tokenizer=tokenizer,text_encoder=text_encoder,unet=unet,vae=vae,IO_DEVICE=IO_DEVICE,UNET_DEVICE=DIFFUSION_DEVICE,rate_nsfw=rate_nsfw,half_precision_latents=args.half_latents)
@@ -119,7 +128,6 @@ def main():
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
         PIL_animation_frames = argdict.pop("image_sequence")
-        argdict.pop("time")
         if argdict["width"] == 512:
             argdict.pop("width")
         if argdict["height"] == 512:
@@ -151,7 +159,6 @@ def main():
             for i in tqdm(range(args.img_cycles), position=0, desc="Image cycle"):
                 #with torch.no_grad():
                 out, SUPPLEMENTARY = one_generation(args.prompt, init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
-                del SUPPLEMENTARY
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -173,6 +180,14 @@ def main():
         except KeyboardInterrupt:
             # when an interrupt is received, cancel cycles and attempt to save any already generated images.
             pass
+        if not args.image_cycle_save_individual:
+            # if images are not saved on every step, save the final image separately
+            try:
+                argdict = SUPPLEMENTARY["io"]
+                final_latent = SUPPLEMENTARY['latent']['final_latent']
+                save_output(args.prompt, out, argdict, True, final_latent, False)
+            except Exception as e:
+                tqdm.write(f"Saving final image failed: {e}")
         save_animations([frames])
         exit()
 
