@@ -39,9 +39,9 @@ class command_task():
         self.response:str="no response was returned"
 
 class prompt_task():
-    def __init__(self,ctx:discord.commands.context.ApplicationContext,prompt:str,w:int=512,h:int=512,steps:int=50,gs:float=7.5,seed:int=-1,eta:float=0.0,eta_seed:int=-1,init_img:Image=None,strength=0.75):
+    def __init__(self,ctx:discord.commands.context.ApplicationContext,prompts:list,w:int=512,h:int=512,steps:int=50,gs:float=7.5,seed:int=-1,eta:float=0.0,eta_seed:int=-1,init_img:Image=None,strength=0.75):
         self.ctx = ctx
-        self.prompt = prompt
+        self.prompts = prompts
         self.w = w
         self.h = h
         self.steps = steps
@@ -62,9 +62,8 @@ class prompt_task():
 
     # params: (prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False):
     def exec(self, generate_exec):
-        prompts = [x.strip() for x in self.prompt.split("||")]
         out,SUPPLEMENTARY = generate_exec(
-            prompt=prompts,
+            prompt=self.prompts,
             width=self.w,
             height=self.h,
             steps=self.steps,
@@ -84,7 +83,7 @@ class prompt_task():
         self.filename = f"{'SPOILER_' if nsfw else 'img_'}generated"
         self.datas = []
         image_data = BytesIO()
-        full_image, full_metadata, metadata_items = save_output(self.prompt, out, argdict, SAVE_OUTPUTS_TO_DISK, final_latent, False)
+        full_image, full_metadata, metadata_items = save_output(self.prompts, out, argdict, SAVE_OUTPUTS_TO_DISK, final_latent, False)
         full_image.save(image_data, "PNG", metadata=full_metadata)
         image_data.seek(0)
         self.datas.append(image_data)
@@ -139,7 +138,7 @@ def main():
             if isinstance(task, prompt_task):
                 task.exec(generate_exec)
                 completed_tasks.append(task)
-                print(f"Done: '{task.prompt}', queued: {len(task_queue)}")
+                print(f"Done: '{task.prompts}', queued: {len(task_queue)}")
             elif isinstance(task,command_task):
                 target = task.command
                 """ # implementation appears to leak memory, requires further investigation.
@@ -233,11 +232,12 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("eta_seed",int,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default=-1)
 @discord.option("strength",float,description="Strength of img2img. 0.0 -> unchanged, 1.0 -> remade entirely. Requires valid image attachment.",required=False,default=0.0)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
-async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, init_image:discord.Attachment=None):
-    reply = run_advanced(ctx, prompt, width, height, seed, gs, steps, eta, eta_seed, strength, init_image)
+@discord.option("amount",int,description="Amount of images to batch at once.",required=False,default=1)
+async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1):
+    reply = run_advanced(ctx, prompt, width, height, seed, gs, steps, eta, eta_seed, strength, init_image, amount)
     await ctx.send_response(reply, delete_after=20.0)
 
-def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, attachment:discord.Attachment=None):
+def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, attachment:discord.Attachment=None, amount:int=1):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
     steps = steps if steps > 0 else 1
@@ -267,8 +267,9 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
         except Exception as e:
             init_img=None
             additional =  f"Unable to parse init image from message attachments: {e}. Running text-to-image only."
-
-    task_queue.append(prompt_task(ctx, prompt=prompt.strip() ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
+    prompts = [x.strip() for x in prompt.split("||")]
+    prompts *= amount
+    task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
     return f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue. {additional}"
 
 @tasks.loop(seconds=1.0)
