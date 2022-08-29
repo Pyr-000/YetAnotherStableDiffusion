@@ -202,28 +202,28 @@ async def switch_h(ctx):
 """
 
 @bot.slash_command(name="square", description="generate a default, square image (512x512)")
-@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def square(ctx, prompt:str, init_image:discord.Attachment=None):
     reply = run_advanced(ctx, prompt, attachment=init_image)
     await ctx.send_response(reply, delete_after=20.0)
 
 @bot.slash_command(name="portrait", description="generate an image with portrait aspect ratio (512x768)")
-@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def portrait(ctx, prompt:str, init_image:discord.Attachment=None):
     reply = run_advanced(ctx, prompt, height=4, attachment=init_image)
     await ctx.send_response(reply, delete_after=20.0)
 
 @bot.slash_command(name="landscape", description="generate an image with landscape aspect ratio (768x512)")
-@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
     reply = run_advanced(ctx, prompt, width=4, attachment=init_image)
     await ctx.send_response(reply, delete_after=20.0)
 
 @bot.slash_command(name="advanced", description="generate an image with custom parameters")
-@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("width",int,description="Width modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
 @discord.option("height",int,description="Height modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
 @discord.option("seed",int,description="Initial noise seed for reproducing/modifying outputs (default: -1 will select a random seed)",required=False,default=-1)
