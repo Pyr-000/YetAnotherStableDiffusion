@@ -23,7 +23,7 @@ UNET_DEVICE = "cuda"
 IO_DEVICE = "cpu"
 SAVE_OUTPUTS_TO_DISK = True
 DEFAULT_HALF_PRECISION = True
-COMMAND_PREFIX = "img>"
+COMMAND_PREFIX = "generate"
 
 OUTPUTS_DIR = "outputs/generated"
 INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
@@ -33,13 +33,13 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 
 class command_task():
-    def __init__(self,ctx:commands.context.Context,command:str) -> None:
+    def __init__(self,ctx:discord.commands.context.ApplicationContext,command:str) -> None:
         self.ctx=ctx
         self.command=command
         self.response:str="no response was returned"
 
 class prompt_task():
-    def __init__(self,ctx:commands.context.Context,prompt:str,w:int=512,h:int=512,steps:int=50,gs:float=7.5,seed:int=-1,eta:float=0.0,eta_seed:int=-1,init_img:Image=None,strength=0.75):
+    def __init__(self,ctx:discord.commands.context.ApplicationContext,prompt:str,w:int=512,h:int=512,steps:int=50,gs:float=7.5,seed:int=-1,eta:float=0.0,eta_seed:int=-1,init_img:Image=None,strength=0.75):
         self.ctx = ctx
         self.prompt = prompt
         self.w = w
@@ -96,9 +96,8 @@ class prompt_task():
                 img.save(bytes_item, "PNG", metadata=metadata)
                 bytes_item.seek(0)
             self.datas += individual_datas
-
         argdict.pop("image_sequence")
-        argdict.pop("time")
+        argdict["time"] = round(argdict["time"], 2)
         argdict.pop("attention")
         if argdict["width"] == 512:
             argdict.pop("width")
@@ -201,20 +200,47 @@ async def switch_h(ctx):
     task_queue.append(command_task(ctx,"half"))
     await ctx.reply(f"Attaching command to switch to half precision to queue! {len(task_queue)+ (1 if currently_generating else 0)} in queue.", delete_after=10.0)
 """
-@bot.slash_command("generate")
-async def generate(ctx, prompt:str):
-    await generate_advanced(ctx, prompt)
 
-@bot.slash_command("portrait")
-async def generate_p(ctx, prompt:str):
-    await generate_advanced(ctx, prompt, height=4)
+@bot.slash_command(name="square", description="generate a default, square image (512x512)")
+@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
+async def square(ctx, prompt:str, init_image:discord.Attachment=None):
+    reply = run_advanced(ctx, prompt, attachment=init_image)
+    await ctx.send_response(reply, delete_after=20.0)
 
-@bot.slash_command("landscape")
-async def generate_l(ctx, prompt:str):
-    await generate_advanced(ctx, prompt, width=4)
+@bot.slash_command(name="portrait", description="generate an image with portrait aspect ratio (512x768)")
+@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
+async def portrait(ctx, prompt:str, init_image:discord.Attachment=None):
+    reply = run_advanced(ctx, prompt, height=4, attachment=init_image)
+    await ctx.send_response(reply, delete_after=20.0)
 
-@bot.slash_command("generate_advanced")
-async def generate_advanced(ctx:commands.context.Context, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75):
+@bot.slash_command(name="landscape", description="generate an image with landscape aspect ratio (768x512)")
+@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
+async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
+    reply = run_advanced(ctx, prompt, width=4, attachment=init_image)
+    await ctx.send_response(reply, delete_after=20.0)
+
+@bot.slash_command(name="advanced", description="generate an image with custom parameters")
+@discord.option("prompt",str,description="text prompt for generating",required=True)
+@discord.option("width",int,description="Width modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
+@discord.option("height",int,description="Height modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
+@discord.option("seed",int,description="Initial noise seed for reproducing/modifying outputs (default: -1 will select a random seed)",required=False,default=-1)
+@discord.option("gs",float,description="Guidance scale (increasing may increse adherence to prompt but decrease 'creativity'). Default: 7.5",required=False,default=7.5)
+@discord.option("steps",int,description="Amount of sampling steps. More can help with detail, but increase computation time. Default: 50",required=False,default=50)
+@discord.option("eta",float,description="If >0.0, switch to the ddim sampler. Higher 'eta' -> more random noise during sampling.",required=False,default=0.0)
+@discord.option("eta_seed",int,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default=-1)
+@discord.option("strength",float,description="Strength of img2img. 0.0 -> unchanged, 1.0 -> remade entirely. Requires valid image attachment.",required=False,default=0.0)
+@discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
+async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, init_image:discord.Attachment=None):
+    reply = run_advanced(ctx, prompt, width, height, seed, gs, steps, eta, eta_seed, strength, init_image)
+    await ctx.send_response(reply, delete_after=20.0)
+
+def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, attachment:discord.Attachment=None):
+    if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
+        return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
+    steps = steps if steps > 0 else 1
     steps = steps if steps <= 150 else 150
     seed = seed if seed > 0 else -1
     eta_seed = eta_seed if eta_seed > 0 else -1
@@ -226,18 +252,24 @@ async def generate_advanced(ctx:commands.context.Context, prompt:str, width:int=
     h = h if h > 64 else 64
 
     init_img = None
-    if (len(ctx.message.attachments) > 0):
+    additional = ""
+    if attachment is not None:
         try:
-            url = ctx.message.attachments[0].url
-            r = requests.get(url, stream=True)
-            r.raw.decode_content = True # Content-Encoding
-            init_img = Image.open(r.raw).convert("RGB")
+            if not attachment.content_type.startswith("image"):
+                additional = f"Attachment must be an image! Got type {attachment.content_type}."
+            elif attachment.size > 8388608:
+                additional = "Attached file is too large! Try again with a smaller file (limit:8MB)."
+            else:
+                url = attachment.url
+                r = requests.get(url, stream=True)
+                r.raw.decode_content = True # Content-Encoding
+                init_img = Image.open(r.raw).convert("RGB")
         except Exception as e:
             init_img=None
-            await ctx.reply(f"Unable to parse init image from message attachments: {e}. Running text-to-image only.", delete_after=10.0)
+            additional =  f"Unable to parse init image from message attachments: {e}. Running text-to-image only."
 
     task_queue.append(prompt_task(ctx, prompt=prompt.strip() ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
-    await ctx.reply(f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.", delete_after=10.0)
+    return f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue. {additional}"
 
 @tasks.loop(seconds=1.0)
 async def poll():
@@ -245,14 +277,19 @@ async def poll():
     if len(completed_tasks) > 0:
         task:prompt_task
         task = completed_tasks.pop()
+        tag = task.ctx.author.mention
         if isinstance(task, prompt_task):
-            files = [discord.File(fp=data, filename=f"{task.filename}_{i}.png") for (data, i) in zip(task.datas, range(len(task.datas)))]
-            # await task.ctx.reply(task.response, file=discord.File(fp=task.data, filename=task.filename))
-            await task.ctx.reply(task.response, files=files)
+            if task.datas is not None:
+                files = [discord.File(fp=data, filename=f"{task.filename}_{i}.png") for (data, i) in zip(task.datas, range(len(task.datas)))]
+            else:
+                files=None
+            # await ctx.reply(task.response, file=discord.File(fp=task.data, filename=task.filename))
+            await task.ctx.send_followup(f"{tag} \n{task.response}", files=files)
         elif isinstance(task, command_task):
-            await task.ctx.reply(task.response, delete_after=10)
+            await task.ctx.send_followup(f"{tag} \n{task.response}", delete_after=10)
         else:
             print(f"WARNING: unknown task type found in completed_tasks queue: {type(task)}")
+        del task
     else:
         #print(f"Idle: {len(completed_tasks)}")
         pass
@@ -262,16 +299,7 @@ poll.start()
 @tasks.loop(seconds=10.0)
 async def set_status():
     global completed_tasks
-    global bot
-    await bot.change_presence(
-        status = discord.Status.online,
-        activity = discord.Activity(
-            type=discord.ActivityType.listening, 
-            name="prompt requests", 
-            state="FP16" if precision_target_half else "FP32", 
-            details=f"Queue: {len(completed_tasks) + (1 if currently_generating else 0)}"
-        )
-    )
+    # await bot.change_presence(status = discord.Status.online,activity=discord.Game(f"with diffusers. Queue: {len(completed_tasks) + (1 if currently_generating else 0)}"))
 set_status.start()
 """
 bot.run(get_token())

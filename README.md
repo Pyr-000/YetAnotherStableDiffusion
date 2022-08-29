@@ -112,8 +112,8 @@ Visualization of the difference between outputs in this example (highlighting of
 - Outputs flagged as potentially NSFW will be sent as spoilers, however, this will likely not make them exempt from any content filters or rules.
 - This script uses two threads, one for the discord bot itself, and one for running StableDiffusion. They communicate via queues of pending and completed tasks.
 - Some basic settings (saving outputs to disk, precision, devices, command prefix) can be set using global variables at the top of the script.
-- Available commands are specified via `@bot.slash_command("<command name>")`. Modifying the pre-existing commands to best serve your use-case is recommended.
-- The bot utilizes the automatic switching to image-to-image present in `generate.py`. When one or more attachments are present, the first attachment of a command message will be utilized as the input for image-to-image.
+- Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
+- The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it be utilized as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.
 
 ## Installation
@@ -130,16 +130,17 @@ pip install py-cord
 ## Usage
 - Set the bot token in `bot_token.py`.
 - Start `discord_bot.py`. The bot should now be accessible to anyone with access to whichever channels the bot is present in.
-- Example commands include:
-  - `img>generate "<text prompt>"`
-  - `img>portrait "<text prompt>"` (shortcut for 512x768 resolution images)
-  - `img>landscape "<text prompt>"` (shortcut for 768x512 resolution images)
-  - `img>generate_advanced "<text prompt>" <width> <height> <seed> <guidance_scale> <steps> <ddim_eta> <eta_seed> <img2img_strength>`
+- The bot includes the following example commands (using discord slash commands):
+  - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution. Accepts an optional image attachment for performing image-to-image
+  - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
+  - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <ddim_eta> <eta_seed> <img2img_strength> <Image attachment>`
     - `Width` and `height` are specified as multiples of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
     - if `eta` is set to a value greater than `0`, the scheduler automatically switches to `ddim`. Otherwise, `pndm` is used.
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
+- All commands come with a short documentation of their available parameters.
 
 #
 # Notes
