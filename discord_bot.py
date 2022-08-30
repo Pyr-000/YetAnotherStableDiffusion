@@ -27,7 +27,7 @@ COMMAND_PREFIX = "generate"
 
 # if set to true, requests with an amount > 1 will be queued individually to preserve VRAM
 # turning this on may make the bot spam-heavy, as each result (or error if the prompt causes one) will be a separate message
-RUN_ALL_IMAGES_INDIVIDUAL = True
+RUN_ALL_IMAGES_INDIVIDUAL = False
 
 OUTPUTS_DIR = "outputs/generated"
 INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
