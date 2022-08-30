@@ -28,6 +28,7 @@ from time import time
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 import inspect
 from io import BytesIO
+from scipy.interpolate import CubicSpline
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -39,6 +40,9 @@ DIFFUSION_DEVICE = "cuda"
 IO_DEVICE = "cpu"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
+
+# quantile range for evaluating color channel midpoints when performing color channel correction in cycled img2img
+#COLOR_CORRECTION_QUANTILE_RANGE = 0.25 # use standard deviation instead!
 
 OUTPUTS_DIR = "outputs/generated"
 ANIMATIONS_DIR = "outputs/animate"
@@ -82,6 +86,7 @@ def parse_args():
     parser.add_argument("-it", "--image-translate", type=int, help="Amount of translation (x,y tuple in pixels) for each subsequent img2img cycle", default=None, nargs=2, dest='img_translation')
     parser.add_argument("-irc", "--image-rotation-center", type=int, help="Center of rotational axis when applying rotation (0,0 -> top left corner) Default is the image center", default=None, nargs=2, dest='img_center')
     parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.2, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
+    parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep Cb/Cr color balance the same as it was initially using transfer functions. Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
     return parser.parse_args()
 
 def main():
@@ -153,10 +158,16 @@ def main():
         return out,SUPPLEMENTARY
 
     if args.img_cycles > 0:
+        colorization_averages=None
         # first frame is the initial image, if it exists.
         frames = [init_image] if init_image is not None else []
         try:
             for i in tqdm(range(args.img_cycles), position=0, desc="Image cycle"):
+                if args.cycle_color_correction and init_image is not None and colorization_averages is None:
+                    # when cycle correction is enabled, an image is present, and averages are unknown, compute them (only happens to the first image)
+                    img = init_image.convert('YCbCr')
+                    y, cb, cr = img.split()
+                    colorization_averages = (midpoint_quantile_range_mean(np.array(cb)), midpoint_quantile_range_mean(np.array(cr)))
                 #with torch.no_grad():
                 out, SUPPLEMENTARY = one_generation(args.prompt, init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
@@ -169,14 +180,26 @@ def main():
                 next_frame = next_frame.rotate(args.img_rotation, resampling_filter, expand=False, center=args.img_center, translate=args.img_translation)
                 next_frame = ImageOps.crop(next_frame, args.img_zoom)
                 next_frame = next_frame.resize((args.width,args.height), resample=Image.Resampling.LANCZOS)
-                # boost sharpness and contrast for input into next cycle to avoid having the image become softer over time.
+
+                # boost sharpness for input into next cycle to avoid having the image become softer over time.
                 if args.img_rotation !=0 or args.img_zoom !=0:
                     enhancer_sharpen = ImageEnhance.Sharpness(next_frame)
                     next_frame = enhancer_sharpen.enhance(args.cycle_sharpen)
                     # contrast does not seem to decay too much. Keep unchanged.
                     #enhancer_contrast = ImageEnhance.Contrast(next_frame)
                     #next_frame = enhancer_contrast.enhance(1.1)
+
+                # apply color channel balance corrections on CbCr channels (keep y: B/W contrast image the same).
+                if args.cycle_color_correction and colorization_averages is not None:
+                    next_frame = next_frame.convert("YCbCr")
+                    y, cb, cr = img.split()
+                    cb = rescale_channel(cb, colorization_averages[0])
+                    cr = rescale_channel(cr, colorization_averages[1])
+                    next_frame = Image.merge('YCbCr', (y, cb, cr))
+                    next_frame = next_frame.convert("RGB")
+
                 init_image = next_frame
+
         except KeyboardInterrupt:
             # when an interrupt is received, cancel cycles and attempt to save any already generated images.
             pass
@@ -650,8 +673,8 @@ def save_animations(images_with_frames):
     image_basepath = os.path.join(ANIMATIONS_DIR, TIMESTAMP)
     for (frames, image_index) in zip(images_with_frames, range(len(images_with_frames))):
         initial_image = frames[0]
-        initial_image.save(fp=image_basepath+f"{image_index}_a.webp", format='webp', append_images=frames[1:], save_all=True, duration=42, minimize_size=True, loop=1)
-        initial_image.save(fp=image_basepath+f"{image_index}.gif", format='gif', append_images=frames[1:], save_all=True, duration=42)
+        initial_image.save(fp=image_basepath+f"{image_index}_a.webp", format='webp', append_images=frames[1:], save_all=True, duration=65, minimize_size=True, loop=1)
+        initial_image.save(fp=image_basepath+f"{image_index}.gif", format='gif', append_images=frames[1:], save_all=True, duration=65)
         image_autogrid(frames).save(fp=image_basepath+f"{image_index}_grid.webp", format='webp', minimize_size=True)
     print(f"Saved files with prefix {image_basepath}")
 
@@ -671,6 +694,58 @@ def create_interpolation(a, b, steps, vae):
         # processing images in target device one-by-one saves VRAM.
         image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
+
+# rescale values in a channel to a target midpoint
+def rescale_channel(image_channel, target_midpoint):
+    # image channel to float array, scaled to 0..1
+    values = np.array(image_channel, dtype="float") / 255.0
+    initial_midpoint = midpoint_quantile_range_mean(values)
+    # rescale target midpoint to 0..1
+    target_midpoint = float(target_midpoint) / 255.0
+    # start at a curve midpoint of 0.5 (linear). Split the search area into two halves ([1, 0.5], [0.5, 0])
+    # select the correct half as the new search area, based on the required value being either above or below the current value (0.5)
+    # iteratively select midpoint of the new search area, repeat for the two halves of the area
+    curve_midpoint_guess = 0.5
+    def get_spline_f(new_curve_midpoint):
+        return CubicSpline([0,new_curve_midpoint,1],[0,0.5,1])
+    for i in range(2,20):
+        # first index must be at 2 already: for 1, the first adjustment would pick either 0.0 or 1.0 as a midpoint! It should be 0.25 or 0.75.
+        # perform 'binary-search-like' optimization cycle!
+        curve = get_spline_f(curve_midpoint_guess)
+        step_adjust = 1.0/(2**i)
+        next_values = curve(values)
+        current_midpoint = midpoint_quantile_range_mean(next_values)
+        if current_midpoint > target_midpoint:
+            # if the current midpoint is too high, values need to be reduced. Shift curve x midpoint upwards. The higher half of the current search area is selected.
+            curve_midpoint_guess += step_adjust
+        else:
+            # otherwise, values need to be boosted. Shift curve x midpoint downwards, select lower half of current search area.
+            curve_midpoint_guess -= step_adjust
+    print(f"Curve adjustment: {initial_midpoint:.5f} reached {current_midpoint:.5f} for target {target_midpoint:.5f}")
+    return Image.fromarray((next_values*255.0).round().astype("uint8"))
+
+# get the mean of all values within a given quantile range from the median. Equivalent to the mean for a range of 1.0, Equivalent to the median for a range of 0.0.
+# if no range is specified, use the range of mean +/- standard deviation!
+def midpoint_quantile_range_mean(array, range:float=None):
+    flat_values_list = array.flatten()
+    if range is not None:
+        if range < 0 or range > 0.5:
+            # can't select more than every value or less than no values.
+            raise ValueError(f"Range must be between 0.0 and 0.5! Got: {range}")
+        # compute the two quantiles.
+        quantiles = np.quantile(flat_values_list, [0.5-(range), 0.5+(range)])
+    else:
+        mean = flat_values_list.mean()
+        std = flat_values_list.std()
+        quantiles = [mean-std, mean+std]
+    
+    # grab any values within those quantiles
+    values_in_range = [x for x in flat_values_list if x >= quantiles[0] and x<= quantiles[1]]
+    
+    if len(values_in_range) == 0:
+        return np.median(flat_values_list)
+    else:
+        return np.array(values_in_range).mean()
 
 class Suppress_out:
     def __init__(self):
