@@ -25,6 +25,10 @@ SAVE_OUTPUTS_TO_DISK = True
 DEFAULT_HALF_PRECISION = True
 COMMAND_PREFIX = "generate"
 
+# if set to true, requests with an amount > 1 will be queued individually to preserve VRAM
+# turning this on may make the bot spam-heavy, as each result (or error if the prompt causes one) will be a separate message
+RUN_ALL_IMAGES_INDIVIDUAL = True
+
 OUTPUTS_DIR = "outputs/generated"
 INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
 UNPUB_DIR = os.path.join(OUTPUTS_DIR, "unpub")
@@ -268,8 +272,12 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
             init_img=None
             additional =  f"Unable to parse init image from message attachments: {e}. Running text-to-image only."
     prompts = [x.strip() for x in prompt.split("||")]
-    prompts *= amount
-    task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
+    if not RUN_ALL_IMAGES_INDIVIDUAL:
+        prompts *= amount
+        task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
+    else:
+        for _ in range(amount):
+            task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
     return f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue. {additional}"
 
 @tasks.loop(seconds=1.0)

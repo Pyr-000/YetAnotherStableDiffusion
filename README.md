@@ -134,7 +134,7 @@ pip install py-cord
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution. Accepts an optional image attachment for performing image-to-image
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
-  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <ddim_eta> <eta_seed> <img2img_strength> <Image attachment>`
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <ddim_eta> <eta_seed> <img2img_strength> <Image attachment> <amount>`
     - `Width` and `height` are specified as multiples of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
     - if `eta` is set to a value greater than `0`, the scheduler automatically switches to `ddim`. Otherwise, `pndm` is used.
