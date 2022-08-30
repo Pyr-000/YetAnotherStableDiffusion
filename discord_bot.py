@@ -86,6 +86,11 @@ class prompt_task():
         #img = out[0]
         self.filename = f"{'SPOILER_' if nsfw else 'img_'}generated"
         self.datas = []
+        if self.init_img is not None:
+            init_image_data = BytesIO()
+            self.init_img.save(init_image_data, "PNG")
+            init_image_data.seek(0)
+            self.datas.append(init_image_data)
         image_data = BytesIO()
         full_image, full_metadata, metadata_items = save_output(self.prompts, out, argdict, SAVE_OUTPUTS_TO_DISK, final_latent, False)
         full_image.save(image_data, "PNG", metadata=full_metadata)
