@@ -45,7 +45,7 @@ IMAGE_CYCLE_DISPLAY_CV2 = True
 #COLOR_CORRECTION_QUANTILE_RANGE = 0.25 # use standard deviation instead!
 # more cycles will increase correction curve precision while taking slightly more time for a color correction step
 # While this accuracy is not relevant for preventing drift, low values will quantize the color curve, causing a static color cast
-COLOR_CORRECTION_CYCLES = 20
+COLOR_CORRECTION_CYCLES = 18
 
 OUTPUTS_DIR = "outputs/generated"
 ANIMATIONS_DIR = "outputs/animate"
@@ -180,9 +180,13 @@ def main():
                 next_frame = out[0]
                 frames.append(next_frame.copy())
                 resampling_filter = Image.Resampling.BILINEAR
+                background = next_frame.copy()
+                next_frame = next_frame.convert("RGBA")
                 next_frame = next_frame.rotate(args.img_rotation, resampling_filter, expand=False, center=args.img_center, translate=args.img_translation)
                 next_frame = ImageOps.crop(next_frame, args.img_zoom)
                 next_frame = next_frame.resize((args.width,args.height), resample=Image.Resampling.LANCZOS)
+                background.paste(next_frame, (0, 0), next_frame)
+                next_frame = background.convert("RGB")
 
                 # boost sharpness for input into next cycle to avoid having the image become softer over time.
                 if args.img_rotation !=0 or args.img_zoom !=0:
