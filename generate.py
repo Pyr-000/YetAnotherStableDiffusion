@@ -43,6 +43,9 @@ IMAGE_CYCLE_DISPLAY_CV2 = True
 
 # quantile range for evaluating color channel midpoints when performing color channel correction in cycled img2img
 #COLOR_CORRECTION_QUANTILE_RANGE = 0.25 # use standard deviation instead!
+# more cycles will increase correction curve precision while taking slightly more time for a color correction step
+# While this accuracy is not relevant for preventing drift, low values will quantize the color curve, causing a static color cast
+COLOR_CORRECTION_CYCLES = 20
 
 OUTPUTS_DIR = "outputs/generated"
 ANIMATIONS_DIR = "outputs/animate"
@@ -192,7 +195,7 @@ def main():
                 # apply color channel balance corrections on CbCr channels (keep y: B/W contrast image the same).
                 if args.cycle_color_correction and colorization_averages is not None:
                     next_frame = next_frame.convert("YCbCr")
-                    y, cb, cr = img.split()
+                    y, cb, cr = next_frame.split()
                     cb = rescale_channel(cb, colorization_averages[0])
                     cr = rescale_channel(cr, colorization_averages[1])
                     next_frame = Image.merge('YCbCr', (y, cb, cr))
@@ -708,7 +711,7 @@ def rescale_channel(image_channel, target_midpoint):
     curve_midpoint_guess = 0.5
     def get_spline_f(new_curve_midpoint):
         return CubicSpline([0,new_curve_midpoint,1],[0,0.5,1])
-    for i in range(2,20):
+    for i in range(2,COLOR_CORRECTION_CYCLES+2):
         # first index must be at 2 already: for 1, the first adjustment would pick either 0.0 or 1.0 as a midpoint! It should be 0.25 or 0.75.
         # perform 'binary-search-like' optimization cycle!
         curve = get_spline_f(curve_midpoint_guess)
@@ -721,7 +724,7 @@ def rescale_channel(image_channel, target_midpoint):
         else:
             # otherwise, values need to be boosted. Shift curve x midpoint downwards, select lower half of current search area.
             curve_midpoint_guess -= step_adjust
-    print(f"Curve adjustment: {initial_midpoint:.5f} reached {current_midpoint:.5f} for target {target_midpoint:.5f}")
+    #print(f"Curve adjustment: {initial_midpoint:.5f} reached {current_midpoint:.5f} for target {target_midpoint:.5f}")
     return Image.fromarray((next_values*255.0).round().astype("uint8"))
 
 # get the mean of all values within a given quantile range from the median. Equivalent to the mean for a range of 1.0, Equivalent to the median for a range of 0.0.
