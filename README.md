@@ -1,5 +1,8 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
+## Recent changes to requirements
+- Now requires `scikit-image` package to perform color correction during image cycling
+
 # Installation
 ## Install `pytorch` (skip when using a pre-existing StableDiffusion-compatible environment)
 Get the correct installation for your hardware at https://pytorch.org/get-started/locally/.
@@ -10,9 +13,9 @@ When installing with `pip` directly (e.g. for non-conda environments), CUDA tool
 #
 ## Install additional dependencies
 ```shell
-pip install diffusers==0.2.4 transformers scipy ftfy opencv-python huggingface_hub
+pip install diffusers==0.2.4 transformers scipy ftfy opencv-python huggingface_hub scikit-image
 ```
-Most pre-existing StableDiffusion-compatible environments will already have these, save for `huggingface_hub` and in some cases `diffusers`.
+Most pre-existing StableDiffusion-compatible environments will already have these, save for `scikit-image`, `huggingface_hub` and in some cases `diffusers`.
 #
 ## Install models
 Models can either be automatically installed by logging into your huggingface account with a token, or manually installed by downloading them from huggingface yourself. 
@@ -79,7 +82,7 @@ When applying image-to-image multiple times sequentially (often with a lower str
 - `-it`/`--image-translate` sets the amount of translation applied to the image between image-to-image steps. This requires two values to be specified for the x and y axis translation respectively. Disabled with a value of `None` by default.
 - `-irc`/`--image-rotation-center` sets the position of the rotational axis within the image in pixel coordinates, if rotations are applied. Requires two values for both x and y coordinates, with the origin `0,0` being the top left corner of the image. By default, this automatically selects the center of the image with a value of `None`.
 - `-ics`/`--image-cycle-sharpen` sets the strength of the sharpening filter applied when zooming and/or rotating during image-to-image cycling. This filter is only applied to image inputs before the next cycle, not to stored image outputs. This can help preserve image sharpness, as the resampling applied when zooming or rotating will soften or blur the image. Values greater than `1.0` will increase sharpness, while values between `1.0` and `0.0` will soften the image. Default is `1.2`.
-- `-icc`/`--image-color-correction` Enables colorization correction for image to image cycling: In the YCbCr colorspace, the Cb/Cr color balance will be kept the same as it was in the initial image using an adaptive transfer function. Prevents 'magenta shifting' with multiple cycles.
+- `-icc`/`--image-color-correction` Enables color correction for image to image cycling: Cumulative density functions of each image channel within the LAB colorspace are respaced to match the density distributions present in the initial (first) image. Prevents 'magenta shifting' (and similar effects) with multiple cycles.
 #
 ## Additional flags
 - `--no-check-nsfw` disables the NSFW check entirely, which slightly speeds up the generation process. By default, `generate.py` will only display a warning and attach an extra tag in image metadata if potential NSFW concepts are detected.
@@ -146,4 +149,4 @@ pip install py-cord
 #
 # Notes
 - For more information about [Stable Diffusion](https://github.com/CompVis/stable-diffusion) and the [Huggingface Diffusers Implementation](https://huggingface.co/CompVis/stable-diffusion-v1-4), including the license, limitations, and capabilities of the systems utilized, check out the respective links.
-- The image to image implementation through diffusers is derived from the implementation in the following colab notebook: https://colab.research.google.com/github/patil-suraj/Notebooks/blob/master/image_2_image_using_diffusers.ipynb
+- Text to image and image to image implementations are derived from the huggingface pipeline implementations.

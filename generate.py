@@ -12,8 +12,7 @@ from torch import autocast
 from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
-from diffusers import StableDiffusionPipeline, DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
-from diffusers import pipelines
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel
 import argparse
 from datetime import datetime
@@ -22,13 +21,12 @@ import codecs
 import cv2
 import numpy as np
 from traceback import print_exc
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from PIL import Image, ImageOps, ImageEnhance
 from tqdm.auto import tqdm
 from time import time
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 import inspect
 from io import BytesIO
-from scipy.interpolate import CubicSpline
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -41,12 +39,6 @@ IO_DEVICE = "cpu"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
 
-# quantile range for evaluating color channel midpoints when performing color channel correction in cycled img2img
-#COLOR_CORRECTION_QUANTILE_RANGE = 0.25 # use standard deviation instead!
-# more cycles will increase correction curve precision while taking slightly more time for a color correction step
-# While this accuracy is not relevant for preventing drift, low values will quantize the color curve, causing a static color cast
-COLOR_CORRECTION_CYCLES = 18
-
 OUTPUTS_DIR = "outputs/generated"
 ANIMATIONS_DIR = "outputs/animate"
 INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
@@ -55,10 +47,6 @@ os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
-
-"""
-    img2img based on: https://colab.research.google.com/github/patil-suraj/Notebooks/blob/master/image_2_image_using_diffusers.ipynb#scrollTo=n9AmMcAGASDq
-"""
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -90,7 +78,6 @@ def parse_args():
     parser.add_argument("-irc", "--image-rotation-center", type=int, help="Center of rotational axis when applying rotation (0,0 -> top left corner) Default is the image center", default=None, nargs=2, dest='img_center')
     parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.2, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
     parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep lightness and colorization distribution the same as it was initially (LAB histogram cdf matching). Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
-    #parser.add_argument("-icc2", "--image-contrast-correction", action="store_true", help="WIP | Apply contrast correction between image cycles. The contrast metric is based on YCbCr channel standard deviation", dest="cycle_contrast_correction")
     return parser.parse_args()
 
 def main():
@@ -625,6 +612,8 @@ def process_cycle_image(img:Image, rotation:int=0, rotation_center:tuple=None, t
 
     if perform_histogram_correction and correction_target is not None:
         img = Image.fromarray(cv2.cvtColor(exposure.match_histograms(cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2LAB), correction_target, channel_axis=2), cv2.COLOR_LAB2RGB).astype("uint8")).convert("RGB")
+    
+    return img
 
 # write latent tensor to string for PNG metadata saving
 def tensor_to_encoded_string(obj):
@@ -695,140 +684,6 @@ def create_interpolation(a, b, steps, vae):
         # processing images in target device one-by-one saves VRAM.
         image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
-
-"""
-def rescale_contrast(image_channel, target_std):
-    image_channel
-    enhancer = ImageEnhance.Contrast(image_channel)
-
-    initial_std = np.asarray(image_channel).std()
-    current_std = initial_std
-    factor = 0.5
-    direction = -1 if current_std > target_std else 1
-    contrast_pos = 1.0
-    for _ in range(0,CONTRAST_CORRECTION_CYCLES):
-        contrast_pos += (direction*factor)
-        new_channel = enhancer.enhance(contrast_pos)
-        current_std = np.asarray(new_channel).std()
-        direction = -1 if current_std > target_std else 1
-        factor *= 0.5
-    # perform a random last step, to reduce potential of always applying the same error from precision limitation
-    direction = 1 if bool(random.getrandbits(1)) else -1
-    contrast_pos += (direction*factor)
-    new_channel = enhancer.enhance(contrast_pos)
-    current_std = np.asarray(new_channel).std()
-    print(f"Contrast adjustment: {initial_std} reached {current_std} for target {target_std}")
-    return new_channel
-
-# rescale values in a channel to a target midpoint
-def rescale_channel(image_channel, target_midpoint):
-    # image channel to float array, scaled to 0..1
-    values = np.array(image_channel, dtype="float") / 255.0
-    initial_midpoint = midpoint_quantile_range_mean(values)
-    # rescale target midpoint to 0..1
-    target_midpoint = float(target_midpoint) / 255.0
-    # start at a curve midpoint of 0.5 (linear). Split the search area into two halves ([1, 0.5], [0.5, 0])
-    # select the correct half as the new search area, based on the required value being either above or below the current value (0.5)
-    # iteratively select midpoint of the new search area, repeat for the two halves of the area
-    curve_midpoint_guess = 0.5
-    def get_spline_f(new_curve_midpoint):
-        return CubicSpline([0,new_curve_midpoint,1],[0,0.5,1])
-    for i in range(2,COLOR_CORRECTION_CYCLES+2):
-        # first index must be at 2 already: for 1, the first adjustment would pick either 0.0 or 1.0 as a midpoint! It should be 0.25 or 0.75.
-        # perform 'binary-search-like' optimization cycle!
-        curve = get_spline_f(curve_midpoint_guess)
-        step_adjust = 1.0/(2**i)
-        next_values = curve(values)
-        current_midpoint = midpoint_quantile_range_mean(next_values)
-        if current_midpoint > target_midpoint:
-            # if the current midpoint is too high, values need to be reduced. Shift curve x midpoint upwards. The higher half of the current search area is selected.
-            curve_midpoint_guess += step_adjust
-        else:
-            # otherwise, values need to be boosted. Shift curve x midpoint downwards, select lower half of current search area.
-            curve_midpoint_guess -= step_adjust
-    # perform a random last step, to reduce potential of always applying the same error from precision limitation
-    direction = 1 if bool(random.getrandbits(1)) else -1
-    curve_midpoint_guess += (step_adjust/2)*direction
-    get_spline_f(curve_midpoint_guess)
-    next_values = curve(values)
-    #print(f"Curve adjustment: {initial_midpoint:.5f} reached {current_midpoint:.5f} for target {target_midpoint:.5f}")
-    return Image.fromarray((next_values*255.0).round().astype("uint8"))
-
-# get the mean of all values within a given quantile range from the median. Equivalent to the mean for a range of 1.0, Equivalent to the median for a range of 0.0.
-# if no range is specified, use the range of mean +/- standard deviation!
-def midpoint_quantile_range_mean(array, range:float=None):
-    flat_values_list = array.flatten()
-    if range is not None:
-        if range < 0 or range > 0.5:
-            # can't select more than every value or less than no values.
-            raise ValueError(f"Range must be between 0.0 and 0.5! Got: {range}")
-        # compute the two quantiles.
-        quantiles = np.quantile(flat_values_list, [0.5-(range), 0.5+(range)])
-    else:
-        mean = flat_values_list.mean()
-        std = flat_values_list.std()
-        quantiles = [mean-std, mean+std]
-    
-    # grab any values within those quantiles
-    values_in_range = [x for x in flat_values_list if x >= quantiles[0] and x<= quantiles[1]]
-    
-    if len(values_in_range) == 0:
-        return np.median(flat_values_list)
-    else:
-        return np.array(values_in_range).mean()
-"""
-
-class Suppress_out:
-    def __init__(self):
-        self.original_stdout = None
-        self.original_stderr = None
-    def __enter__(self, *args):
-        import sys, os
-        devnull = open(os.devnull, "w")
-        # Suppress streams
-        self.original_stdout = sys.stdout
-        sys.stdout = devnull
-        self.original_stderr = sys.stderr
-        sys.stderr = devnull
-    def __exit__(self, *args, **kwargs):
-        import sys
-        # Restore streams
-        sys.stdout = self.original_stdout
-        sys.stderr = self.original_stderr
-
-# NO LONGER IN USE: pipeline functions
-def load_pipeline(model_id:str,device:str,half:bool=True):
-    print("loading")
-    # default scheduler is PNDM - swap by setting from_pretrained(... scheduler=s) with s=LMSDiscreteScheduler() / s=DDIMScheduler()
-    pipe: pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline
-    # lms_scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
-    if not half:
-        pipe = StableDiffusionPipeline.from_pretrained(model_id, use_auth_token=True)
-    else:
-        pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16, revision="fp16", use_auth_token=True)
-    print(type(pipe))
-    print(vars(pipe.scheduler))
-    pipe = pipe.to(device)
-    return pipe
-def generate_pipe(pipe:pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline, prompt="painting of a painter painting a painting", w=768, h=512, steps=100, gs=7.5, seed=None, n=1):
-    # truncate incorrect input dimensions to a multiple of 64
-    h = int(h/64.0)*64
-    w = int(w/64.0)*64
-    with autocast("cuda"):
-        if n != 1:
-            prompt = [prompt]*n
-        print("running")
-        seed = seed if seed is not None else random.randint(1, 2703686851)
-        generator = torch.Generator("cuda").manual_seed(seed)
-        out = pipe.__call__(prompt, height=h, width=w, num_inference_steps=steps, guidance_scale=gs, generator=generator)
-    argdict = {"seed":seed,"steps":steps,"scale":gs}
-    if w != 512:
-        argdict["w"] = w
-    if h != 512:
-        argdict["h"] = h
-    if True in out["nsfw_content_detected"]:
-        argdict["nsfw"] = True
-    return out,argdict
 
 if __name__ == "__main__":
     main()
