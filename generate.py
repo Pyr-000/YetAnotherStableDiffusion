@@ -22,7 +22,7 @@ import codecs
 import cv2
 import numpy as np
 from traceback import print_exc
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from tqdm.auto import tqdm
 from time import time
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -89,7 +89,8 @@ def parse_args():
     parser.add_argument("-it", "--image-translate", type=int, help="Amount of translation (x,y tuple in pixels) for each subsequent img2img cycle", default=None, nargs=2, dest='img_translation')
     parser.add_argument("-irc", "--image-rotation-center", type=int, help="Center of rotational axis when applying rotation (0,0 -> top left corner) Default is the image center", default=None, nargs=2, dest='img_center')
     parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.2, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
-    parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep Cb/Cr color balance the same as it was initially using transfer functions. Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
+    parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep lightness and colorization distribution the same as it was initially (LAB histogram cdf matching). Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
+    #parser.add_argument("-icc2", "--image-contrast-correction", action="store_true", help="WIP | Apply contrast correction between image cycles. The contrast metric is based on YCbCr channel standard deviation", dest="cycle_contrast_correction")
     return parser.parse_args()
 
 def main():
@@ -161,17 +162,13 @@ def main():
         return out,SUPPLEMENTARY
 
     if args.img_cycles > 0:
-        colorization_averages=None
+        correction_target = None
         # first frame is the initial image, if it exists.
         frames = [init_image] if init_image is not None else []
         try:
             for i in tqdm(range(args.img_cycles), position=0, desc="Image cycle"):
-                if args.cycle_color_correction and init_image is not None and colorization_averages is None:
-                    # when cycle correction is enabled, an image is present, and averages are unknown, compute them (only happens to the first image)
-                    img = init_image.convert('YCbCr')
-                    y, cb, cr = img.split()
-                    colorization_averages = (midpoint_quantile_range_mean(np.array(cb)), midpoint_quantile_range_mean(np.array(cr)))
-                #with torch.no_grad():
+                if args.cycle_color_correction and correction_target is None and init_image is not None:
+                    correction_target = image_to_correction_target(init_image)
                 out, SUPPLEMENTARY = one_generation(args.prompt, init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
@@ -179,33 +176,7 @@ def main():
 
                 next_frame = out[0]
                 frames.append(next_frame.copy())
-                resampling_filter = Image.Resampling.BILINEAR
-                background = next_frame.copy()
-                next_frame = next_frame.convert("RGBA")
-                next_frame = next_frame.rotate(args.img_rotation, resampling_filter, expand=False, center=args.img_center, translate=args.img_translation)
-                next_frame = ImageOps.crop(next_frame, args.img_zoom)
-                next_frame = next_frame.resize((args.width,args.height), resample=Image.Resampling.LANCZOS)
-                background.paste(next_frame, (0, 0), next_frame)
-                next_frame = background.convert("RGB")
-
-                # boost sharpness for input into next cycle to avoid having the image become softer over time.
-                if args.img_rotation !=0 or args.img_zoom !=0:
-                    enhancer_sharpen = ImageEnhance.Sharpness(next_frame)
-                    next_frame = enhancer_sharpen.enhance(args.cycle_sharpen)
-                    # contrast does not seem to decay too much. Keep unchanged.
-                    #enhancer_contrast = ImageEnhance.Contrast(next_frame)
-                    #next_frame = enhancer_contrast.enhance(1.1)
-
-                # apply color channel balance corrections on CbCr channels (keep y: B/W contrast image the same).
-                if args.cycle_color_correction and colorization_averages is not None:
-                    next_frame = next_frame.convert("YCbCr")
-                    y, cb, cr = next_frame.split()
-                    cb = rescale_channel(cb, colorization_averages[0])
-                    cr = rescale_channel(cr, colorization_averages[1])
-                    next_frame = Image.merge('YCbCr', (y, cb, cr))
-                    next_frame = next_frame.convert("RGB")
-
-                init_image = next_frame
+                init_image = process_cycle_image(next_frame, args.img_rotation, args.img_center, args.img_translation, args.img_zoom, args.cycle_sharpen, args.width, args.height, args.cycle_color_correction, correction_target)
 
         except KeyboardInterrupt:
             # when an interrupt is received, cancel cycles and attempt to save any already generated images.
@@ -632,6 +603,29 @@ def get_safety_checker(device="cpu", safety_model_id = "CompVis/stable-diffusion
 
     return check_safety
 
+# return LAB colorspace array for image
+def image_to_correction_target(img):
+    return cv2.cvtColor(np.asarray(img.copy()), cv2.COLOR_RGB2LAB)
+
+def process_cycle_image(img:Image, rotation:int=0, rotation_center:tuple=None, translation:tuple=(0,0), zoom:int=0, resample_sharpen:float=1.2, width:int=512, height:int=512, perform_histogram_correction:bool=True, correction_target:np.ndarray=None):
+    from skimage import exposure
+    background = img.copy()
+    img = img.convert("RGBA")
+    img = img.rotate(rotation, Image.Resampling.BILINEAR, expand=False, center=rotation_center, translate=translation)
+    # zoom after rotating, not before (reduce background space created by translations/rotations)
+    img = ImageOps.crop(img, zoom)
+    img = img.resize((width,height), resample=Image.Resampling.LANCZOS)
+    background.paste(img, (0, 0), img)
+    img = background.convert("RGB")
+
+    # boost sharpness for input into next cycle to avoid having the image become softer over time.
+    if rotation !=0 or zoom !=0:
+        enhancer_sharpen = ImageEnhance.Sharpness(img)
+        img = enhancer_sharpen.enhance(resample_sharpen)
+
+    if perform_histogram_correction and correction_target is not None:
+        img = Image.fromarray(cv2.cvtColor(exposure.match_histograms(cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2LAB), correction_target, channel_axis=2), cv2.COLOR_LAB2RGB).astype("uint8")).convert("RGB")
+
 # write latent tensor to string for PNG metadata saving
 def tensor_to_encoded_string(obj):
     bytes_io = BytesIO()
@@ -702,6 +696,30 @@ def create_interpolation(a, b, steps, vae):
         image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
 
+"""
+def rescale_contrast(image_channel, target_std):
+    image_channel
+    enhancer = ImageEnhance.Contrast(image_channel)
+
+    initial_std = np.asarray(image_channel).std()
+    current_std = initial_std
+    factor = 0.5
+    direction = -1 if current_std > target_std else 1
+    contrast_pos = 1.0
+    for _ in range(0,CONTRAST_CORRECTION_CYCLES):
+        contrast_pos += (direction*factor)
+        new_channel = enhancer.enhance(contrast_pos)
+        current_std = np.asarray(new_channel).std()
+        direction = -1 if current_std > target_std else 1
+        factor *= 0.5
+    # perform a random last step, to reduce potential of always applying the same error from precision limitation
+    direction = 1 if bool(random.getrandbits(1)) else -1
+    contrast_pos += (direction*factor)
+    new_channel = enhancer.enhance(contrast_pos)
+    current_std = np.asarray(new_channel).std()
+    print(f"Contrast adjustment: {initial_std} reached {current_std} for target {target_std}")
+    return new_channel
+
 # rescale values in a channel to a target midpoint
 def rescale_channel(image_channel, target_midpoint):
     # image channel to float array, scaled to 0..1
@@ -728,6 +746,11 @@ def rescale_channel(image_channel, target_midpoint):
         else:
             # otherwise, values need to be boosted. Shift curve x midpoint downwards, select lower half of current search area.
             curve_midpoint_guess -= step_adjust
+    # perform a random last step, to reduce potential of always applying the same error from precision limitation
+    direction = 1 if bool(random.getrandbits(1)) else -1
+    curve_midpoint_guess += (step_adjust/2)*direction
+    get_spline_f(curve_midpoint_guess)
+    next_values = curve(values)
     #print(f"Curve adjustment: {initial_midpoint:.5f} reached {current_midpoint:.5f} for target {target_midpoint:.5f}")
     return Image.fromarray((next_values*255.0).round().astype("uint8"))
 
@@ -753,6 +776,7 @@ def midpoint_quantile_range_mean(array, range:float=None):
         return np.median(flat_values_list)
     else:
         return np.array(values_in_range).mean()
+"""
 
 class Suppress_out:
     def __init__(self):
