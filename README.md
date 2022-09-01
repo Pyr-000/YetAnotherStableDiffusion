@@ -9,7 +9,7 @@ Get the correct installation for your hardware at https://pytorch.org/get-starte
 
 When installing pytorch with CUDA support, the `conda` install command will install cudatoolkit as well.
 
-When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. To install CUDA toolkit your device,  (https://developer.nvidia.com/cuda-downloads)
+When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. To install CUDA toolkit on your device manually, check https://developer.nvidia.com/cuda-downloads.
 #
 ## Install additional dependencies
 ```shell
@@ -38,11 +38,12 @@ and paste a valid read token for your huggingface account (accessible at https:/
 - Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over.
 
 #
-# Usage
+# Usage & Features
 - Features include text-to-image, image-to-image (including cycling), and options for precision/devices to control generation speed and memory usage.
 - `prompts`, `seeds`, and other relevant arguments will be stored in PNG metadata by default.
 - For every generated output, an image will be saved in `outputs/generated`. This can be modified using the global variable `OUTPUTS_DIR` near the top of `generate.py`. When multiple images are batched at once, this singular image will be a grid, with the individual images being saved in `outputs/generated/individual` (or {OUTPUTS_DIR}/individual). Additionally, each generated output will produce a text file in `outputs/generated/unpub` (or {OUTPUTS_DIR}/unpub) of the same filename, containing the prompt and additional arguments. This can be used for maintaining an external image gallery.
 - The NSFW check is enabled by default, but will only print a warning message and attach a metadata label, leaving the output images untouched. It can also be fully disabled via a commandline flag (see: [Additional Flags](#additional-flags))
+- Cycling through iterations of image-to-image comes with a mitigation for keeping the color scheme unchanged, preventing effects such as 'magenta shifting'. (`-icc`, see: [Image to image cycling](#image-to-image-cycling))
 # 
 ## text to image
 By default, `generate.py` will run in text-to-image mode. If launched without a prompt, it will enter a prompt input loop until the program is manually terminated. Alternatively a prompt can be specified as a commandline argument:
@@ -75,6 +76,8 @@ When either a starting image (`-ii`, see below) or the image cycle flag (`-ic`, 
 - `-st`/`--strength` specifies the 'strength' setting of image-to-image. Values closer to `0` will result in the output being closer to the input image, while values closer to `1` will result in the output being closer to the information of the newly generated image.
 ### Image to image cycling
 When applying image-to-image multiple times sequentially (often with a lower strength), the resulting outputs can often be "closer" to the input image, while also achieving a higher "image quality" or "adherence to the prompt". Image-to-image cycling can also be applied without a starting image (the first image in the sequence will be generated via text-to-image) to create interesting effects.
+
+For faster generation cycles, it is recommended to pass the flags `--no-check-nsfw` (you will not receive warnings about potential NSFW content being detected, see: [Additional Flags](#additional-flags)) and `--io-device cuda` (VRAM usage will be increased, see: [Device settings](#device-settings))
 - `-ic`/`--image-cycles` sets the amount of image-to-image cycles that will be performed. An animation (and image grid) will be stored in the `/animated` folder in the output directory. While running, this mode will attempt to display the current image via cv2. This can be disabled by setting the global variable `IMAGE_CYCLE_DISPLAY_CV2=False` near the top of `generate.py`
 - `-cni`/`--cycle-no-save-individual` disables the saving of image-to-image cycle frames as individual images when specified.
 - `-iz`/`--image-zoom` sets the amount of zoom applied between image-to-image steps. The value specifies the amount of pixels cropped per side. Disabled with a value of `0` by default.
