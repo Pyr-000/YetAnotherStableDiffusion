@@ -668,9 +668,21 @@ def save_animations(images_with_frames):
     image_basepath = os.path.join(ANIMATIONS_DIR, TIMESTAMP)
     for (frames, image_index) in zip(images_with_frames, range(len(images_with_frames))):
         initial_image = frames[0]
-        initial_image.save(fp=image_basepath+f"{image_index}_a.webp", format='webp', append_images=frames[1:], save_all=True, duration=65, minimize_size=True, loop=1)
-        initial_image.save(fp=image_basepath+f"{image_index}.gif", format='gif', append_images=frames[1:], save_all=True, duration=65)
-        image_autogrid(frames).save(fp=image_basepath+f"{image_index}_grid.webp", format='webp', minimize_size=True)
+        try:
+            initial_image.save(fp=image_basepath+f"{image_index}_a.webp", format='webp', append_images=frames[1:], save_all=True, duration=65, minimize_size=True, loop=1)
+            #initial_image.save(fp=image_basepath+f"{image_index}.gif", format='gif', append_images=frames[1:], save_all=True, duration=65) # GIF files take up lots of space.
+            image_autogrid(frames).save(fp=image_basepath+f"{image_index}_grid.webp", format='webp', minimize_size=True)
+        except:
+            print_exc()
+        try:
+            print("The following OpenCV codec error can be ignored: ", end="")
+            video_writer = cv2.VideoWriter(f"{image_basepath}{image_index}.webm", cv2.VideoWriter_fourcc(*'VP90'), 15, initial_image.size)
+            print()
+            for frame in tqdm(frames, desc="Encoding webm video from frames!"):
+                video_writer.write(cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR))
+            video_writer.release()
+        except:
+            print_exc()
     print(f"Saved files with prefix {image_basepath}")
 
 def create_interpolation(a, b, steps, vae):
