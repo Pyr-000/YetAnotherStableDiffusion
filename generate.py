@@ -149,6 +149,11 @@ def main():
         return out,SUPPLEMENTARY
 
     if args.img_cycles > 0:
+        # sequence prompts across all iterations
+        prompts = [p.strip() for p in args.prompt.split("||")]
+        iter_per_prompt = args.img_cycles / len(prompts)
+        def index_prompt(i):
+            return prompts[int(i/iter_per_prompt)]
         correction_target = None
         # first frame is the initial image, if it exists.
         frames = [init_image] if init_image is not None else []
@@ -156,7 +161,7 @@ def main():
             for i in tqdm(range(args.img_cycles), position=0, desc="Image cycle"):
                 if args.cycle_color_correction and correction_target is None and init_image is not None:
                     correction_target = image_to_correction_target(init_image)
-                out, SUPPLEMENTARY = one_generation(args.prompt, init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
+                out, SUPPLEMENTARY = one_generation(index_prompt(i), init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
                     torch.cuda.empty_cache()
