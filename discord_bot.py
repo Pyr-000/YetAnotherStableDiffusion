@@ -303,7 +303,7 @@ async def poll():
                     print(f"Dropped: {len(datas)-len(files)} due to exceeding the 8MB limit")
                 i=0
                 while len(files)>0:
-                    ten_file_chunk = [files.pop() for _ in range(min(10,len(files)))]
+                    ten_file_chunk = [files.pop(0) for _ in range(min(10,len(files)))]
                     print(f"sending chunk: {len(ten_file_chunk)} files")
                     await task.ctx.send_followup(f"{tag}{'' if i==0 else ' ['+str(i)+']'} \n{task.response}", files=ten_file_chunk)
                     sleep(1)
