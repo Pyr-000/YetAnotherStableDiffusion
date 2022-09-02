@@ -25,8 +25,7 @@ SAVE_OUTPUTS_TO_DISK = True
 DEFAULT_HALF_PRECISION = True
 COMMAND_PREFIX = "generate"
 
-# if set to true, requests with an amount > 1 will be queued individually to preserve VRAM
-# turning this on may make the bot spam-heavy, as each result (or error if the prompt causes one) will be a separate message
+# if set to true, requests with an amount > 1 will always be generated sequentially to preserve VRAM. Will slow down generation speed for multiple images.
 RUN_ALL_IMAGES_INDIVIDUAL = False
 
 OUTPUTS_DIR = "outputs/generated"
@@ -50,8 +49,8 @@ class prompt_task():
         self.h = h
         self.steps = steps
         self.gs = gs
-        self.seed = seed if seed >= 0 else random.randint(1, 18446744073709551615)
-        self.eta_seed = eta_seed if eta_seed >= 0 else random.randint(1, 18446744073709551615)
+        self.seed = seed if seed >= 0 else None
+        self.eta_seed = eta_seed if eta_seed >= 0 else None
         if eta > 0:
             self.eta = eta
             self.sched_name = "ddim"
@@ -77,7 +76,8 @@ class prompt_task():
             eta=self.eta,
             eta_seed=self.eta_seed,
             init_image=self.init_img,
-            img_strength=self.strength
+            img_strength=self.strength,
+            sequential=RUN_ALL_IMAGES_INDIVIDUAL
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -94,6 +94,11 @@ class prompt_task():
         image_data = BytesIO()
         full_image, full_metadata, metadata_items = save_output(self.prompts, out, argdict, SAVE_OUTPUTS_TO_DISK, final_latent, False)
         full_image.save(image_data, "PNG", metadata=full_metadata)
+        if (image_data.getbuffer().nbytes < (8388608 -512)) : # (keep 512 bytes of space. Discord apparently needs some extra bytes for itself within the 8MB limit.)
+            image_data.seek(0)
+            self.datas.append(image_data)
+        else:
+            print("INFO: Dropping grid image upload, as it exceeds the 8MB limit.")
         image_data.seek(0)
         self.datas.append(image_data)
         if len(out) > 1:
@@ -118,8 +123,10 @@ class prompt_task():
             argdict.pop("eta_seed")
 
         text_readback = argdict.pop("text_readback")
-        if len(text_readback) == 1:
+        if len(set(text_readback)) == 1:
             text_readback = text_readback[0]
+        if len(set(argdict["remaining_token_count"])) == 1:
+            argdict["remaining_token_count"] = argdict["remaining_token_count"][0]
         self.response = f"{text_readback} ```{argdict}```"
 
 task_queue = []
@@ -251,6 +258,7 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
         return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
     steps = steps if steps > 0 else 1
     steps = steps if steps <= 150 else 150
+    amount = amount if amount <= 16 else 16
     seed = seed if seed > 0 else -1
     eta_seed = eta_seed if eta_seed > 0 else -1
     global task_queue
@@ -276,13 +284,8 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
         except Exception as e:
             init_img=None
             additional =  f"Unable to parse init image from message attachments: {e}. Running text-to-image only."
-    prompts = [x.strip() for x in prompt.split("||")]
-    if not RUN_ALL_IMAGES_INDIVIDUAL:
-        prompts *= amount
-        task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
-    else:
-        for _ in range(amount):
-            task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
+    prompts = [x.strip() for x in prompt.split("||")] * amount
+    task_queue.append(prompt_task(ctx, prompts=prompts ,w=w, h=h, steps=steps, gs=gs, seed=seed, eta=eta, eta_seed=eta_seed, init_img=init_img, strength=strength))
     return f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue. {additional}"
 
 @tasks.loop(seconds=1.0)
@@ -294,11 +297,19 @@ async def poll():
         tag = task.ctx.author.mention
         if isinstance(task, prompt_task):
             if task.datas is not None:
-                files = [discord.File(fp=data, filename=f"{task.filename}_{i}.png") for (data, i) in zip(task.datas, range(len(task.datas)))]
+                datas = [data for data in task.datas if (data.getbuffer().nbytes < (8388608 -512))]
+                files = [discord.File(fp=data, filename=f"{task.filename}_{i}.png") for (data, i) in zip(datas, range(len(datas)))]
+                if len(datas) < len(files):
+                    print(f"Dropped: {len(datas)-len(files)} due to exceeding the 8MB limit")
+                i=0
+                while len(files)>0:
+                    ten_file_chunk = [files.pop() for _ in range(min(10,len(files)))]
+                    print(f"sending chunk: {len(ten_file_chunk)} files")
+                    await task.ctx.send_followup(f"{tag}{'' if i==0 else ' ['+str(i)+']'} \n{task.response}", files=ten_file_chunk)
+                    sleep(1)
+                    i += 1
             else:
-                files=None
-            # await ctx.reply(task.response, file=discord.File(fp=task.data, filename=task.filename))
-            await task.ctx.send_followup(f"{tag} \n{task.response}", files=files)
+                await task.ctx.send_followup(f"{tag} \n{task.response}", files=None)
         elif isinstance(task, command_task):
             await task.ctx.send_followup(f"{tag} \n{task.response}", delete_after=10)
         else:

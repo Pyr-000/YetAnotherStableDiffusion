@@ -60,6 +60,7 @@ def parse_args():
     parser.add_argument("-H","--H", type=int, default=512, help="image height, in pixel space", dest="height")
     parser.add_argument("-W","--W", type=int, default=512, help="image width, in pixel space", dest="width")
     parser.add_argument("-n", "--n-samples", type=int, default=1, help="how many samples to produce for each given prompt. A.k.a. batch size", dest="n_samples")
+    parser.add_argument("-seq", "--sequential_samples", action="store_true", help="Run batch in sequence instead of in parallel. Removes VRAM requirement for increased batch sizes, increases processing time.", dest="sequential_samples")
     parser.add_argument("-cs", "--scale", type=float, default=7.5, help="(classifier free) guidance scale (higher values may increse adherence to prompt but decrease 'creativity')", dest="guidance_scale")
     parser.add_argument("-S","--seed", type=int, default=None, help="initial noise seed for reproducing/modifying outputs (None will select a random seed)", dest="seed")
     parser.add_argument("--unet-full", action='store_false', help="Run diffusion UNET at full precision (fp32). Default is half precision (fp16). Increases memory load.", dest="half")
@@ -119,8 +120,23 @@ def main():
 
     def one_generation(prompt, init_image, display_with_cv2=False, save_latents=True, save_images=True):
         prompt = prompt if prompt is not None else ""
-        prompts = [x.strip() for x in prompt.split("||")]
-        out, SUPPLEMENTARY = generate_exec(prompts*args.n_samples, width=args.width, height=args.height, steps=args.steps, gs=args.guidance_scale, seed=args.seed, sched_name=args.sched_name, eta=args.ddim_eta, eta_seed=args.eta_seed, init_image=init_image, img_strength=args.strength, animate=args.animate, save_latents=save_latents)
+        prompts = [x.strip() for x in prompt.split("||")]*args.n_samples
+        out, SUPPLEMENTARY = generate_exec(
+            prompts,
+            width=args.width,
+            height=args.height,
+            steps=args.steps,
+            gs=args.guidance_scale,
+            seed=args.seed,
+            sched_name=args.sched_name,
+            eta=args.ddim_eta,
+            eta_seed=args.eta_seed,
+            init_image=init_image,
+            img_strength=args.strength,
+            animate=args.animate,
+            save_latents=save_latents,
+            sequential=args.sequential_samples
+        )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
         PIL_animation_frames = argdict.pop("image_sequence")
@@ -133,7 +149,7 @@ def main():
         if not ("ddim" in argdict["sched_name"] and argdict["eta"] > 0):
             argdict.pop("eta")
             argdict.pop("eta_seed")
-        save_output(prompt, out, argdict, save_images, final_latent, display_with_cv2)
+        save_output(prompts, out, argdict, save_images, final_latent, display_with_cv2)
         if args.animate:
             # init frames by image list
             frames_by_image = []
@@ -454,7 +470,54 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             SUPPLEMENTARY["io"]["time"] = time() - START_TIME
 
             return pil_images, SUPPLEMENTARY
-    return generate_segmented_exec
+    def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False):
+        exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents}
+        if not sequential:
+            try:
+                return generate_segmented_exec(prompt=prompt, **exec_args)
+            except RuntimeError as e:
+                if 'out of memory' in str(e) and len(prompt) > 1:
+                    # if an OOM error occurs with batch size >1 in parallel, retry sequentially.
+                    tqdm.write("Generating batch in parallel ran out of memory! Switching to sequential generation! To run sequential generation from the start, specify '-seq'.")
+                    sequential=True
+                else:
+                    # if the error was not OOM due to batch size, raise it.
+                    raise e
+        if sequential:
+            if exec_args["animate"]:
+                tqdm.write("--animate is currently not supported for sequential generation. Disabling.")
+                exec_args["animate"] = False
+            # if sequential is requested, run items one-by-one
+            out = []
+            seeds = []
+            eta_seeds = []
+            SUPPLEMENTARY = None
+            try:
+                for prompt_item in tqdm(prompt, position=0, desc="Sequential Batch"):
+                    new_out, new_supplementary = generate_segmented_exec(prompt=prompt_item, **exec_args)
+                    # reassemble list of outputs
+                    out += new_out
+                    seeds.append(new_supplementary['io']['seed'])
+                    eta_seeds.append(new_supplementary['io']['eta_seed'])
+                    if SUPPLEMENTARY is None:
+                        SUPPLEMENTARY = new_supplementary
+                    else:
+                        if save_latents:
+                            # reassemble stack tensor of final latents
+                            SUPPLEMENTARY['latent']['final_latent'] = torch.stack([x for x in SUPPLEMENTARY['latent']['final_latent']] + [new_supplementary['latent']['final_latent'][0]])
+                        # reassemble other supplementary return data
+                        SUPPLEMENTARY['io']['text_readback'] += new_supplementary['io']['text_readback']
+                        SUPPLEMENTARY['io']['remaining_token_count'] += new_supplementary['io']['remaining_token_count']
+                        SUPPLEMENTARY['io']['time'] += new_supplementary['io']['time']
+                        SUPPLEMENTARY['io']['attention'] += new_supplementary['io']['attention']
+                        SUPPLEMENTARY['io']['nsfw'] = SUPPLEMENTARY['io']['nsfw'] or new_supplementary['io']['nsfw']
+                    SUPPLEMENTARY['io']['seed'] = seeds
+                    SUPPLEMENTARY['io']['eta_seed'] = eta_seeds
+            except KeyboardInterrupt:
+                pass
+            SUPPLEMENTARY['io']['sequential'] = True
+            return out, SUPPLEMENTARY
+    return generate_segmented_wrapper
 
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False):

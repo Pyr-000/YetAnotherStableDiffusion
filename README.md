@@ -9,7 +9,7 @@ Get the correct installation for your hardware at https://pytorch.org/get-starte
 
 When installing pytorch with CUDA support, the `conda` install command will install cudatoolkit as well.
 
-When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. To install CUDA toolkit on your device manually, check https://developer.nvidia.com/cuda-downloads.
+When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. CUDA toolkit can be found at: https://developer.nvidia.com/cuda-downloads.
 #
 ## Install additional dependencies
 ```shell
@@ -63,11 +63,12 @@ python generate.py "a painting of a painter painting a painting"
 - `-sc`/`--scheduler` sets the sampling scheduler. Currently, `"lms"`, `"pndm"` and `"ddim"` are implemented.
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
-### Device settings
+### Device, Performace and Optimization settings
 - `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly. See section [Precision](#Precision).
 - `--latents-half` will switch from using full precision (fp32) latents to using half precision (fp16) latents. The difference in memory usage should be insignificant (<1MB). See section [Precision](#Precision).
 - `--diff-device` sets the device used for the UNET and diffusion sampling loop. `"cuda"` by default.
 - `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cpu"` by default. Switching this to `"cuda"` will increase VRAM usage (~7.32GB instead of ~6.45GB in the example shown in section [Precision](#Precision)), while only speeding up the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
+- `--seq`/`--sequential_samples` will process batch items (if multiple images are to be generated) sequentially, instead of as a single large batch. Reduces VRAM consumption. This flag will activate automatically if generating runs out of memory when more than one image is requested.
 #
 ## image to image
 When either a starting image (`-ii`, see below) or the image cycle flag (`-ic`, see below) are specified, `generate.py` automatically performs image-to-image generation.
@@ -118,7 +119,11 @@ Visualization of the difference between outputs in this example (highlighting of
 - `discord_bot.py` contains an example of a discord bot script, which imports functions from `generate.py` to perform both image-to-image and text-to-image generation. This example bot is not recommended for use outside of trusted, private servers in channels marked as NSFW.
 - Outputs flagged as potentially NSFW will be sent as spoilers, however, this will likely not make them exempt from any content filters or rules.
 - This script uses two threads, one for the discord bot itself, and one for running StableDiffusion. They communicate via queues of pending and completed tasks.
-- Some basic settings (saving outputs to disk, precision, devices, command prefix) can be set using global variables at the top of the script.
+- Some basic settings (saving outputs to disk, precision, devices, command prefix) can be set using global variables at the top of the script:
+  - `SAVE_OUTPUTS_TO_DISK` can be set to `False` if outputs generated through bot commands should not be saved on the device running the bot.
+  - `DEFAULT_HALF_PRECISION` can be set to `False` if the fp32 version of the UNET should be used
+  - `IO_DEVICE` can be set to `"cuda"` if running in a less memory optimized (slightly faster) configuration is desired.
+  - `RUN_ALL_IMAGES_INDIVIDUAL` can be set to `True` to default to running batch items in sequence. Otherwise, the automatic failover should trigger in response to oversized batches.
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
 - The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it be utilized as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.
