@@ -99,8 +99,6 @@ class prompt_task():
             self.datas.append(image_data)
         else:
             print("INFO: Dropping grid image upload, as it exceeds the 8MB limit.")
-        image_data.seek(0)
-        self.datas.append(image_data)
         if len(out) > 1:
             individual_datas = []
             for _ in out:
