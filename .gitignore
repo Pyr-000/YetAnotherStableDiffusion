@@ -5,6 +5,7 @@ outputs/
 bot_token.py
 config.json
 diffusion_pytorch_model.bin
+models/concepts/**/*.bin
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

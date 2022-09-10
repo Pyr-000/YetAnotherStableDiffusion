@@ -27,11 +27,14 @@ from time import time
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 import inspect
 from io import BytesIO
+from pathlib import Path
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
 # for manual model installs
 models_local_dir = "models/stable-diffusion-v1-4"
+# location of textual inversion concepts (if present). (recursively) search for any .bin files. see see: https://huggingface.co/sd-concepts-library
+concepts_dir = "models/concepts"
 # one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep, hip, ve, ort, mps, xla, lazy, vulkan, meta, hpu
 # devices will be set by argparser if used. 
 DIFFUSION_DEVICE = "cuda"
@@ -258,6 +261,13 @@ def load_models(half_precision=False, unet_only=False):
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
     text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
     rate_nsfw = get_safety_checker()
+    concepts_path = Path(concepts_dir)
+    available_concepts = [f for f in concepts_path.rglob("*.bin")]
+    if len(available_concepts) > 0:
+        print(f"Adding {len(available_concepts)} Textual Inversion concepts found in {concepts_path}: ")
+        for item in available_concepts:
+            load_learned_embed_in_clip(item, text_encoder, tokenizer)
+        print("")
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
 def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False):
@@ -518,6 +528,36 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             SUPPLEMENTARY['io']['sequential'] = True
             return out, SUPPLEMENTARY
     return generate_segmented_wrapper
+
+# see: https://huggingface.co/sd-concepts-library | derived from the "Inference Colab" notebook
+# load learned embeds (textual inversion) into an encoder and tokenizer
+def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, target_device="cpu", token=None):
+    loaded_learned_embeds = torch.load(learned_embeds_path, map_location=target_device)
+    # separate token and the embeds
+    trained_token = list(loaded_learned_embeds.keys())[0]
+    embeds = loaded_learned_embeds[trained_token]
+    # cast to dtype of text_encoder
+    dtype = text_encoder.get_input_embeddings().weight.dtype
+    embeds.to(dtype)
+    # add the token in tokenizer
+    token = token if token is not None else trained_token
+    num_added_tokens = tokenizer.add_tokens(token)
+    if num_added_tokens == 0:
+        # simply attempt to add the token with a number suffix
+        for i in range(0, 64):
+            if num_added_tokens == 0:
+                num_added_tokens = tokenizer.add_tokens(f"{token}{i}")
+            else:
+                break
+        if num_added_tokens == 0:
+            print(f"WARNING: The tokenizer already contains the token {token}. Skipping addition!")
+            return
+    # resize the token embeddings
+    text_encoder.resize_token_embeddings(len(tokenizer))
+    # get the id for the token and assign the embeds
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    text_encoder.get_input_embeddings().weight.data[token_id] = embeds
+    print(f" {token}", end="")
 
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False):
