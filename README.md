@@ -125,6 +125,7 @@ Visualization of the difference between outputs in this example (highlighting of
   - `DEFAULT_HALF_PRECISION` can be set to `False` if the fp32 version of the UNET should be used
   - `IO_DEVICE` can be set to `"cuda"` if running in a less memory optimized (slightly faster) configuration is desired.
   - `RUN_ALL_IMAGES_INDIVIDUAL` can be set to `True` to default to running batch items in sequence. Otherwise, the automatic failover should trigger in response to oversized batches.
+  - `FLAG_POTENTIAL_NSFW` can be set to `False` to entirely disable the content check. This will speed up generation slightly, while no longer flagging images and marking them as spoilers.
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
 - The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it be utilized as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.

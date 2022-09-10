@@ -27,6 +27,8 @@ COMMAND_PREFIX = "generate"
 
 # if set to true, requests with an amount > 1 will always be generated sequentially to preserve VRAM. Will slow down generation speed for multiple images.
 RUN_ALL_IMAGES_INDIVIDUAL = False
+# if set to False, images are not checked for potential NSFW content. This disables flagging them as spoilers and speeds up generation slightly.
+FLAG_POTENTIAL_NSFW = True
 
 OUTPUTS_DIR = "outputs/generated"
 INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
@@ -139,6 +141,8 @@ def main():
     #p = load_pipeline(model_id,device,True)
     precision_target_half = DEFAULT_HALF_PRECISION
     tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(precision_target_half)
+    if not FLAG_POTENTIAL_NSFW:
+        rate_nsfw = lambda x: False
     generate_exec = generate_segmented(tokenizer=tokenizer,text_encoder=text_encoder,unet=unet,vae=vae,IO_DEVICE=IO_DEVICE,UNET_DEVICE=UNET_DEVICE,rate_nsfw=rate_nsfw)
     print("loaded models!")
     while True:
@@ -219,21 +223,21 @@ async def switch_h(ctx):
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def square(ctx, prompt:str, init_image:discord.Attachment=None):
     reply = run_advanced(ctx, prompt, attachment=init_image)
-    await ctx.send_response(reply, delete_after=20.0)
+    await ctx.send_response(reply)
 
 @bot.slash_command(name="portrait", description="generate an image with portrait aspect ratio (512x768)")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def portrait(ctx, prompt:str, init_image:discord.Attachment=None):
     reply = run_advanced(ctx, prompt, height=4, attachment=init_image)
-    await ctx.send_response(reply, delete_after=20.0)
+    await ctx.send_response(reply)
 
 @bot.slash_command(name="landscape", description="generate an image with landscape aspect ratio (768x512)")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
     reply = run_advanced(ctx, prompt, width=4, attachment=init_image)
-    await ctx.send_response(reply, delete_after=20.0)
+    await ctx.send_response(reply)
 
 @bot.slash_command(name="advanced", description="generate an image with custom parameters")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
@@ -249,7 +253,7 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("amount",int,description="Amount of images to batch at once.",required=False,default=1)
 async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1):
     reply = run_advanced(ctx, prompt, width, height, seed, gs, steps, eta, eta_seed, strength, init_image, amount)
-    await ctx.send_response(reply, delete_after=20.0)
+    await ctx.send_response(reply)
 
 def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, eta:float=0.0, eta_seed:int=-1, strength:float=0.75, attachment:discord.Attachment=None, amount:int=1):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
@@ -300,16 +304,28 @@ async def poll():
                 if len(datas) < len(files):
                     print(f"Dropped: {len(datas)-len(files)} due to exceeding the 8MB limit")
                 i=0
+                chunk = []
+                chunk_size = 0
                 while len(files)>0:
-                    ten_file_chunk = [files.pop(0) for _ in range(min(10,len(files)))]
-                    print(f"sending chunk: {len(ten_file_chunk)} files")
-                    await task.ctx.send_followup(f"{tag}{'' if i==0 else ' ['+str(i)+']'} \n{task.response}", files=ten_file_chunk)
-                    sleep(1)
-                    i += 1
+                    next_file = files.pop(0)
+                    next_size = next_file.fp.getbuffer().nbytes
+                    # file size limit seems to be applied to the sum of all files, instead of to each file individually. Keeping to <=10 files within the limit (individually) can still cause HTTP413
+                    if (next_size + chunk_size > (8388608 -512)) or (len(chunk) >= 10):
+                        # if too much data would be present, send accumulated data and start a new chunk.
+                        await (task.ctx.edit if i==0 else task.ctx.send_followup)(content=f"{task.response}" if i==0 else f"[{i}]", files=chunk)
+                        sleep(0.2)
+                        chunk = [next_file]
+                        chunk_size = next_size
+                        i += 1
+                    else:
+                        chunk.append(next_file)
+                        chunk_size += next_size
+                if len(chunk) > 0:
+                    await (task.ctx.edit if i==0 else task.ctx.send_followup)(content=f"{task.response}" if i==0 else f"[{i}]", files=chunk)
             else:
-                await task.ctx.send_followup(f"{tag} \n{task.response}", files=None)
+                await task.ctx.edit(content=f"{task.response}", files=None, delete_after=60)
         elif isinstance(task, command_task):
-            await task.ctx.send_followup(f"{tag} \n{task.response}", delete_after=10)
+            await task.ctx.edit(content=f"{task.response}", delete_after=60)
         else:
             print(f"WARNING: unknown task type found in completed_tasks queue: {type(task)}")
         del task
