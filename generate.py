@@ -28,6 +28,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionS
 import inspect
 from io import BytesIO
 from pathlib import Path
+import re
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -53,7 +54,7 @@ os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(type=str, nargs="?", default=None, help="text prompt for generation. Leave unset to enter prompt loop mode. Multiple prompts can be separated by ||.", dest="prompt")
+    parser.add_argument(type=str, nargs="?", default="", help="text prompt for generation. Leave unset to enter prompt loop mode. Multiple prompts can be separated by ||.", dest="prompt")
     parser.add_argument("-ii", "--init-img", type=str, default=None, help="use img2img mode. path to the input image", dest="init_img_path")
     parser.add_argument("-st", "--strength", type=float, default=0.75, help="strength of initial image in img2img. 0.0 -> no new information, 1.0 -> only new information", dest="strength")
     parser.add_argument("-s","--steps", type=int, default=50, help="number of sampling steps", dest="steps")
@@ -74,7 +75,7 @@ def parse_args():
     parser.add_argument("-in", "--interpolate", nargs=2, type=str, help="Two image paths for generating an interpolation animation", default=None, dest='interpolation_targets')
     parser.add_argument("--no-check-nsfw", action="store_true", help="NSFW check will only print a warning and add a metadata label if enabled. This flag disables NSFW check entirely to speed up generation.", dest="no_check")
     parser.add_argument("-pf", "--prompts-file", type=str, help="Path of file containing prompts. One line per prompt.", default=None, dest='prompts_file')
-    parser.add_argument("-ic", "--image-cycles", type=int, help="Repetition count when using image2image", default=0, dest='img_cycles')
+    parser.add_argument("-ic", "--image-cycles", type=int, help="Repetition count when using image2image. Will interpolate between multiple prompts when || is used.", default=0, dest='img_cycles')
     parser.add_argument("-cni", "--cycle-no-save-individual", action="store_false", help="Disables saving of individual images in image cycle mode.", dest="image_cycle_save_individual")
     parser.add_argument("-iz", "--image-zoom", type=int, help="Amount of zoom (pixels cropped per side) for each subsequent img2img cycle", default=0, dest='img_zoom')
     parser.add_argument("-ir", "--image-rotate", type=int, help="Amount of rotation (counter-clockwise degrees) for each subsequent img2img cycle", default=0, dest='img_rotation')
@@ -82,6 +83,7 @@ def parse_args():
     parser.add_argument("-irc", "--image-rotation-center", type=int, help="Center of rotational axis when applying rotation (0,0 -> top left corner) Default is the image center", default=None, nargs=2, dest='img_center')
     parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.2, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
     parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep lightness and colorization distribution the same as it was initially (LAB histogram cdf matching). Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
+    parser.add_argument("-cfi", "--cycle-fresh-image", action="store_true", help="When cycling images (-ic), create a fresh image (use text-to-image) in each cycle. Useful for interpolating prompts (especially with fixed seed)", dest="cycle_fresh")
     return parser.parse_args()
 
 def main():
@@ -170,16 +172,20 @@ def main():
     if args.img_cycles > 0:
         # sequence prompts across all iterations
         prompts = [p.strip() for p in args.prompt.split("||")]
-        iter_per_prompt = args.img_cycles / len(prompts)
+        iter_per_prompt = (args.img_cycles / (len(prompts)-1)) if args.cycle_fresh and (len(prompts) > 1) else args.image_cycles / len(prompts)
         def index_prompt(i):
-            return prompts[int(i/iter_per_prompt)]
-        correction_target = None
+            prompt_idx = int(i/iter_per_prompt)
+            progress_in_idx = i % iter_per_prompt
+            # interpolate through the prompts in the text encoding space, using prompt mixing. Set weights from the frame count between the prompts
+            return prompts[prompt_idx] if not prompt_idx+1 in range(len(prompts)) else f"{prompts[prompt_idx]};{iter_per_prompt-progress_in_idx};{prompts[prompt_idx+1]};{progress_in_idx};"
+        correction_target = None    
         # first frame is the initial image, if it exists.
         frames = [init_image] if init_image is not None else []
         try:
             for i in tqdm(range(args.img_cycles), position=0, desc="Image cycle"):
                 if args.cycle_color_correction and correction_target is None and init_image is not None:
                     correction_target = image_to_correction_target(init_image)
+                init_image = init_image if not args.cycle_fresh else None
                 out, SUPPLEMENTARY = one_generation(index_prompt(i), init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
@@ -274,6 +280,115 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
     vae.to(IO_DEVICE)
     text_encoder.to(IO_DEVICE)
     unet.to(UNET_DEVICE)
+
+    @torch.no_grad()
+    def perform_text_encode(prompt):
+        io_data = {}
+        # text embeddings
+        text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt", return_overflowing_tokens=True)
+        num_truncated_tokens = text_input.num_truncated_tokens
+        io_data["text_readback"] = tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)
+        # if a batch element had items truncated, the remaining token count is the negative of the amount of truncated tokens
+        # otherwise, count the amount of <|endoftext|> in the readback. Sidenote: this will report incorrectly if the prompt is below the token limit and happens to contain "<|endoftext|>" for some unthinkable reason.
+        io_data["remaining_token_count"] = [(- item) if item>0 else (io_data["text_readback"][idx].count("<|endoftext|>") - 1) for (item,idx) in zip(num_truncated_tokens,range(len(num_truncated_tokens)))]
+        io_data["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in io_data["text_readback"]]
+        io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist()
+        # TODO: implement custom attention masks?
+        text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE))[0]
+        return text_embeddings, io_data
+
+    @torch.no_grad()
+    def encode_prompt(prompt):
+        uncond_input = tokenizer([""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+        one_uncond_embedding = text_encoder(uncond_input.input_ids.to(IO_DEVICE))[0]
+        io_data = {"text_readback":[], "remaining_token_count":[], "attention":[]}
+        text_embeddings = []
+        for raw_item in prompt:
+            # create sequence of substrings followed by weight multipliers: substr,w,substr,w,... (w may be empty string - use default: 1, last trailing substr may be empty string)
+            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*);", raw_item)
+            if len(prompt_segments) == 1:
+                # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
+                new_text_embeddings, new_io_data = perform_text_encode(raw_item)
+            else:
+                # print(f"Mixing {len(prompt_segments)//2} prompts with their respective weights")
+                # perpare invalid segments list to desired shape after splitting
+                if len(prompt_segments) % 2 == 1:
+                    if prompt_segments[-1] == "":
+                        # if last prompt in sequence is terminated by a weight, remove trailing empty prompt created by splitting.
+                        prompt_segments = prompt_segments[:-1]
+                    else:
+                        # if last prompt in sequence is not empty, but lacks a trailing weight, append an empty weight.
+                        prompt_segments.append("")
+
+                # encoding tensors will be summed up with their respective multipliers (could be positive or negative).
+                # Final tensor will be divided by (absolute!) sum of multipliers.
+                encodings_sum_positive = None
+                encodings_sum_negative = None
+                multiplier_sum_positive = 0
+                multiplier_sum_negative = 0
+                new_io_data = {"text_readback":[], "remaining_token_count":[], "attention":[]}
+                for i, segment in enumerate(prompt_segments):
+                    if i % 2 == 0:
+                        next_encoding, next_io_data = perform_text_encode(segment)
+                        for key in next_io_data:
+                            # glue together the io_data sublist of all the prompts being mixed
+                            new_io_data[key] += next_io_data[key]
+                    else:
+                        # get multiplier. 1 if no multiplier is present.
+                        multiplier = 1 if segment == "" else float(segment)
+                        new_io_data["text_readback"].append(f";{multiplier};")
+                        # add either to positive, or to negative encodings & multipliers
+                        is_negative_multiplier = multiplier < 0
+                        if is_negative_multiplier:
+                            multiplier_sum_negative += abs(multiplier)
+                            if encodings_sum_negative is None:
+                                # if sum is empty, write first item.
+                                encodings_sum_negative = next_encoding*multiplier
+                            else:
+                                # add new encodings to sum based on their multiplier
+                                encodings_sum_negative += next_encoding*multiplier
+                        else:
+                            multiplier_sum_positive += multiplier
+                            if encodings_sum_positive is None:
+                                # if sum is empty, write first item.
+                                encodings_sum_positive = next_encoding*multiplier
+                            else:
+                                # add new encodings to sum based on their multiplier
+                                encodings_sum_positive += next_encoding*multiplier
+                if encodings_sum_positive is None:
+                    print("WARNING: only negative multipliers for prompt mixing are present. This should be done by using positive multipliers with a negative guidance scale! Using as prompts with positive multipliers!")
+                    new_text_embeddings = encodings_sum_negative / multiplier_sum_negative
+                else:
+                    new_text_embeddings = encodings_sum_positive / multiplier_sum_positive
+                    if encodings_sum_negative is not None:
+                        # compute offset of negative embeddings sum from unconditional embeddings, subtract this offset (the change from uncond caused by the negative prompts) from the positive embeddings.
+                        negative_embeddings_offset = (encodings_sum_negative / multiplier_sum_negative) - one_uncond_embedding
+                        new_text_embeddings -= negative_embeddings_offset
+
+            text_embeddings.append(new_text_embeddings)
+            for key in new_io_data:
+                io_data[key].append(new_io_data[key])
+
+        # if only one (sub)prompt was actually processed, use the io_data un-encapsulated
+        if len(io_data["text_readback"]) == 1:
+            for key in io_data:
+                io_data[key] = io_data[key][0]
+
+        # stack list of text encodings to be processed back into a tensor
+        text_embeddings = torch.cat(text_embeddings)
+        # get the resulting batch size
+        batch_size = len(text_embeddings)
+        max_length = text_embeddings.shape[1]
+        # create tensor of uncond embeddings for the batch size by stacking n instances of the singular uncond embedding
+        uncond_embeddings = torch.stack([one_uncond_embedding[0]] * batch_size)
+        # n*77*768 + n*77*768 -> 2n*77*768
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+        if half_precision_latents:
+                text_embeddings = text_embeddings.to(dtype=torch.float16)
+        text_embeddings = text_embeddings.to(UNET_DEVICE)
+
+        return text_embeddings, batch_size, io_data
+
     def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
@@ -320,33 +435,12 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             generator_eta = torch.manual_seed(eta_seed)
             generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
 
-            batch_size = len(prompt)
             sched_name = sched_name.lower().strip()
             SUPPLEMENTARY["io"]["sched_name"]=sched_name
 
-            # text embeddings
-            text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt", return_overflowing_tokens=True)
-            num_truncated_tokens = text_input.num_truncated_tokens
-            SUPPLEMENTARY["io"]["text_readback"] = tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)
-            # if a batch element had items truncated, the remaining token count is the negative of the amount of truncated tokens
-            # otherwise, count the amount of <|endoftext|> in the readback. Sidenote: this will report incorrectly if the prompt is below the token limit and happens to contain "<|endoftext|>" for some unthinkable reason.
-            SUPPLEMENTARY["io"]["remaining_token_count"] = [(- item) if item>0 else (SUPPLEMENTARY["io"]["text_readback"][idx].count("<|endoftext|>") - 1) for (item,idx) in zip(num_truncated_tokens,range(len(num_truncated_tokens)))]
-            SUPPLEMENTARY["io"]["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in SUPPLEMENTARY["io"]["text_readback"]]
-            SUPPLEMENTARY["io"]["attention"] = text_input.attention_mask.cpu().numpy().tolist()
-            # TODO: implement custom attention masks!
-
-            text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE))[0]
-            max_length = text_input.input_ids.shape[-1]
-            uncond_input = tokenizer([""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt")
-            uncond_embeddings = text_encoder(uncond_input.input_ids.to(IO_DEVICE))[0]
-            #text_embeddings.to(UNET_DEVICE)
-            #uncond_embeddings.to(UNET_DEVICE)
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-            if half_precision_latents:
-                    text_embeddings = text_embeddings.to(dtype=torch.float16)
-            text_embeddings = text_embeddings.to(UNET_DEVICE)
-
-            
+            text_embeddings, batch_size, io_data = encode_prompt(prompt)
+            for key in io_data:
+                SUPPLEMENTARY["io"][key] = io_data[key]
 
             # schedulers
             if high_beta:
@@ -434,7 +528,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                         latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
 
             # free up some now unused memory before attempting VAE decode!
-            del noise_pred, noise_pred_text, noise_pred_uncond, latent_model_input, scheduler, text_embeddings, uncond_embeddings, uncond_input, text_input
+            del noise_pred, noise_pred_text, noise_pred_uncond, latent_model_input, scheduler, text_embeddings
             gc.collect()
             if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                 torch.cuda.empty_cache()

@@ -37,6 +37,15 @@ os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 
+def flatten_sublist(input_item):
+    if not isinstance(input_item, list):
+        return [input_item]
+    else:
+        concat = []
+        for item in input_item:
+            concat += flatten_sublist(item)
+        return concat
+
 class command_task():
     def __init__(self,ctx:discord.commands.context.ApplicationContext,command:str) -> None:
         self.ctx=ctx
@@ -123,10 +132,12 @@ class prompt_task():
             argdict.pop("eta_seed")
 
         text_readback = argdict.pop("text_readback")
-        if len(set(text_readback)) == 1:
-            text_readback = text_readback[0]
-        if len(set(argdict["remaining_token_count"])) == 1:
-            argdict["remaining_token_count"] = argdict["remaining_token_count"][0]
+        text_readback_flat = flatten_sublist(text_readback)
+        token_counts_flat = flatten_sublist(argdict["remaining_token_count"])
+        if len(set(text_readback_flat)) == 1:
+            text_readback = text_readback_flat[0]
+        if len(set(token_counts_flat)) == 1:
+            argdict["remaining_token_count"] = token_counts_flat[0]
         self.response = f"{text_readback} ```{argdict}```"
 
 task_queue = []
