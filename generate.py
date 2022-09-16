@@ -172,7 +172,7 @@ def main():
     if args.img_cycles > 0:
         # sequence prompts across all iterations
         prompts = [p.strip() for p in args.prompt.split("||")]
-        iter_per_prompt = (args.img_cycles / (len(prompts)-1)) if args.cycle_fresh and (len(prompts) > 1) else args.image_cycles / len(prompts)
+        iter_per_prompt = (args.img_cycles / (len(prompts)-1)) if args.cycle_fresh and (len(prompts) > 1) else args.img_cycles / len(prompts)
         def index_prompt(i):
             prompt_idx = int(i/iter_per_prompt)
             progress_in_idx = i % iter_per_prompt
