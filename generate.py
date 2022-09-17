@@ -29,6 +29,7 @@ import inspect
 from io import BytesIO
 from pathlib import Path
 import re
+from tokens import get_huggingface_token
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -52,13 +53,15 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
+IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim"]
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(type=str, nargs="?", default="", help="text prompt for generation. Leave unset to enter prompt loop mode. Multiple prompts can be separated by ||.", dest="prompt")
     parser.add_argument("-ii", "--init-img", type=str, default=None, help="use img2img mode. path to the input image", dest="init_img_path")
     parser.add_argument("-st", "--strength", type=float, default=0.75, help="strength of initial image in img2img. 0.0 -> no new information, 1.0 -> only new information", dest="strength")
     parser.add_argument("-s","--steps", type=int, default=50, help="number of sampling steps", dest="steps")
-    parser.add_argument("-sc","--scheduler", type=str, default="pndm", choices=["lms", "pndm", "ddim"], help="scheduler used when sampling in the diffusion loop", dest="sched_name")
+    parser.add_argument("-sc","--scheduler", type=str, default="pndm", choices=IMPLEMENTED_SCHEDULERS, help="scheduler used when sampling in the diffusion loop", dest="sched_name")
     parser.add_argument("-e", "--ddim-eta", type=float, default=0.0, help="eta adds additional random noise when sampling, only applied on ddim sampler. 0 -> deterministic", dest="ddim_eta")
     parser.add_argument("-es","--ddim-eta-seed", type=int, default=None, help="secondary seed for the eta noise with ddim sampler and eta>0", dest="eta_seed")
     parser.add_argument("-H","--H", type=int, default=512, help="image height, in pixel space", dest="height")
@@ -92,7 +95,7 @@ def main():
     args = parse_args()
     DIFFUSION_DEVICE = args.diffusion_device
     IO_DEVICE = args.io_device
-    
+
     # load up models
     tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(half_precision=args.half)
     if args.no_check:
@@ -107,120 +110,26 @@ def main():
         create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae)
         exit()
 
-    # fix values to multiples of 64 before init image resize in case of img2img cycling
-    args.width = int(args.width/64)*64
-    args.height = int(args.height/64)*64
-    init_image = None
-    if args.init_img_path is not None:
-        init_image = Image.open(args.init_img_path).convert("RGB")
-        if init_image.size != (args.width,args.height):
-            # if lanczos resampling is required, apply a small amount of post-sharpening
-            init_image = init_image.resize((args.width, args.height), resample=Image.Resampling.LANCZOS)
-            enhancer_sharpen = ImageEnhance.Sharpness(init_image)
-            init_image = enhancer_sharpen.enhance(1.15)
+    generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
+    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True)
 
-    args.strength = args.strength if args.strength < 1.0 else 1.0
-    args.strength = args.strength if args.strength > 0.0 else 0.0
-    generate_exec = generate_segmented(tokenizer=tokenizer,text_encoder=text_encoder,unet=unet,vae=vae,IO_DEVICE=IO_DEVICE,UNET_DEVICE=DIFFUSION_DEVICE,rate_nsfw=rate_nsfw,half_precision_latents=args.half_latents)
-
-    def one_generation(prompt, init_image, display_with_cv2=False, save_latents=True, save_images=True):
-        prompt = prompt if prompt is not None else ""
-        prompts = [x.strip() for x in prompt.split("||")]*args.n_samples
-        out, SUPPLEMENTARY = generate_exec(
-            prompts,
-            width=args.width,
-            height=args.height,
-            steps=args.steps,
-            gs=args.guidance_scale,
-            seed=args.seed,
-            sched_name=args.sched_name,
-            eta=args.ddim_eta,
-            eta_seed=args.eta_seed,
-            init_image=init_image,
-            img_strength=args.strength,
-            animate=args.animate,
-            save_latents=save_latents,
-            sequential=args.sequential_samples
-        )
-        argdict = SUPPLEMENTARY["io"]
-        final_latent = SUPPLEMENTARY['latent']['final_latent']
-        PIL_animation_frames = argdict.pop("image_sequence")
-        if argdict["width"] == 512:
-            argdict.pop("width")
-        if argdict["height"] == 512:
-            argdict.pop("height")
-        if not argdict["nsfw"]:
-            argdict.pop("nsfw")
-        if not ("ddim" in argdict["sched_name"] and argdict["eta"] > 0):
-            argdict.pop("eta")
-            argdict.pop("eta_seed")
-        save_output(prompts, out, argdict, save_images, final_latent, display_with_cv2)
-        if args.animate:
-            # init frames by image list
-            frames_by_image = []
-            # one sublist per image
-            for _ in range(len(PIL_animation_frames[0])):
-                frames_by_image.append([])
-            for images_of_step in PIL_animation_frames:
-                for (image, image_sublist_index) in zip(images_of_step, range(len(images_of_step))):
-                    frames_by_image[image_sublist_index].append(image)
-            # remove the last frame of each sequence. It appears to be an extra, overly noised image
-            frames_by_image = [list_of_frames[:-1] for list_of_frames in frames_by_image]
-            save_animations(frames_by_image)
-        return out,SUPPLEMENTARY
+    init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
 
     if args.img_cycles > 0:
-        # sequence prompts across all iterations
-        prompts = [p.strip() for p in args.prompt.split("||")]
-        iter_per_prompt = (args.img_cycles / (len(prompts)-1)) if args.cycle_fresh and (len(prompts) > 1) else args.img_cycles / len(prompts)
-        def index_prompt(i):
-            prompt_idx = int(i/iter_per_prompt)
-            progress_in_idx = i % iter_per_prompt
-            # interpolate through the prompts in the text encoding space, using prompt mixing. Set weights from the frame count between the prompts
-            return prompts[prompt_idx] if not prompt_idx+1 in range(len(prompts)) else f"{prompts[prompt_idx]};{iter_per_prompt-progress_in_idx};{prompts[prompt_idx+1]};{progress_in_idx};"
-        correction_target = None    
-        # first frame is the initial image, if it exists.
-        frames = [init_image] if init_image is not None else []
-        try:
-            for i in tqdm(range(args.img_cycles), position=0, desc="Image cycle"):
-                if args.cycle_color_correction and correction_target is None and init_image is not None:
-                    correction_target = image_to_correction_target(init_image)
-                init_image = init_image if not args.cycle_fresh else None
-                out, SUPPLEMENTARY = one_generation(index_prompt(i), init_image, display_with_cv2=IMAGE_CYCLE_DISPLAY_CV2, save_latents=args.image_cycle_save_individual, save_images=args.image_cycle_save_individual)
-                if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                next_frame = out[0]
-                frames.append(next_frame.copy())
-                init_image = process_cycle_image(next_frame, args.img_rotation, args.img_center, args.img_translation, args.img_zoom, args.cycle_sharpen, args.width, args.height, args.cycle_color_correction, correction_target)
-
-        except KeyboardInterrupt:
-            # when an interrupt is received, cancel cycles and attempt to save any already generated images.
-            pass
-        if not args.image_cycle_save_individual:
-            # if images are not saved on every step, save the final image separately
-            try:
-                argdict = SUPPLEMENTARY["io"]
-                final_latent = SUPPLEMENTARY['latent']['final_latent']
-                save_output(args.prompt, out, argdict, True, final_latent, False)
-            except Exception as e:
-                tqdm.write(f"Saving final image failed: {e}")
-        save_animations([frames])
+        generator.perform_image_cycling(args.prompt, args.img_cycles, args.image_cycle_save_individual, init_image, args.cycle_fresh, args.cycle_color_correction, None, args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen)
         exit()
 
-
     if args.prompts_file is not None:
-        lines = [line.strip() for line in codecs.open("./artists.txt", "r", "utf-8-sig").readlines()]
+        lines = [line.strip() for line in codecs.open(args.prompts_file, "r").readlines()]
         for line in tqdm(lines, position=0, desc="Input prompts"):
-            one_generation(line, init_image)
+            generator.one_generation(line, init_image)
     elif args.prompt is not None:
-        one_generation(args.prompt, init_image)
+        generator.one_generation(args.prompt, init_image)
     else:
         while True:
             prompt = input("Prompt> ").strip()
             try:
-                one_generation(prompt, init_image)
+                generator.one_generation(prompt, init_image)
             except KeyboardInterrupt:
                 pass
             except Exception as e:
@@ -235,8 +144,8 @@ def load_models(half_precision=False, unet_only=False):
 
     unet_model_id = model_id
     vae_model_id = model_id
-    use_auth_token_unet=True
-    use_auth_token_vae=True
+    use_auth_token_unet=get_huggingface_token()
+    use_auth_token_vae=get_huggingface_token()
 
     unet_dir = os.path.join(models_local_dir, "unet")
     if os.path.exists(os.path.join(unet_dir, "config.json")) and os.path.exists(os.path.join(unet_dir, "diffusion_pytorch_model.bin")):
@@ -389,191 +298,191 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
 
         return text_embeddings, batch_size, io_data
 
+    @torch.no_grad()
     def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
             torch.cuda.empty_cache()
-        with torch.no_grad():
-            START_TIME = time()
+        START_TIME = time()
 
-            SUPPLEMENTARY = {
-                "io" : {
-                    "width" : 0,
-                    "height" : 0,
-                    "steps" : steps,
-                    "gs" : gs,
-                    "text_readback" : "",
-                    "nsfw" : False,
-                    "remaining_token_count" : 0,
-                    "time" : 0.0,
-                    "image_sequence" : [],
-                    "seed" : 0,
-                    "eta_seed" : 0,
-                    "eta" : eta,
-                    "sched_name" : None,
-                    "attention" : [],
-                },
-                "latent" : {
-                    "final_latent" : None,
-                    "latent_sequence" : [],
-                },
-            }
+        SUPPLEMENTARY = {
+            "io" : {
+                "width" : 0,
+                "height" : 0,
+                "steps" : steps,
+                "gs" : gs,
+                "text_readback" : "",
+                "nsfw" : False,
+                "remaining_token_count" : 0,
+                "time" : 0.0,
+                "image_sequence" : [],
+                "seed" : 0,
+                "eta_seed" : 0,
+                "eta" : eta,
+                "sched_name" : None,
+                "attention" : [],
+            },
+            "latent" : {
+                "final_latent" : None,
+                "latent_sequence" : [],
+            },
+        }
 
-            # truncate incorrect input dimensions to a multiple of 64
-            if isinstance(prompt, str):
-                prompt = [prompt]
-            height = int(height/64.0)*64
-            width = int(width/64.0)*64
-            SUPPLEMENTARY["io"]["height"] = height
-            SUPPLEMENTARY["io"]["width"] = width
-            # torch.manual_seed: Value must be within the inclusive range [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff], negative values remapped to positive
-            # 0xffff_ffff_ffff_ffff == 18446744073709551615
-            seed = seed if seed is not None else random.randint(1, 18446744073709551615)
-            eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709551615)
-            SUPPLEMENTARY["io"]["seed"] = seed
-            SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
-            generator_eta = torch.manual_seed(eta_seed)
-            generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
+        # truncate incorrect input dimensions to a multiple of 64
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        height = int(height/64.0)*64
+        width = int(width/64.0)*64
+        SUPPLEMENTARY["io"]["height"] = height
+        SUPPLEMENTARY["io"]["width"] = width
+        # torch.manual_seed: Value must be within the inclusive range [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff], negative values remapped to positive
+        # 0xffff_ffff_ffff_ffff == 18446744073709551615
+        seed = seed if seed is not None else random.randint(1, 18446744073709551615)
+        eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709551615)
+        SUPPLEMENTARY["io"]["seed"] = seed
+        SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
+        generator_eta = torch.manual_seed(eta_seed)
+        generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
 
-            sched_name = sched_name.lower().strip()
-            SUPPLEMENTARY["io"]["sched_name"]=sched_name
+        sched_name = sched_name.lower().strip()
+        SUPPLEMENTARY["io"]["sched_name"]=sched_name
 
-            text_embeddings, batch_size, io_data = encode_prompt(prompt)
-            for key in io_data:
-                SUPPLEMENTARY["io"][key] = io_data[key]
+        text_embeddings, batch_size, io_data = encode_prompt(prompt)
+        for key in io_data:
+            SUPPLEMENTARY["io"][key] = io_data[key]
 
-            # schedulers
-            if high_beta:
-                # scheduler default
-                beta_start = 0.0001
-                beta_end = 0.02
-            else:
-                # stablediffusion default
-                beta_start = 0.00085
-                beta_end = 0.012
-            if "lms" in sched_name:
-                scheduler = LMSDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
-            elif "pndm" in sched_name:
-                # "for some models like stable diffusion the prk steps can/should be skipped to produce better results."
-                scheduler = PNDMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000, skip_prk_steps=True) # <-- pipeline default
-            elif "ddim" in sched_name:
-                scheduler = DDIMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
-            # set timesteps. Also offset, as pipeline does this
-            accepts_offset = "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-            if accepts_offset:
-                scheduler_offset=1
-                scheduler.set_timesteps(steps, offset=1)
-            else:
-                scheduler_offset=0
-                scheduler.set_timesteps(steps)
+        # schedulers
+        if high_beta:
+            # scheduler default
+            beta_start = 0.0001
+            beta_end = 0.02
+        else:
+            # stablediffusion default
+            beta_start = 0.00085
+            beta_end = 0.012
+        if "lms" in sched_name:
+            scheduler = LMSDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+        elif "pndm" in sched_name:
+            # "for some models like stable diffusion the prk steps can/should be skipped to produce better results."
+            scheduler = PNDMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000, skip_prk_steps=True) # <-- pipeline default
+        elif "ddim" in sched_name:
+            scheduler = DDIMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+        # set timesteps. Also offset, as pipeline does this
+        accepts_offset = "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if accepts_offset:
+            scheduler_offset=1
+            scheduler.set_timesteps(steps, offset=1)
+        else:
+            scheduler_offset=0
+            scheduler.set_timesteps(steps)
 
-            if isinstance(scheduler, LMSDiscreteScheduler):
-                latents = latents * scheduler.sigmas[0]
+        if isinstance(scheduler, LMSDiscreteScheduler):
+            latents = latents * scheduler.sigmas[0]
 
-            
-            starting_timestep = 0
-            # initial noise latents
-            if init_image is None:
-                latents = torch.randn((batch_size, unet.in_channels, height // 8, width // 8), device=IO_DEVICE, generator=generator_unet)
-                if half_precision_latents:
-                    latents = latents.to(dtype=torch.float16)
-                latents = latents.to(UNET_DEVICE)
-            else:
-                SUPPLEMENTARY["io"]["strength"] = img_strength
-                init_image = init_image.resize((width,height), resample=Image.Resampling.LANCZOS)
-                image_processing = np.array(init_image).astype(np.float32) / 255.0
-                image_processing = image_processing[None].transpose(0, 3, 1, 2)
-                init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
-                init_latents = vae.encode(init_image_tensor.to(IO_DEVICE)).sample()
-                # apply inverse scaling
-                init_latents = 0.18215 * init_latents
-                init_latents = torch.cat([init_latents] * batch_size)
-                init_timestep = int(steps * img_strength) + scheduler_offset
-                init_timestep = min(init_timestep, steps)
-                timesteps = scheduler.timesteps[-init_timestep]
-                timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=IO_DEVICE)
-                noise = torch.randn(init_latents.shape, generator=generator_unet, device=IO_DEVICE)
-                init_latents = scheduler.add_noise(init_latents, noise, timesteps)
-                if half_precision_latents:
-                    init_latents = init_latents.to(dtype=torch.float16)
-                latents = init_latents.to(UNET_DEVICE)
-                starting_timestep = max(steps - init_timestep + scheduler_offset, 0)
+        starting_timestep = 0
+        # initial noise latents
+        if init_image is None:
+            latents = torch.randn((batch_size, unet.in_channels, height // 8, width // 8), device=IO_DEVICE, generator=generator_unet)
+            if half_precision_latents:
+                latents = latents.to(dtype=torch.float16)
+            latents = latents.to(UNET_DEVICE)
+        else:
+            SUPPLEMENTARY["io"]["strength"] = img_strength
+            init_image = init_image.resize((width,height), resample=Image.Resampling.LANCZOS)
+            image_processing = np.array(init_image).astype(np.float32) / 255.0
+            image_processing = image_processing[None].transpose(0, 3, 1, 2)
+            init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
+            init_latents = vae.encode(init_image_tensor.to(IO_DEVICE)).sample()
+            # apply inverse scaling
+            init_latents = 0.18215 * init_latents
+            init_latents = torch.cat([init_latents] * batch_size)
+            init_timestep = int(steps * img_strength) + scheduler_offset
+            init_timestep = min(init_timestep, steps)
+            timesteps = scheduler.timesteps[-init_timestep]
+            timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=IO_DEVICE)
+            noise = torch.randn(init_latents.shape, generator=generator_unet, device=IO_DEVICE)
+            init_latents = scheduler.add_noise(init_latents, noise, timesteps)
+            if half_precision_latents:
+                init_latents = init_latents.to(dtype=torch.float16)
+            latents = init_latents.to(UNET_DEVICE)
+            starting_timestep = max(steps - init_timestep + scheduler_offset, 0)
 
-            # denoising loop!
-            with autocast(UNET_DEVICE):
-                #print(f"{unet.device} {latents.device} {text_embeddings.device}")
-                for i, t in tqdm(enumerate(scheduler.timesteps[starting_timestep:]), position=1):
-                    if animate:
-                        SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
-                    # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-                    latent_model_input = torch.cat([latents] * 2)
-                    if isinstance(scheduler, LMSDiscreteScheduler):
-                        sigma = scheduler.sigmas[i]
-                        latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
+        # denoising loop!
+        with autocast(UNET_DEVICE):
+            #print(f"{unet.device} {latents.device} {text_embeddings.device}")
+            for i, t in tqdm(enumerate(scheduler.timesteps[starting_timestep:]), position=1):
+                if animate:
+                    SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
+                # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+                latent_model_input = torch.cat([latents] * 2)
+                if isinstance(scheduler, LMSDiscreteScheduler):
+                    sigma = scheduler.sigmas[i]
+                    latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
 
-                    # predict the noise residual
-                    with torch.no_grad():
-                        noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
-
-                    # perform guidance
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond)
-
-                    # compute the previous noisy sample x_t -> x_t-1
-                    if isinstance(scheduler, LMSDiscreteScheduler):
-                        latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
-                    elif isinstance(scheduler, DDIMScheduler):
-                        latents = scheduler.step(noise_pred, t, latents, eta=eta, generator=generator_eta)["prev_sample"]
-                    else:
-                        latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
-
-            # free up some now unused memory before attempting VAE decode!
-            del noise_pred, noise_pred_text, noise_pred_uncond, latent_model_input, scheduler, text_embeddings
-            gc.collect()
-            if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
-                torch.cuda.empty_cache()
-
-            # save last latent before scaling!
-            if save_latents:
-                SUPPLEMENTARY["latent"]["final_latent"] = latents.clone().cpu()
-            if animate:
-                SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
-            # scale and decode the image latents with vae
-            latents = 1 / 0.18215 * latents
-            latents = latents.to(IO_DEVICE)
-            latents = latents.to(vae.dtype)
-            image = vae.decode(latents)
-
-            # latents are decoded and copied (if requested) by now.
-            del latents
-
-            def to_pil(image, should_rate_nsfw:bool=True):
-                image = (image / 2 + 0.5).clamp(0, 1)
-                image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-                if should_rate_nsfw:
-                    has_nsfw = rate_nsfw(image)
-                else:
-                    has_nsfw = False
-                images = (image * 255).round().astype("uint8")
-                pil_images = [Image.fromarray(image) for image in images]
-                return pil_images, has_nsfw
-
-            pil_images, has_nsfw = to_pil(image)
-            SUPPLEMENTARY["io"]["nsfw"] = has_nsfw
-            if animate:
-                # swap places between UNET and VAE to speed up large batch decode. then swap back.
-                unet.to(IO_DEVICE)
-                vae.to(DIFFUSION_DEVICE)
-                torch.cuda.synchronize()
+                # predict the noise residual
                 with torch.no_grad():
-                    # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
-                    SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae.decode(item.to(DIFFUSION_DEVICE) * (1 / 0.18215)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
-                torch.cuda.synchronize()
-                vae.to(IO_DEVICE)
-                unet.to(DIFFUSION_DEVICE)
-            SUPPLEMENTARY["io"]["time"] = time() - START_TIME
+                    noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
 
-            return pil_images, SUPPLEMENTARY
+                # perform guidance
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond)
+
+                # compute the previous noisy sample x_t -> x_t-1
+                if isinstance(scheduler, LMSDiscreteScheduler):
+                    latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
+                elif isinstance(scheduler, DDIMScheduler):
+                    latents = scheduler.step(noise_pred, t, latents, eta=eta, generator=generator_eta)["prev_sample"]
+                else:
+                    latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
+
+        # free up some now unused memory before attempting VAE decode!
+        del noise_pred, noise_pred_text, noise_pred_uncond, latent_model_input, scheduler, text_embeddings
+        gc.collect()
+        if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
+            torch.cuda.empty_cache()
+
+        # save last latent before scaling!
+        if save_latents:
+            SUPPLEMENTARY["latent"]["final_latent"] = latents.clone().cpu()
+        if animate:
+            SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
+        # scale and decode the image latents with vae
+        latents = 1 / 0.18215 * latents
+        latents = latents.to(IO_DEVICE)
+        latents = latents.to(vae.dtype)
+        image = vae.decode(latents)
+
+        # latents are decoded and copied (if requested) by now.
+        del latents
+
+        def to_pil(image, should_rate_nsfw:bool=True):
+            image = (image / 2 + 0.5).clamp(0, 1)
+            image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+            if should_rate_nsfw:
+                has_nsfw = rate_nsfw(image)
+            else:
+                has_nsfw = False
+            images = (image * 255).round().astype("uint8")
+            pil_images = [Image.fromarray(image) for image in images]
+            return pil_images, has_nsfw
+
+        pil_images, has_nsfw = to_pil(image)
+        SUPPLEMENTARY["io"]["nsfw"] = has_nsfw
+        if animate:
+            # swap places between UNET and VAE to speed up large batch decode. then swap back.
+            unet.to(IO_DEVICE)
+            vae.to(DIFFUSION_DEVICE)
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
+                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae.decode(item.to(DIFFUSION_DEVICE) * (1 / 0.18215)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+            torch.cuda.synchronize()
+            vae.to(IO_DEVICE)
+            unet.to(DIFFUSION_DEVICE)
+        SUPPLEMENTARY["io"]["time"] = time() - START_TIME
+
+        return pil_images, SUPPLEMENTARY
+
     def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False):
         exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents}
         if not sequential:
@@ -881,6 +790,7 @@ def save_animations(images_with_frames):
         except:
             print_exc()
     print(f"Saved files with prefix {image_basepath}")
+    return image_basepath
 
 def create_interpolation(a, b, steps, vae):
     al = load_latents_from_image(a)
@@ -898,6 +808,173 @@ def create_interpolation(a, b, steps, vae):
         # processing images in target device one-by-one saves VRAM.
         image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
+
+class Placeholder():
+    pass
+
+placeholder = Placeholder()
+class QuickGenerator():
+    def __init__(self,tokenizer,text_encoder,unet,vae,IO_DEVICE,UNET_DEVICE,rate_nsfw,use_half_latents):
+        gc.collect()
+        if "cuda" in [IO_DEVICE, UNET_DEVICE]:
+            torch.cuda.empty_cache()
+        self.generate_exec = generate_segmented(tokenizer=tokenizer,text_encoder=text_encoder,unet=unet,vae=vae,IO_DEVICE=IO_DEVICE,UNET_DEVICE=UNET_DEVICE,rate_nsfw=rate_nsfw,half_precision_latents=use_half_latents)
+        self.sample_count=1
+        self.width,self.height=512,512
+        self.steps=50
+        self.guidance_scale=7.5
+        self.seed=None
+        self.sched_name="pndm"
+        self.ddim_eta=0.0
+        self.eta_seed=None
+        self.strength=0.75
+        self.animate=False
+        self.sequential_samples=False
+        self.save_latents=True
+        self.display_with_cv2=True
+
+    # use Placeholder as the default value when the setting should not be changed. None is a valid value for some settings.
+    def configure(self,
+            sample_count:int=placeholder,
+            width:int=placeholder,
+            height:int=placeholder,
+            steps:int=placeholder,
+            guidance_scale:float=placeholder,
+            seed:int=placeholder,
+            sched_name:str=placeholder,
+            ddim_eta:float=placeholder,
+            eta_seed:int=placeholder,
+            strength:float=placeholder,
+            animate:bool=placeholder,
+            sequential_samples:bool=placeholder,
+            save_latents:bool=placeholder,
+            display_with_cv2:bool=placeholder,
+        ):
+        settings = locals()
+
+        if not isinstance(sample_count, Placeholder):
+            self.sample_count = max(1,sample_count)
+        if not isinstance(width, Placeholder):
+            self.width = int(width/64)*64
+        if not isinstance(height, Placeholder):
+            self.height = int(height/64)*64
+        if not isinstance(steps, Placeholder):
+            self.steps = max(1,steps)
+        if not isinstance(strength, Placeholder):
+            strength = strength if strength < 1.0 else 1.0
+            strength = strength if strength > 0.0 else 0.0
+            self.strength = strength
+        if not isinstance(sched_name, Placeholder):
+            if sched_name in IMPLEMENTED_SCHEDULERS:
+                self.sched_name = sched_name
+            else:
+                print(f"unknown scheduler requested: '{sched_name}' options are: {IMPLEMENTED_SCHEDULERS}")
+
+        # if no additional processing is performed on an option, automate setting it on self:
+        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2"]
+        for option in unmodified_options:
+            if not isinstance(settings[option], Placeholder):
+                setattr(self, option, settings[option])
+
+    def one_generation(self, prompt:str=None, init_image:Image=None, save_images:bool=True):
+        # keep this conversion instead of only having a default value of "" to permit None as an input
+        prompt = prompt if prompt is not None else ""
+        prompts = [x.strip() for x in prompt.split("||")]*self.sample_count
+
+        if init_image is not None:
+            init_image = init_image.convert("RGB")
+            if init_image.size != (self.width,self.height):
+                # if lanczos resampling is required, apply a small amount of post-sharpening
+                init_image = init_image.resize((self.width, self.height), resample=Image.Resampling.LANCZOS)
+                enhancer_sharpen = ImageEnhance.Sharpness(init_image)
+                init_image = enhancer_sharpen.enhance(1.15)
+
+        out, SUPPLEMENTARY = self.generate_exec(
+            prompts,
+            width=self.width,
+            height=self.height,
+            steps=self.steps,
+            gs=self.guidance_scale,
+            seed=self.seed,
+            sched_name=self.sched_name,
+            eta=self.ddim_eta,
+            eta_seed=self.eta_seed,
+            init_image=init_image,
+            img_strength=self.strength,
+            animate=self.animate,
+            save_latents=self.save_latents,
+            sequential=self.sequential_samples
+        )
+        argdict = SUPPLEMENTARY["io"]
+        final_latent = SUPPLEMENTARY['latent']['final_latent']
+        PIL_animation_frames = argdict.pop("image_sequence")
+        if argdict["width"] == 512:
+            argdict.pop("width")
+        if argdict["height"] == 512:
+            argdict.pop("height")
+        if not argdict["nsfw"]:
+            argdict.pop("nsfw")
+        if not ("ddim" in argdict["sched_name"] and argdict["eta"] > 0):
+            argdict.pop("eta")
+            argdict.pop("eta_seed")
+        save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
+        if self.animate:
+            # init frames by image list
+            frames_by_image = []
+            # one sublist per image
+            for _ in range(len(PIL_animation_frames[0])):
+                frames_by_image.append([])
+            for images_of_step in PIL_animation_frames:
+                for (image, image_sublist_index) in zip(images_of_step, range(len(images_of_step))):
+                    frames_by_image[image_sublist_index].append(image)
+            # remove the last frame of each sequence. It appears to be an extra, overly noised image
+            frames_by_image = [list_of_frames[:-1] for list_of_frames in frames_by_image]
+            save_animations(frames_by_image)
+        return out,SUPPLEMENTARY
+
+    def perform_image_cycling(self,
+            in_prompt:str="", img_cycles:int=100, save_individual:bool=False,
+            init_image:Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image=None,
+            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.2,
+        ):
+        # sequence prompts across all iterations
+        prompts = [p.strip() for p in in_prompt.split("||")]
+        iter_per_prompt = (img_cycles / (len(prompts)-1)) if text2img and (len(prompts) > 1) else img_cycles / len(prompts)
+        def index_prompt(i):
+            prompt_idx = int(i/iter_per_prompt)
+            progress_in_idx = i % iter_per_prompt
+            # interpolate through the prompts in the text encoding space, using prompt mixing. Set weights from the frame count between the prompts
+            return prompts[prompt_idx] if not prompt_idx+1 in range(len(prompts)) else f"{prompts[prompt_idx]};{iter_per_prompt-progress_in_idx};{prompts[prompt_idx+1]};{progress_in_idx};"
+        correction_target = None
+        # first frame is the initial image, if it exists.
+        frames = [init_image] if init_image is not None else []
+        try:
+            for i in tqdm(range(img_cycles), position=0, desc="Image cycle"):
+                # if correction should be applied, the correction target array is not present, and a source image to generate the array from is present, create it.
+                if color_correct and correction_target is None and (init_image is not None or color_target_image is not None):
+                    correction_target = image_to_correction_target(color_target_image if color_target_image is not None else init_image)
+                # if text-to-image should be used, set input image for cycle to None
+                init_image = init_image if not text2img else None
+                out, SUPPLEMENTARY = self.one_generation(index_prompt(i), init_image, save_images=save_individual)
+                if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                next_frame = out[0]
+                frames.append(next_frame.copy())
+                if not text2img:
+                    # skip processing image for next cycle if it will not be used.
+                    init_image = process_cycle_image(next_frame, rotate, center, translate, zoom, sharpen, self.width, self.height, color_correct, correction_target)
+
+        except KeyboardInterrupt:
+            # when an interrupt is received, cancel cycles and attempt to save any already generated images.
+            pass
+
+        # if images are not saved on every step, save the final image separately
+        argdict = SUPPLEMENTARY["io"]
+        final_latent = SUPPLEMENTARY['latent']['final_latent']
+        full_image, full_metadata, metadata_items = save_output(in_prompt, out, argdict, (not save_individual), final_latent, False)
+        animation_files_basepath = save_animations([frames])
 
 if __name__ == "__main__":
     main()

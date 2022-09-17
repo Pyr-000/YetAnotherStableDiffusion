@@ -18,16 +18,18 @@ pip install diffusers==0.2.4 transformers scipy ftfy opencv-python huggingface_h
 Most pre-existing StableDiffusion-compatible environments will already have these, save for `scikit-image`, `huggingface_hub` and in some cases `diffusers`.
 #
 ## Install models
-Models can either be automatically installed by logging into your huggingface account with a token, or manually installed by downloading them from huggingface yourself. 
+Models can either be automatically installed by providing a huggingface token, or manually installed by downloading them from huggingface yourself.
 ## Option A: Automatic model install via huggingface:
-If you have not yet logged into huggingface-cli on your machine, run
-```shell
-huggingface-cli login
-```
-and paste a valid read token for your huggingface account (accessible at https://huggingface.co/settings/tokens). Your login should remain stored in your user directory until you log out with the cli, independent of your python environment.
+The automated installation process requires you to have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4.
+
+If you have already logged into huggingface-cli on your machine, you can skip the model installation step. Models will be downloaded automatically.
+
+Otherwise, get a valid token with read access for your huggingface account, accessible at https://huggingface.co/settings/tokens. You can then:
+- Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
+- Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
 
 ## Option B: Manual model install:
-- Log in at https://huggingface.co/CompVis/stable-diffusion-v1-4/
+- Log in at https://huggingface.co/CompVis/stable-diffusion-v1-4/. If you have not done so already, you will need to read and accept the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) in order to access the models.
 - Head to the `Files and versions` tab, and navigate to `stable-diffusion-v1-4/unet`
   - Download both `config.json` and `diffusion_pytorch_model.bin`
   - place both files in `models/stable-diffusion-v1-4/unet`
@@ -148,7 +150,7 @@ pip install py-cord
 ```
 
 ## Usage
-- Set the bot token in `bot_token.py`.
+- Set the bot token in the `tokens.py` file: `DISCORD_TOKEN = "your token here"`.
 - Start `discord_bot.py`. The bot should now be accessible to anyone with access to whichever channels the bot is present in.
 - The bot includes the following example commands (using discord slash commands):
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution. Accepts an optional image attachment for performing image-to-image

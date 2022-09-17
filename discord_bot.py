@@ -16,7 +16,7 @@ import discord
 from discord.ext import commands, tasks
 
 from generate import load_models, generate_segmented, save_output
-from bot_token import get_token
+from tokens import get_discord_token
 
 model_id = "CompVis/stable-diffusion-v1-4"
 UNET_DEVICE = "cuda"
@@ -352,7 +352,7 @@ async def set_status():
     # await bot.change_presence(status = discord.Status.online,activity=discord.Game(f"with diffusers. Queue: {len(completed_tasks) + (1 if currently_generating else 0)}"))
 set_status.start()
 """
-bot.run(get_token())
+bot.run(get_discord_token())
 
 """
 if __name__ == "__main__":
