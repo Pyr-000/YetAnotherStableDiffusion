@@ -49,7 +49,7 @@ Otherwise, get a valid token with read access for your huggingface account, acce
 - "Textual Inversion Concepts" from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically.
 - Prompts can be mixed using prompt weights: When prompts are separated by `;;`, their representation within the text encoder space will be averaged. Custom prompt weights can be set by putting a number between the `;;` trailing the prompt. If no value is specified, the default value of 1 will be used as the prompt weight. 
   - Example: `"Painting of a cat ;3; Photograph of a cat ;1;"` Will yield the text representation of `3/4 * "Painting of a cat" + 1/4 "Photograph of a cat"`
-  - Note: The current implementation of negative weight values usually produces unusable results.
+  - Note: Prompts with negative weight values are not directly 'subtracted'. Instead, the prompt is amplified in its difference from the negative prompts (moving away from the prompt, in the opposite direction of the negative prompt).
 
 # 
 ## text to image

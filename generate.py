@@ -270,9 +270,10 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 else:
                     new_text_embeddings = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is not None:
-                        # compute offset of negative embeddings sum from unconditional embeddings, subtract this offset (the change from uncond caused by the negative prompts) from the positive embeddings.
-                        negative_embeddings_offset = (encodings_sum_negative / multiplier_sum_negative) - one_uncond_embedding
-                        new_text_embeddings -= negative_embeddings_offset
+                        # compute difference (direction of change) of negative embeddings from positive embeddings. Move in opposite direction of negative embeddings from positive embeddings based on relative multiplier strength.
+                        # this does not subtract negative prompts, but rather amplifies the difference from the positive embeddings to the negative embeddings
+                        negative_embeddings_offset = (encodings_sum_negative / multiplier_sum_negative)
+                        new_text_embeddings += ((new_text_embeddings) - (negative_embeddings_offset)) * (multiplier_sum_negative / (multiplier_sum_negative+multiplier_sum_positive))
 
             text_embeddings.append(new_text_embeddings)
             for key in new_io_data:
