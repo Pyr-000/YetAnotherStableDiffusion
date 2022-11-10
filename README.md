@@ -1,6 +1,7 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
 ## Recent changes to requirements
+- `diffusers` should be updated. `accelerate` can now be used to perform automatic CPU offloading.
 - Now requires `scikit-image` package to perform color correction during image cycling
 
 # Installation
@@ -13,9 +14,9 @@ When installing with `pip` directly (e.g. for non-conda environments), CUDA tool
 #
 ## Install additional dependencies
 ```shell
-pip install diffusers==0.2.4 transformers scipy ftfy opencv-python huggingface_hub scikit-image
+pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate
 ```
-Most pre-existing StableDiffusion-compatible environments will already have these, save for `scikit-image`, `huggingface_hub` and in some cases `diffusers`.
+Most pre-existing StableDiffusion-compatible environments will already have some of these installed.
 #
 ## Install models
 Models can either be automatically installed by providing a huggingface token, or manually installed by downloading them from huggingface yourself.
@@ -67,15 +68,18 @@ python generate.py "a painting of a painter painting a painting"
 - `-S`/`--seed` will set the image seed. So long as the image size remains the same, keeping the seed should yield "the same image" under a similar prompt, or "a similar composition" under different prompts.
 - `-s`/`--steps` will set the amount of diffusion steps performed. Higher values can help increase detail, but will be more computationally expensive.
 - `-cs`/`--scale` sets the guidance scale. Increasing this value may make outputs more adherent to the prompt, while decreasing it may increase 'creativity'. The effect of different values will be different depending on the scheduler used.
-- `-sc`/`--scheduler` sets the sampling scheduler. Currently, `"lms"`, `"pndm"` and `"ddim"` are implemented.
+- `-sc`/`--scheduler` sets the sampling scheduler. Currently, the following schedulers are available: `"lms"`, `"pndm"`, `"ddim"`, `"euler"`, `"euler_ancestral"`
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
 ### Device, Performace and Optimization settings
 - `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly. See section [Precision](#Precision).
 - `--latents-half` will switch from using full precision (fp32) latents to using half precision (fp16) latents. The difference in memory usage should be insignificant (<1MB). See section [Precision](#Precision).
 - `--diff-device` sets the device used for the UNET and diffusion sampling loop. `"cuda"` by default.
-- `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cpu"` by default. Switching this to `"cuda"` will increase VRAM usage (~7.32GB instead of ~6.45GB in the example shown in section [Precision](#Precision)), while only speeding up the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
+- `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cpu"` by default. Switching this to `"cuda"` will increase VRAM usage (see the example shown in section [Precision](#Precision)), while only speeding up the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
 - `--seq`/`--sequential_samples` will process batch items (if multiple images are to be generated) sequentially, instead of as a single large batch. Reduces VRAM consumption. This flag will activate automatically if generating runs out of memory when more than one image is requested.
+- `-as`/`--attention-slice` sets slice size for UNET attention slicing, reducing memory usage. The value must be a valid divisor of the UNET head count. Set to 1 to maximise memory efficiency. Set to 0 to use the diffusers recommended "auto"-tradeoff between memory reduction and (minimal) speed cost.
+- `-co`/`--cpu-offload` will enable CPU offloading of models through `accelerate`. This should enable compatibility with minimal VRAM at the cost of speed.
+- `-cb`/`--cuda-benchmark` will perform CUDNN performance autotuning (CUDA benchmark). This should improve throughput when computing on CUDA, but will have a slight overhead and may slightly increase VRAM usage.
 #
 ## image to image
 When either a starting image (`-ii`, see below) or the image cycle flag (`-ic`, see below) are specified, `generate.py` automatically performs image-to-image generation.
@@ -106,6 +110,7 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 # Precision
 When switching the precision of either the unet or the latents between full (fp32) and half (fp16), there will be a small difference in outputs.
 
+(Measurements were taken under an older, less optimised version of diffusers. Exact values may no longer be accurate.)
 Switching from a half precision UNET to a full precision UNET will significantly increase the amount of memory required: ~9.15GB instead of ~6.45GB (overall usage) in the example shown below.
 Switching from full precision latents to half precision latents should only reduce the memory usage by less than a megabyte.
 

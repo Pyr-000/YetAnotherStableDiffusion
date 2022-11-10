@@ -8,12 +8,13 @@ import math
 import random
 from typing import Tuple
 import torch
-from torch import autocast
+# from torch import autocast
 from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
-from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers.utils import is_accelerate_available
 import argparse
 from datetime import datetime
 from PIL.PngImagePlugin import PngInfo
@@ -41,6 +42,8 @@ concepts_dir = "models/concepts"
 # devices will be set by argparser if used. 
 DIFFUSION_DEVICE = "cuda"
 IO_DEVICE = "cpu"
+# execution device when offloading enabled. Required as a global for now.
+OFFLOAD_EXEC_DEVICE = "cuda"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
 
@@ -53,11 +56,11 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
-IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim"]
+IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "ipndm", "euler", "euler_ancestral"]
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(type=str, nargs="?", default="", help="text prompt for generation. Leave unset to enter prompt loop mode. Multiple prompts can be separated by ||.", dest="prompt")
+    parser.add_argument(type=str, nargs="?", default=None, help="text prompt for generation. Leave unset to enter prompt loop mode. Multiple prompts can be separated by ||.", dest="prompt")
     parser.add_argument("-ii", "--init-img", type=str, default=None, help="use img2img mode. path to the input image", dest="init_img_path")
     parser.add_argument("-st", "--strength", type=float, default=0.75, help="strength of initial image in img2img. 0.0 -> no new information, 1.0 -> only new information", dest="strength")
     parser.add_argument("-s","--steps", type=int, default=50, help="number of sampling steps", dest="steps")
@@ -87,17 +90,25 @@ def parse_args():
     parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.2, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
     parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep lightness and colorization distribution the same as it was initially (LAB histogram cdf matching). Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
     parser.add_argument("-cfi", "--cycle-fresh-image", action="store_true", help="When cycling images (-ic), create a fresh image (use text-to-image) in each cycle. Useful for interpolating prompts (especially with fixed seed)", dest="cycle_fresh")
+    parser.add_argument("-cb", "--cuda-benchmark", action="store_true", help="Perform CUDA benchmark. Should improve throughput when computing on CUDA, but may slightly increase VRAM usage.", dest="cuda_benchmark")
+    parser.add_argument("-as", "--attention-slice", type=int, default=None, help="Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings", dest="attention_slicing")
+    parser.add_argument("-co", "--cpu-offload", action='store_true', help="Set to enable CPU offloading through accelerate. This should enable compatibility with minimal VRAM at the cost of speed.", dest="cpu_offloading")
     return parser.parse_args()
 
 def main():
     global DIFFUSION_DEVICE
     global IO_DEVICE
     args = parse_args()
+    if args.cpu_offloading:
+        args.diffusion_device, args.io_device = OFFLOAD_EXEC_DEVICE, OFFLOAD_EXEC_DEVICE
     DIFFUSION_DEVICE = args.diffusion_device
     IO_DEVICE = args.io_device
 
+    if args.cuda_benchmark:
+        torch.backends.cudnn.benchmark = True
+
     # load up models
-    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(half_precision=args.half)
+    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(half_precision=args.half, cpu_offloading=args.cpu_offloading)
     if args.no_check:
         rate_nsfw = lambda x: False
     # create generate function using the loaded models
@@ -111,7 +122,7 @@ def main():
         exit()
 
     generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
-    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True)
+    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing)
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
 
@@ -135,7 +146,15 @@ def main():
             except Exception as e:
                 print_exc()
 
-def load_models(half_precision=False, unet_only=False):
+def load_models(half_precision=False, unet_only=False, cpu_offloading=False):
+    if cpu_offloading:
+        if not is_accelerate_available():
+            print("accelerate library is not installed! Unable to utilise CPU offloading!")
+            cpu_offloading=False
+        else:
+            # NOTE: this only offloads parameters, but not buffers by default.
+            from accelerate import cpu_offload
+
     torch.no_grad() # We don't need gradients where we're going.
     tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer
     text_encoder:transfomers_models.clip.modeling_clip.CLIPTextModel
@@ -163,6 +182,9 @@ def load_models(half_precision=False, unet_only=False):
         unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet, torch_dtype=torch.float16, revision="fp16")
     else:
         unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet)
+
+    if cpu_offloading:
+        cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
     
     if unet_only:
         return unet
@@ -175,7 +197,13 @@ def load_models(half_precision=False, unet_only=False):
     # Load the tokenizer and text encoder to tokenize and encode the text. 
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
     text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-    rate_nsfw = get_safety_checker()
+
+    if cpu_offloading:
+        cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+
+    #rate_nsfw = get_safety_checker(cpu_offloading=cpu_offloading)
+    rate_nsfw = get_safety_checker(cpu_offloading=False)
     concepts_path = Path(concepts_dir)
     available_concepts = [f for f in concepts_path.rglob("*.bin")]
     if len(available_concepts) > 0:
@@ -186,9 +214,16 @@ def load_models(half_precision=False, unet_only=False):
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
 def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False):
-    vae.to(IO_DEVICE)
-    text_encoder.to(IO_DEVICE)
-    unet.to(UNET_DEVICE)
+    if not vae.device == torch.device("meta"):
+        vae.to(IO_DEVICE)
+    if not text_encoder.device == torch.device("meta"):
+        text_encoder.to(IO_DEVICE)
+    if not unet.device == torch.device("meta"):
+        unet.to(UNET_DEVICE)
+    UNET_DEVICE = UNET_DEVICE if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
+    IO_DEVICE = IO_DEVICE if IO_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
+    #if UNET_DEVICE == "meta" and unet.dtype == torch.float16:
+    #    half_precision_latents = True
 
     @torch.no_grad()
     def perform_text_encode(prompt):
@@ -302,7 +337,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
     @torch.no_grad()
     def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False):
         gc.collect()
-        if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
+        if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
             torch.cuda.empty_cache()
         START_TIME = time()
 
@@ -343,7 +378,10 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         SUPPLEMENTARY["io"]["seed"] = seed
         SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
         generator_eta = torch.manual_seed(eta_seed)
-        generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
+        if not IO_DEVICE == "meta":
+            generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
+        else:
+            generator_unet = torch.Generator("cpu").manual_seed(seed)
 
         sched_name = sched_name.lower().strip()
         SUPPLEMENTARY["io"]["sched_name"]=sched_name
@@ -361,13 +399,21 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             # stablediffusion default
             beta_start = 0.00085
             beta_end = 0.012
-        if "lms" in sched_name:
+        if "lms" == sched_name:
             scheduler = LMSDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
-        elif "pndm" in sched_name:
+        elif "pndm" == sched_name:
             # "for some models like stable diffusion the prk steps can/should be skipped to produce better results."
             scheduler = PNDMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000, skip_prk_steps=True) # <-- pipeline default
-        elif "ddim" in sched_name:
+        elif "ddim" == sched_name:
             scheduler = DDIMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+        elif "ipndm" == sched_name:
+            scheduler = IPNDMScheduler(num_train_timesteps=1000)
+        elif "euler" == sched_name:
+            scheduler = EulerDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+        elif "euler_ancestral" == sched_name:
+            scheduler = EulerAncestralDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+        else:
+            raise ValueError(f"Requested unknown scheduler: {sched_name}")
         # set timesteps. Also offset, as pipeline does this
         accepts_offset = "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
         if accepts_offset:
@@ -376,9 +422,6 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         else:
             scheduler_offset=0
             scheduler.set_timesteps(steps)
-
-        if isinstance(scheduler, LMSDiscreteScheduler):
-            latents = latents * scheduler.sigmas[0]
 
         starting_timestep = 0
         # initial noise latents
@@ -408,36 +451,46 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             latents = init_latents.to(UNET_DEVICE)
             starting_timestep = max(steps - init_timestep + scheduler_offset, 0)
 
+        """
+        if isinstance(scheduler, LMSDiscreteScheduler):
+            latents = latents * scheduler.sigmas[0]
+        """
+        if hasattr(scheduler, "init_noise_sigma"):
+            latents *= scheduler.init_noise_sigma
+
         # denoising loop!
-        with autocast(UNET_DEVICE):
-            #print(f"{unet.device} {latents.device} {text_embeddings.device}")
-            for i, t in tqdm(enumerate(scheduler.timesteps[starting_timestep:]), position=1):
-                if animate:
-                    SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
-                # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-                latent_model_input = torch.cat([latents] * 2)
-                if isinstance(scheduler, LMSDiscreteScheduler):
-                    sigma = scheduler.sigmas[i]
-                    latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
+        # autocast _requires_ a device of either CUDA or CPU to be specified! Switching to manual casting for meta/offload support
+        #with autocast(autocast_device):
+        for i, t in tqdm(enumerate(scheduler.timesteps[starting_timestep:]), position=1):
+            if animate:
+                SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
+            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+            latent_model_input = torch.cat([latents] * 2)
+            if hasattr(scheduler, "scale_model_input"):
+                latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+            #if isinstance(scheduler, LMSDiscreteScheduler):
+                #sigma = scheduler.sigmas[i]
+                #latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
+            # predict the noise residual
+            with torch.no_grad():
+                cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
+                noise_pred = unet(latent_model_input.to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=text_embeddings.to(device=cast_device, dtype=unet.dtype))["sample"]
+            # perform guidance
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond)
+            del noise_pred_uncond, noise_pred_text
+            # compute the previous noisy sample x_t -> x_t-1
+            if isinstance(scheduler, LMSDiscreteScheduler):
+                latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
+            elif isinstance(scheduler, DDIMScheduler):
+                latents = scheduler.step(noise_pred, t, latents, eta=eta, generator=generator_eta)["prev_sample"]
+            else:
+                latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
 
-                # predict the noise residual
-                with torch.no_grad():
-                    noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings)["sample"]
-
-                # perform guidance
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond)
-
-                # compute the previous noisy sample x_t -> x_t-1
-                if isinstance(scheduler, LMSDiscreteScheduler):
-                    latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
-                elif isinstance(scheduler, DDIMScheduler):
-                    latents = scheduler.step(noise_pred, t, latents, eta=eta, generator=generator_eta)["prev_sample"]
-                else:
-                    latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
+            del noise_pred
 
         # free up some now unused memory before attempting VAE decode!
-        del noise_pred, noise_pred_text, noise_pred_uncond, latent_model_input, scheduler, text_embeddings
+        del latent_model_input, scheduler, text_embeddings
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
             torch.cuda.empty_cache()
@@ -457,7 +510,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         del latents
 
         def to_pil(image, should_rate_nsfw:bool=True):
-            image = (image / 2 + 0.5).clamp(0, 1)
+            image = (image.sample / 2 + 0.5).clamp(0, 1)
             image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
             if should_rate_nsfw:
                 has_nsfw = rate_nsfw(image)
@@ -484,6 +537,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
 
         return pil_images, SUPPLEMENTARY
 
+    @torch.no_grad()
     def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False):
         exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents}
         if not sequential:
@@ -535,6 +589,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
 
 # see: https://huggingface.co/sd-concepts-library | derived from the "Inference Colab" notebook
 # load learned embeds (textual inversion) into an encoder and tokenizer
+@torch.no_grad()
 def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, target_device="cpu", token=None):
     loaded_learned_embeds = torch.load(learned_embeds_path, map_location=target_device)
     # separate token and the embeds
@@ -564,6 +619,7 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
     print(f" {token}", end="")
 
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
+@torch.no_grad()
 def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False):
     if isinstance(imgs, list):
         if len(imgs) > 1:
@@ -679,11 +735,22 @@ def image_autogrid(imgs, fixed_rows=None) -> Image:
         grid.paste(img, box=(i%cols*w, i//cols*h))
     return grid
 
-def get_safety_checker(device="cpu", safety_model_id = "CompVis/stable-diffusion-safety-checker"):
+@torch.no_grad()
+def get_safety_checker(device="cpu", safety_model_id = "CompVis/stable-diffusion-safety-checker", cpu_offloading=False):
+    if cpu_offloading:
+        if not is_accelerate_available():
+            print("accelerate library is not installed! Unable to utilise CPU offloading!")
+            cpu_offloading=False
+        else:
+            # NOTE: this only offloads parameters, but not buffers by default.
+            from accelerate import cpu_offload
     safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
     safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
     #safety_feature_extractor.to(device)
-    safety_checker.to(device)
+    if cpu_offloading:
+        cpu_offload(safety_checker, OFFLOAD_EXEC_DEVICE, offload_buffers=False)
+    else:
+        safety_checker.to(device)
     def numpy_to_pil(images):
         if images.ndim == 3:
             images = images[None, ...]
@@ -760,6 +827,7 @@ def load_latents_from_image(path, index=0):
 
 # interpolate between two latents (if multiple images are contained in a latent, only the first one is used)
 # returns latent sequence, which can be passed into VAE to retrieve image sequence.
+@torch.no_grad()
 def interpolate_latents(latent_a, latent_b, steps=1):
     # TODO: Add overextension: get diff between a,b, then keep applying diff beyond the range between a,b (follow linear function outside of endpoints)
     a = latent_a[0]
@@ -799,7 +867,7 @@ def create_interpolation(a, b, steps, vae):
     with torch.no_grad():
         interpolated = interpolate_latents(al,bl,steps)
     def to_pil(image):
-        image = (image / 2 + 0.5).clamp(0, 1)
+        image = (image.sample / 2 + 0.5).clamp(0, 1)
         image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
         images = (image * 255).round().astype("uint8")
         pil_images = [Image.fromarray(image) for image in images]
@@ -819,7 +887,15 @@ class QuickGenerator():
         gc.collect()
         if "cuda" in [IO_DEVICE, UNET_DEVICE]:
             torch.cuda.empty_cache()
-        self.generate_exec = generate_segmented(tokenizer=tokenizer,text_encoder=text_encoder,unet=unet,vae=vae,IO_DEVICE=IO_DEVICE,UNET_DEVICE=UNET_DEVICE,rate_nsfw=rate_nsfw,half_precision_latents=use_half_latents)
+        self._tokenizer=tokenizer
+        self._text_encoder=text_encoder
+        self._unet=unet
+        self._vae=vae
+        self._IO_DEVICE=IO_DEVICE
+        self._UNET_DEVICE=UNET_DEVICE
+        self._rate_nsfw=rate_nsfw
+        self._use_half_latents=use_half_latents
+        self.generate_exec = generate_segmented(tokenizer=self._tokenizer,text_encoder=self._text_encoder,unet=self._unet,vae=self._vae,IO_DEVICE=self._IO_DEVICE,UNET_DEVICE=self._UNET_DEVICE,rate_nsfw=self._rate_nsfw,half_precision_latents=self._use_half_latents)
         self.sample_count=1
         self.width,self.height=512,512
         self.steps=50
@@ -833,6 +909,7 @@ class QuickGenerator():
         self.sequential_samples=False
         self.save_latents=True
         self.display_with_cv2=True
+        self.attention_slicing=None
 
     # use Placeholder as the default value when the setting should not be changed. None is a valid value for some settings.
     def configure(self,
@@ -850,6 +927,7 @@ class QuickGenerator():
             sequential_samples:bool=placeholder,
             save_latents:bool=placeholder,
             display_with_cv2:bool=placeholder,
+            attention_slicing:bool=placeholder,
         ):
         settings = locals()
 
@@ -877,6 +955,40 @@ class QuickGenerator():
             if not isinstance(settings[option], Placeholder):
                 setattr(self, option, settings[option])
 
+        if not isinstance(attention_slicing, Placeholder) and not (attention_slicing==self.attention_slicing):
+            # None disables slicing if parameter is False
+            slice_size = None
+
+            # 'True' / 0 -> use diffusers recommended 'automatic' value for "a good trade-off between speed and memory"
+            # use bool instance check and bool value: otherwise (int)1==True -> True would be caught!
+            if attention_slicing <= 0 or (isinstance(attention_slicing, bool) and attention_slicing):
+                slice_size = self._unet.config.attention_head_dim//2
+            # int -> use as slice size
+            elif isinstance(attention_slicing, int):
+                slice_size = attention_slicing
+            # False / None / unknown type will disable slicing with default value of None.
+
+            self.attention_slicing = attention_slicing
+            print(f"Setting attention slice size to {slice_size}")
+            self._unet.set_attention_slice(slice_size)
+
+    """
+        if cpu_offloading==True and not self.cpu_offloading: # as this is currently an irreversible operation, the parameter type check can be skipped.
+            if not is_accelerate_available():
+                print("accelerate library is not installed! Unable to utilise CPU offloading!")
+            else:
+                print("Enabling CPU offloading on UNET and VAE models.")
+                from accelerate import cpu_offload
+                self.cpu_offload = True
+                # this only offloads parameters, but not buffers by default.
+                cpu_offload(self._unet, offload_buffers=True)
+                cpu_offload(self._vae, offload_buffers=True)
+                # TODO: potentially include safety checker, which is currently always on CPU.
+                print(self._unet.device)
+                print("CPU offloading enabled!")
+    """
+
+    @torch.no_grad()
     def one_generation(self, prompt:str=None, init_image:Image=None, save_images:bool=True):
         # keep this conversion instead of only having a default value of "" to permit None as an input
         prompt = prompt if prompt is not None else ""
@@ -933,6 +1045,7 @@ class QuickGenerator():
             save_animations(frames_by_image)
         return out,SUPPLEMENTARY
 
+    @torch.no_grad()
     def perform_image_cycling(self,
             in_prompt:str="", img_cycles:int=100, save_individual:bool=False,
             init_image:Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image=None,
