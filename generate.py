@@ -57,6 +57,7 @@ os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
 IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "ipndm", "euler", "euler_ancestral"]
+IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5"]
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -93,6 +94,7 @@ def parse_args():
     parser.add_argument("-cb", "--cuda-benchmark", action="store_true", help="Perform CUDA benchmark. Should improve throughput when computing on CUDA, but may slightly increase VRAM usage.", dest="cuda_benchmark")
     parser.add_argument("-as", "--attention-slice", type=int, default=None, help="Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings", dest="attention_slicing")
     parser.add_argument("-co", "--cpu-offload", action='store_true', help="Set to enable CPU offloading through accelerate. This should enable compatibility with minimal VRAM at the cost of speed.", dest="cpu_offloading")
+    parser.add_argument("-gsc","--gs_schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for variable guidance scale. Default (None) corresponds to no schedule.", dest="gs_schedule")
     return parser.parse_args()
 
 def main():
@@ -122,7 +124,7 @@ def main():
         exit()
 
     generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
-    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing)
+    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule)
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
 
@@ -335,7 +337,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         return text_embeddings, batch_size, io_data
 
     @torch.no_grad()
-    def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False):
+    def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
             torch.cuda.empty_cache()
@@ -347,6 +349,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 "height" : 0,
                 "steps" : steps,
                 "gs" : gs,
+                "gs_sched" : gs_schedule,
                 "text_readback" : "",
                 "nsfw" : False,
                 "remaining_token_count" : 0,
@@ -461,8 +464,9 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         # denoising loop!
         # autocast _requires_ a device of either CUDA or CPU to be specified! Switching to manual casting for meta/offload support
         #with autocast(autocast_device):
-        for i, t in tqdm(enumerate(scheduler.timesteps[starting_timestep:]), position=1):
-            if animate:
+        progress_bar = tqdm([x for x in enumerate(scheduler.timesteps[starting_timestep:])], position=1)
+        for i, t in progress_bar:
+            if animate and not animate_pred_diff:
                 SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
             # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
             latent_model_input = torch.cat([latents] * 2)
@@ -477,7 +481,26 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 noise_pred = unet(latent_model_input.to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=text_embeddings.to(device=cast_device, dtype=unet.dtype))["sample"]
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond)
+            progress_factor = i/len(scheduler.timesteps[starting_timestep:])
+            if gs_schedule is None:
+                gs_mult = 1
+            elif gs_schedule == "sin": # half-sine (between 0 and pi; 0 -> 1 -> 0)
+                gs_mult = np.sin(np.pi * progress_factor)
+            elif gs_schedule == "isin": # inverted half-sine (1 -> 0 -> 1)
+                gs_mult = 1.0 - np.sin(np.pi * progress_factor)
+            elif gs_schedule == "fsin": # full sine (0 -> 1 -> 0 -> -1 -> 0) for experimentation
+                gs_mult = np.sin(2*np.pi * progress_factor)
+            elif gs_schedule == "anneal5": # rectified 2.5x full sine (5 bumps)
+                gs_mult = np.abs(np.sin(2*np.pi * progress_factor*2.5))
+            elif gs_schedule == "cos": # quarter-cos (between 0 and pi/2; 1 -> 0)
+                gs_mult = np.cos(np.pi/2 * progress_factor)
+            elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
+                gs_mult = 1.0 - np.cos(np.pi/2 * progress_factor)
+            progress_bar.set_description(f"gs={gs*gs_mult:.3f}")
+            noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
+
+            if animate and animate_pred_diff:
+                SUPPLEMENTARY["latent"]["latent_sequence"].append((latents-noise_pred).clone().cpu())
             del noise_pred_uncond, noise_pred_text
             # compute the previous noisy sample x_t -> x_t-1
             if isinstance(scheduler, LMSDiscreteScheduler):
@@ -529,7 +552,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             torch.cuda.synchronize()
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
-                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae.decode(item.to(DIFFUSION_DEVICE) * (1 / 0.18215)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae.decode((item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
             torch.cuda.synchronize()
             vae.to(IO_DEVICE)
             unet.to(DIFFUSION_DEVICE)
@@ -538,8 +561,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         return pil_images, SUPPLEMENTARY
 
     @torch.no_grad()
-    def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False):
-        exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents}
+    def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True):
+        exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff}
         if not sequential:
             try:
                 return generate_segmented_exec(prompt=prompt, **exec_args)
@@ -910,6 +933,8 @@ class QuickGenerator():
         self.save_latents=True
         self.display_with_cv2=True
         self.attention_slicing=None
+        self.animate_pred_diff=True
+        self.gs_scheduler=None
 
     # use Placeholder as the default value when the setting should not be changed. None is a valid value for some settings.
     def configure(self,
@@ -928,6 +953,8 @@ class QuickGenerator():
             save_latents:bool=placeholder,
             display_with_cv2:bool=placeholder,
             attention_slicing:bool=placeholder,
+            animate_pred_diff:bool=placeholder,
+            gs_scheduler:str=placeholder,
         ):
         settings = locals()
 
@@ -948,6 +975,11 @@ class QuickGenerator():
                 self.sched_name = sched_name
             else:
                 print(f"unknown scheduler requested: '{sched_name}' options are: {IMPLEMENTED_SCHEDULERS}")
+        if not isinstance(gs_scheduler, Placeholder):
+            if gs_scheduler in IMPLEMENTED_GS_SCHEDULES:
+                self.gs_scheduler = gs_scheduler
+            else:
+                print(f"unknown gs schedule requested: '{gs_scheduler}' options are {IMPLEMENTED_GS_SCHEDULES}")
 
         # if no additional processing is performed on an option, automate setting it on self:
         unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2"]
@@ -1016,7 +1048,9 @@ class QuickGenerator():
             img_strength=self.strength,
             animate=self.animate,
             save_latents=self.save_latents,
-            sequential=self.sequential_samples
+            sequential=self.sequential_samples,
+            gs_schedule=self.gs_scheduler,
+            animate_pred_diff=self.animate_pred_diff,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -1040,8 +1074,6 @@ class QuickGenerator():
             for images_of_step in PIL_animation_frames:
                 for (image, image_sublist_index) in zip(images_of_step, range(len(images_of_step))):
                     frames_by_image[image_sublist_index].append(image)
-            # remove the last frame of each sequence. It appears to be an extra, overly noised image
-            frames_by_image = [list_of_frames[:-1] for list_of_frames in frames_by_image]
             save_animations(frames_by_image)
         return out,SUPPLEMENTARY
 
