@@ -36,6 +36,8 @@ from tokens import get_huggingface_token
 model_id = "CompVis/stable-diffusion-v1-4"
 # for manual model installs
 models_local_dir = "models/stable-diffusion-v1-4"
+# for metadata, written during model load
+using_local_unet, using_local_vae = False,False
 # location of textual inversion concepts (if present). (recursively) search for any .bin files. see see: https://huggingface.co/sd-concepts-library
 concepts_dir = "models/concepts"
 # one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep, hip, ve, ort, mps, xla, lazy, vulkan, meta, hpu
@@ -47,8 +49,9 @@ OFFLOAD_EXEC_DEVICE = "cuda"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
 
-OUTPUTS_DIR = "outputs/generated"
-ANIMATIONS_DIR = "outputs/animate"
+OUTPUT_DIR_BASE = "outputs"
+OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
+ANIMATIONS_DIR = f"{OUTPUT_DIR_BASE}/animate"
 INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
 UNPUB_DIR = os.path.join(OUTPUTS_DIR, "unpub")
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
@@ -95,16 +98,40 @@ def parse_args():
     parser.add_argument("-as", "--attention-slice", type=int, default=None, help="Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings", dest="attention_slicing")
     parser.add_argument("-co", "--cpu-offload", action='store_true', help="Set to enable CPU offloading through accelerate. This should enable compatibility with minimal VRAM at the cost of speed.", dest="cpu_offloading")
     parser.add_argument("-gsc","--gs-schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for variable guidance scale. Default (None) corresponds to no schedule.", dest="gs_schedule")
+    parser.add_argument("-om","--online-model", type=str, default=None, help="Set an online model id for acquisition from huggingface hub.", dest="online_model")
+    parser.add_argument("-lm","--local-model", type=str, default=None, help="Set a path to a directory containing local model files (should contain unet and vae dirs, see local install in readme).", dest="local_model")
+    parser.add_argument("-od","--output-dir", type=str, default=None, help="Set an override for the base output directory. The directory will be created if not already present.", dest="output_dir")
     return parser.parse_args()
 
 def main():
-    global DIFFUSION_DEVICE
-    global IO_DEVICE
+    global DIFFUSION_DEVICE, IO_DEVICE
+    global model_id, models_local_dir
+    global OUTPUT_DIR_BASE, OUTPUTS_DIR, INDIVIDUAL_OUTPUTS_DIR, UNPUB_DIR, ANIMATIONS_DIR
     args = parse_args()
     if args.cpu_offloading:
         args.diffusion_device, args.io_device = OFFLOAD_EXEC_DEVICE, OFFLOAD_EXEC_DEVICE
     DIFFUSION_DEVICE = args.diffusion_device
     IO_DEVICE = args.io_device
+
+    if args.online_model is not None:
+        # set the online model id
+        model_id = args.online_model
+        # set local model to None to disable local override
+        models_local_dir = None
+    if args.local_model is not None:
+        # local model dirs function as an override - online id can remain untouched
+        models_local_dir = args.local_model
+
+    if args.output_dir is not None:
+        OUTPUT_DIR_BASE = args.output_dir
+        OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
+        ANIMATIONS_DIR = f"{OUTPUT_DIR_BASE}/animate"
+        INDIVIDUAL_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "individual")
+        UNPUB_DIR = os.path.join(OUTPUTS_DIR, "unpub")
+        os.makedirs(OUTPUTS_DIR, exist_ok=True)
+        os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
+        os.makedirs(UNPUB_DIR, exist_ok=True)
+        os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
     if args.cuda_benchmark:
         torch.backends.cudnn.benchmark = True
@@ -149,6 +176,7 @@ def main():
                 print_exc()
 
 def load_models(half_precision=False, unet_only=False, cpu_offloading=False):
+    global using_local_unet, using_local_vae
     if cpu_offloading:
         if not is_accelerate_available():
             print("accelerate library is not installed! Unable to utilise CPU offloading!")
@@ -168,16 +196,19 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False):
     use_auth_token_unet=get_huggingface_token()
     use_auth_token_vae=get_huggingface_token()
 
-    unet_dir = os.path.join(models_local_dir, "unet")
-    if os.path.exists(os.path.join(unet_dir, "config.json")) and os.path.exists(os.path.join(unet_dir, "diffusion_pytorch_model.bin")):
-        use_auth_token_unet=False
-        print("Using local unet model files!")
-        unet_model_id = unet_dir
-    vae_dir = os.path.join(models_local_dir, "vae")
-    if os.path.exists(os.path.join(vae_dir, "config.json")) and os.path.exists(os.path.join(vae_dir, "diffusion_pytorch_model.bin")):
-        use_auth_token_vae=False
-        print("Using local vae model files!")
-        vae_model_id = vae_dir
+    if models_local_dir is not None and len(models_local_dir) > 0:
+        unet_dir = os.path.join(models_local_dir, "unet")
+        if os.path.exists(os.path.join(unet_dir, "config.json")) and os.path.exists(os.path.join(unet_dir, "diffusion_pytorch_model.bin")):
+            use_auth_token_unet=False
+            print("Using local unet model files!")
+            unet_model_id = unet_dir
+            using_local_unet = True
+        vae_dir = os.path.join(models_local_dir, "vae")
+        if os.path.exists(os.path.join(vae_dir, "config.json")) and os.path.exists(os.path.join(vae_dir, "diffusion_pytorch_model.bin")):
+            use_auth_token_vae=False
+            print("Using local vae model files!")
+            vae_model_id = vae_dir
+            using_local_vae = True
 
     # Load the UNet model for generating the latents.
     if half_precision:
@@ -360,6 +391,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 "eta" : eta,
                 "sched_name" : None,
                 "attention" : [],
+                "unet_model" : f"{models_local_dir} (local)" if using_local_unet else model_id,
+                "vae_model" : f"{models_local_dir} (local)" if using_local_vae else model_id,
             },
             "latent" : {
                 "final_latent" : None,

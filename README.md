@@ -38,7 +38,8 @@ Otherwise, get a valid token with read access for your huggingface account, acce
   - Download both `config.json` and `diffusion_pytorch_model.bin`
   - Place the files in `models/stable-diffusion-v1-4/vae`
 - It is recommended to keep the branch on the default: `main` instead of switching to `fp16`. The fp32 weights are larger (3.44GB instead of 1.72GB), but can be loaded for both full precision (fp32) and half precision (fp16) use. 
-- Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over.
+- Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over directly.
+  - If required, custom (monolithic) model checkpoints designated for the "standard StableDiffusion" implementation can be converted to separate models for use with diffusers using their provided conversion script: [diffusers/scripts/convert_original_stable_diffusion_to_diffusers.py](https://github.com/huggingface/diffusers/blob/main/scripts/convert_original_stable_diffusion_to_diffusers.py), available from the [huggingface diffusers repository](https://github.com/huggingface/diffusers).
 
 #
 # Usage & Features
@@ -46,7 +47,8 @@ Otherwise, get a valid token with read access for your huggingface account, acce
   - Additional memory optimisation options include (automatic) sequential batching, attention slicing and CPU offloading (see: [Optimisation settings](#device-performace-and-optimization-settings))
 - Animating prompt interpolations is possible for both image-to-image cycling and text-to-image (`-cfi`, see: [Additional Flags](#additional-flags)).
 - `prompts`, `seeds`, and other relevant arguments will be stored in PNG metadata by default.
-- For every generated output, an image will be saved in `outputs/generated`. This can be modified using the global variable `OUTPUTS_DIR` near the top of `generate.py`. When multiple images are batched at once, this singular image will be a grid, with the individual images being saved in `outputs/generated/individual` (or {OUTPUTS_DIR}/individual). Additionally, each generated output will produce a text file in `outputs/generated/unpub` (or {OUTPUTS_DIR}/unpub) of the same filename, containing the prompt and additional arguments. This can be used for maintaining an external image gallery.
+- For every generated output, an image will be saved in `outputs/generated`. When multiple images are batched at once, this singular image will be a grid, with the individual images being saved in `outputs/generated/individual`. Additionally, each generated output will produce a text file in `outputs/generated/unpub` of the same filename, containing the prompt and additional arguments. This can be used for maintaining an external image gallery.
+  - Optionally, a different output directory can be specified (`-od`, see: [Additional flags](#additional-flags)).
 - The NSFW check is enabled by default, but will only print a warning message and attach a metadata label, leaving the output images untouched. It can also be fully disabled via a commandline flag (see: [Additional Flags](#additional-flags))
 - Cycling through iterations of image-to-image comes with a mitigation for keeping the color scheme unchanged, preventing effects such as 'magenta shifting'. (`-icc`, see: [Image to image cycling](#image-to-image-cycling))
 - "Textual Inversion Concepts" from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically.
@@ -104,6 +106,9 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-icc`/`--image-color-correction` Enables color correction for image to image cycling: Cumulative density functions of each image channel within the LAB colorspace are respaced to match the density distributions present in the initial (first) image. Prevents 'magenta shifting' (and similar effects) with multiple cycles.
 #
 ## Additional flags
+- `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. See: [Automatic model install](#option-a-automatic-model-install-via-huggingface)
+- `-lm`/`--local-model` can be used to specify a directory containing local model files (this directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` file each. See: [Manual model install](#option-b-manual-model-install)
+- `-od`/`--output-dir` sets an override for the base output directory. The directory will be created if it is not already present.
 - `--no-check-nsfw` disables the NSFW check entirely, which slightly speeds up the generation process. By default, `generate.py` will only display a warning and attach an extra tag in image metadata if potential NSFW concepts are detected.
 - `--animate` will store any intermediate (unfinished) latents during the sampling process in CPU memory. After sampling has concluded, an animation (and image grid) will be created in the `/animated` folder in the output directory
 - `-in`/`--interpolate-latents` accepts two image paths for retrieving and interpolating latents from the images. This will only work for images of the same size which have had their latents stored in metadata (`generate.py` does this by default, as it will only increase image size by 50-100kB). While the interpolation occurs in the latent space (after which the VAE is applied to decode individual images), results will usually not differ from crossfading the images in image space directly. Results are saved like in `--animate`.
@@ -174,5 +179,5 @@ pip install py-cord
 
 #
 # Notes
-- For more information about [Stable Diffusion](https://github.com/CompVis/stable-diffusion) and the [Huggingface Diffusers Implementation](https://huggingface.co/CompVis/stable-diffusion-v1-4), including the license, limitations, and capabilities of the systems utilized, check out the respective links.
-- Text to image and image to image implementations are derived from the huggingface pipeline implementations.
+- For more information about [Stable Diffusion](https://github.com/CompVis/stable-diffusion) and the [huggingface diffusers model of Stable Diffusion](https://huggingface.co/CompVis/stable-diffusion-v1-4), including the license, limitations, and capabilities of the systems utilized, check out the respective links.
+- Text to image and image to image implementations are derived from the pipeline implementations of the [huggingface diffusers library](https://github.com/huggingface/diffusers)
