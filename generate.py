@@ -101,6 +101,7 @@ def parse_args():
     parser.add_argument("-om","--online-model", type=str, default=None, help="Set an online model id for acquisition from huggingface hub.", dest="online_model")
     parser.add_argument("-lm","--local-model", type=str, default=None, help="Set a path to a directory containing local model files (should contain unet and vae dirs, see local install in readme).", dest="local_model")
     parser.add_argument("-od","--output-dir", type=str, default=None, help="Set an override for the base output directory. The directory will be created if not already present.", dest="output_dir")
+    parser.add_argument("-mn","--mix-negative-prompts", action="store_true", help="Mix negative prompts directly into the prompt itself, instead of using them as uncond embeddings.", dest="negative_prompt_mixing")
     return parser.parse_args()
 
 def main():
@@ -151,7 +152,7 @@ def main():
         exit()
 
     generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
-    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule)
+    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule, args.negative_prompt_mixing)
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
 
@@ -275,17 +276,19 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         return text_embeddings, io_data
 
     @torch.no_grad()
-    def encode_prompt(prompt):
-        uncond_input = tokenizer([""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
-        one_uncond_embedding = text_encoder(uncond_input.input_ids.to(IO_DEVICE))[0]
+    def encode_prompt(prompt, encoder_level_negative_prompts=False):
+        #uncond_input = tokenizer([""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
+        #one_uncond_embedding = text_encoder(uncond_input.input_ids.to(IO_DEVICE))[0]
         io_data = {"text_readback":[], "remaining_token_count":[], "attention":[]}
-        text_embeddings = []
+        embeddings_list_uncond = []
+        embeddings_list_prompt = []
         for raw_item in prompt:
             # create sequence of substrings followed by weight multipliers: substr,w,substr,w,... (w may be empty string - use default: 1, last trailing substr may be empty string)
             prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*);", raw_item)
             if len(prompt_segments) == 1:
                 # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
-                new_text_embeddings, new_io_data = perform_text_encode(raw_item)
+                new_embedding_positive, new_io_data = perform_text_encode(raw_item)
+                new_embedding_negative, _ = perform_text_encode("")
             else:
                 # print(f"Mixing {len(prompt_segments)//2} prompts with their respective weights")
                 # perpare invalid segments list to desired shape after splitting
@@ -317,7 +320,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                         # add either to positive, or to negative encodings & multipliers
                         is_negative_multiplier = multiplier < 0
                         if is_negative_multiplier:
-                            multiplier_sum_negative += abs(multiplier)
+                            multiplier = abs(multiplier)
+                            multiplier_sum_negative += multiplier
                             if encodings_sum_negative is None:
                                 # if sum is empty, write first item.
                                 encodings_sum_negative = next_encoding*multiplier
@@ -332,18 +336,39 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                             else:
                                 # add new encodings to sum based on their multiplier
                                 encodings_sum_positive += next_encoding*multiplier
-                if encodings_sum_positive is None:
-                    print("WARNING: only negative multipliers for prompt mixing are present. This should be done by using positive multipliers with a negative guidance scale! Using as prompts with positive multipliers!")
-                    new_text_embeddings = encodings_sum_negative / multiplier_sum_negative
-                else:
+
+                if encoder_level_negative_prompts:
+                    # old mixing mode. leaves uncond embeddings untouched, mixes negative prompts directly into the prompt embedding itself.
+                    if encodings_sum_positive is None:
+                        tqdm.write("WARNING: only negative multipliers for prompt mixing are present. Using '' as a placeholder for positive prompts!")
+                        encodings_sum_positive, _ = perform_text_encode("")
+                        multiplier_sum_positive = 1.0
                     new_text_embeddings = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is not None:
                         # compute difference (direction of change) of negative embeddings from positive embeddings. Move in opposite direction of negative embeddings from positive embeddings based on relative multiplier strength.
                         # this does not subtract negative prompts, but rather amplifies the difference from the positive embeddings to the negative embeddings
                         negative_embeddings_offset = (encodings_sum_negative / multiplier_sum_negative)
                         new_text_embeddings += ((new_text_embeddings) - (negative_embeddings_offset)) * (multiplier_sum_negative / multiplier_sum_positive)
+                    # use mixed prompt tensor as prompt embedding
+                    new_embedding_positive = new_text_embeddings
+                    # use default, empty uncond embedding
+                    new_embedding_negative, _ = perform_text_encode("")
+                else:
+                    if encodings_sum_positive is None:
+                        # add an empty prompt for positive embeddings. Saving iodata of an empty placeholder is probably not necessary.
+                        replacement_encoding_positive, additional_io_data = perform_text_encode("")
+                        new_embedding_positive = replacement_encoding_positive
+                    else:
+                        new_embedding_positive = encodings_sum_positive / multiplier_sum_positive
+                    if encodings_sum_negative is None:
+                        # create default, empty uncond embedding. Skip iodata. It would not normally be saved for the empty uncond embedding.
+                        replacement_encoding_negative, additional_io_data = perform_text_encode("")
+                        new_embedding_negative = replacement_encoding_negative
+                    else:
+                        new_embedding_negative = (encodings_sum_negative / multiplier_sum_negative)
 
-            text_embeddings.append(new_text_embeddings)
+            embeddings_list_prompt.append(new_embedding_positive)
+            embeddings_list_uncond.append(new_embedding_negative)
             for key in new_io_data:
                 io_data[key].append(new_io_data[key])
 
@@ -353,12 +378,14 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 io_data[key] = io_data[key][0]
 
         # stack list of text encodings to be processed back into a tensor
-        text_embeddings = torch.cat(text_embeddings)
+        text_embeddings = torch.cat(embeddings_list_prompt)
         # get the resulting batch size
         batch_size = len(text_embeddings)
-        max_length = text_embeddings.shape[1]
+        #max_length = text_embeddings.shape[1]
         # create tensor of uncond embeddings for the batch size by stacking n instances of the singular uncond embedding
-        uncond_embeddings = torch.stack([one_uncond_embedding[0]] * batch_size)
+        #uncond_embeddings = torch.stack([one_uncond_embedding[0]] * batch_size)
+        uncond_embeddings = torch.cat(embeddings_list_uncond)
+        print(text_embeddings.shape, uncond_embeddings.shape)
         # n*77*768 + n*77*768 -> 2n*77*768
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         if half_precision_latents:
@@ -368,7 +395,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         return text_embeddings, batch_size, io_data
 
     @torch.no_grad()
-    def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True):
+    def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True, encoder_level_negative_prompts=False):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
             torch.cuda.empty_cache()
@@ -422,7 +449,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         sched_name = sched_name.lower().strip()
         SUPPLEMENTARY["io"]["sched_name"]=sched_name
 
-        text_embeddings, batch_size, io_data = encode_prompt(prompt)
+        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts)
         for key in io_data:
             SUPPLEMENTARY["io"][key] = io_data[key]
 
@@ -594,8 +621,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         return pil_images, SUPPLEMENTARY
 
     @torch.no_grad()
-    def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True):
-        exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff}
+    def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True, encoder_level_negative_prompts=False):
+        exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff,"encoder_level_negative_prompts":encoder_level_negative_prompts}
         if not sequential:
             try:
                 return generate_segmented_exec(prompt=prompt, **exec_args)
@@ -968,6 +995,7 @@ class QuickGenerator():
         self.attention_slicing=None
         self.animate_pred_diff=True
         self.gs_scheduler=None
+        self.encoder_level_negative_prompts=False
 
     # use Placeholder as the default value when the setting should not be changed. None is a valid value for some settings.
     def configure(self,
@@ -988,8 +1016,14 @@ class QuickGenerator():
             attention_slicing:bool=placeholder,
             animate_pred_diff:bool=placeholder,
             gs_scheduler:str=placeholder,
+            encoder_level_negative_prompts:bool=placeholder,
         ):
         settings = locals()
+        # if no additional processing is performed on an option, automate setting it on self:
+        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts"]
+        for option in unmodified_options:
+            if not isinstance(settings[option], Placeholder):
+                setattr(self, option, settings[option])
 
         if not isinstance(sample_count, Placeholder):
             self.sample_count = max(1,sample_count)
@@ -1014,11 +1048,6 @@ class QuickGenerator():
             else:
                 print(f"unknown gs schedule requested: '{gs_scheduler}' options are {IMPLEMENTED_GS_SCHEDULES}")
 
-        # if no additional processing is performed on an option, automate setting it on self:
-        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2"]
-        for option in unmodified_options:
-            if not isinstance(settings[option], Placeholder):
-                setattr(self, option, settings[option])
 
         if not isinstance(attention_slicing, Placeholder) and not (attention_slicing==self.attention_slicing):
             # None disables slicing if parameter is False
@@ -1084,6 +1113,7 @@ class QuickGenerator():
             sequential=self.sequential_samples,
             gs_schedule=self.gs_scheduler,
             animate_pred_diff=self.animate_pred_diff,
+            encoder_level_negative_prompts=self.encoder_level_negative_prompts
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
