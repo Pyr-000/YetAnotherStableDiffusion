@@ -558,7 +558,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             progress_factor = i/len(scheduler.timesteps[starting_timestep:])
-            if gs_schedule is None:
+            if gs_schedule is None or gs_schedule == "":
                 gs_mult = 1
             elif gs_schedule == "sin": # half-sine (between 0 and pi; 0 -> 1 -> 0)
                 gs_mult = np.sin(np.pi * progress_factor)
@@ -1000,23 +1000,37 @@ class QuickGenerator():
         self._rate_nsfw=rate_nsfw
         self._use_half_latents=use_half_latents
         self.generate_exec = generate_segmented(tokenizer=self._tokenizer,text_encoder=self._text_encoder,unet=self._unet,vae=self._vae,IO_DEVICE=self._IO_DEVICE,UNET_DEVICE=self._UNET_DEVICE,rate_nsfw=self._rate_nsfw,half_precision_latents=self._use_half_latents)
-        self.sample_count=1
-        self.width,self.height=512,512
-        self.steps=50
-        self.guidance_scale=7.5
-        self.seed=None
-        self.sched_name="pndm"
-        self.ddim_eta=0.0
-        self.eta_seed=None
-        self.strength=0.75
-        self.animate=False
-        self.sequential_samples=False
-        self.save_latents=True
-        self.display_with_cv2=True
-        self.attention_slicing=None
-        self.animate_pred_diff=True
-        self.gs_scheduler=None
-        self.encoder_level_negative_prompts=False
+
+        # default config for re-initialisation
+        self.default_config = {
+            "sample_count":1,
+            "width":512,
+            "height":512,
+            "steps":50,
+            "guidance_scale":7.5,
+            "seed":None,
+            "sched_name":"pndm",
+            "ddim_eta":0.0,
+            "eta_seed":None,
+            "strength":0.75,
+            "animate":False,
+            "sequential_samples":False,
+            "save_latents":True,
+            "display_with_cv2":True,
+            "attention_slicing":None,
+            "animate_pred_diff":True,
+            "gs_scheduler":None,
+            "encoder_level_negative_prompts":False,
+        }
+        # pre-set attributes as placeholders, ensuring that there are no missing attributes
+        for attribute_name in self.default_config:
+            setattr(self, attribute_name, self.default_config[attribute_name])
+        # properly initialise config
+        self.init_config()
+
+    # (re)-initialise settings
+    def init_config(self):
+        self.configure(**self.default_config)
 
     # use Placeholder as the default value when the setting should not be changed. None is a valid value for some settings.
     def configure(self,
@@ -1076,7 +1090,7 @@ class QuickGenerator():
 
             # 'True' / 0 -> use diffusers recommended 'automatic' value for "a good trade-off between speed and memory"
             # use bool instance check and bool value: otherwise (int)1==True -> True would be caught!
-            if attention_slicing <= 0 or (isinstance(attention_slicing, bool) and attention_slicing):
+            if (isinstance(attention_slicing, int) and attention_slicing <= 0) or (isinstance(attention_slicing, bool) and attention_slicing):
                 slice_size = self._unet.config.attention_head_dim//2
             # int -> use as slice size
             elif isinstance(attention_slicing, int):
@@ -1147,7 +1161,12 @@ class QuickGenerator():
         if not ("ddim" in argdict["sched_name"] and argdict["eta"] > 0):
             argdict.pop("eta")
             argdict.pop("eta_seed")
-        save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
+        if argdict["unet_model"] == argdict["vae_model"]:
+            argdict.pop("vae_model")
+            argdict["model"] = argdict.pop("unet_model")
+        if argdict["gs_sched"] is None:
+            argdict.pop("gs_sched")
+        full_image, full_metadata, metadata_items = save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
         if self.animate:
             # init frames by image list
             frames_by_image = []
@@ -1158,7 +1177,7 @@ class QuickGenerator():
                 for (image, image_sublist_index) in zip(images_of_step, range(len(images_of_step))):
                     frames_by_image[image_sublist_index].append(image)
             save_animations(frames_by_image)
-        return out,SUPPLEMENTARY
+        return out,SUPPLEMENTARY, (full_image, full_metadata, metadata_items)
 
     @torch.no_grad()
     def perform_image_cycling(self,
@@ -1184,7 +1203,7 @@ class QuickGenerator():
                     correction_target = image_to_correction_target(color_target_image if color_target_image is not None else init_image)
                 # if text-to-image should be used, set input image for cycle to None
                 init_image = init_image if not text2img else None
-                out, SUPPLEMENTARY = self.one_generation(index_prompt(i), init_image, save_images=save_individual)
+                out, SUPPLEMENTARY, _ = self.one_generation(index_prompt(i), init_image, save_images=save_individual)
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
                     torch.cuda.empty_cache()
