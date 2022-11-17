@@ -60,7 +60,7 @@ os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
 IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "ipndm", "euler", "euler_ancestral"]
-IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5"]
+IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "rand", "frand"]
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -273,12 +273,37 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist()
         # TODO: implement custom attention masks?
         text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE))[0]
+        if prompt == "<damaged_uncond>":
+            uncond, _ = perform_text_encode("")
+            for i in range(uncond.shape[1]):
+                # create some tensor damage: mix half of the vector elements with a random element of the same vector.
+                idx = torch.randperm(uncond.shape[2])
+                for j in range(uncond.shape[2]):
+                    if torch.rand(1) > 0.5:
+                        uncond[:,i,j] = (uncond[:,i,j]*2 + uncond[:,i,idx[j]]) /3
+            text_embeddings=uncond
+        elif prompt == "<alpha_dropout_uncond>":
+            uncond, _ = perform_text_encode("")
+            text_embeddings = torch.nn.functional.alpha_dropout(uncond, p=0.5)
+        elif prompt == "<all_starts>":
+            uncond, _ = perform_text_encode("")
+            for i in range(1,uncond.shape[1]):
+                uncond[:,i] = uncond[:,0]
+            text_embeddings = uncond
+        elif prompt == "<all_ends>":
+            uncond, _ = perform_text_encode("")
+            for i in range(0,uncond.shape[1]-1):
+                uncond[:,i] = uncond[:,-1]
+            text_embeddings = uncond
+        elif prompt == "<all_start_end>":
+            uncond, _ = perform_text_encode("")
+            for i in range(1,uncond.shape[1]-1):
+                uncond[:,i] = uncond[:,0] if i%2==0 else uncond[:,-1]
+            text_embeddings = uncond
         return text_embeddings, io_data
 
     @torch.no_grad()
     def encode_prompt(prompt, encoder_level_negative_prompts=False):
-        #uncond_input = tokenizer([""], padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt")
-        #one_uncond_embedding = text_encoder(uncond_input.input_ids.to(IO_DEVICE))[0]
         io_data = {"text_readback":[], "remaining_token_count":[], "attention":[]}
         embeddings_list_uncond = []
         embeddings_list_prompt = []
@@ -381,11 +406,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         text_embeddings = torch.cat(embeddings_list_prompt)
         # get the resulting batch size
         batch_size = len(text_embeddings)
-        #max_length = text_embeddings.shape[1]
         # create tensor of uncond embeddings for the batch size by stacking n instances of the singular uncond embedding
-        #uncond_embeddings = torch.stack([one_uncond_embedding[0]] * batch_size)
         uncond_embeddings = torch.cat(embeddings_list_uncond)
-        print(text_embeddings.shape, uncond_embeddings.shape)
         # n*77*768 + n*77*768 -> 2n*77*768
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
         if half_precision_latents:
@@ -514,16 +536,10 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             latents = init_latents.to(UNET_DEVICE)
             starting_timestep = max(steps - init_timestep + scheduler_offset, 0)
 
-        """
-        if isinstance(scheduler, LMSDiscreteScheduler):
-            latents = latents * scheduler.sigmas[0]
-        """
         if hasattr(scheduler, "init_noise_sigma"):
             latents *= scheduler.init_noise_sigma
 
         # denoising loop!
-        # autocast _requires_ a device of either CUDA or CPU to be specified! Switching to manual casting for meta/offload support
-        #with autocast(autocast_device):
         progress_bar = tqdm([x for x in enumerate(scheduler.timesteps[starting_timestep:])], position=1)
         for i, t in progress_bar:
             if animate and not animate_pred_diff:
@@ -556,6 +572,11 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 gs_mult = np.cos(np.pi/2 * progress_factor)
             elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
                 gs_mult = 1.0 - np.cos(np.pi/2 * progress_factor)
+            elif gs_schedule == "rand": # random multiplier in [0,1)
+                gs_mult = np.random.rand()
+            elif gs_schedule == "frand": # random multiplier, with negative values
+                gs_mult = np.random.rand()*2-1
+
             progress_bar.set_description(f"gs={gs*gs_mult:.3f}")
             noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
 
@@ -1063,7 +1084,6 @@ class QuickGenerator():
             # False / None / unknown type will disable slicing with default value of None.
 
             self.attention_slicing = attention_slicing
-            print(f"Setting attention slice size to {slice_size}")
             self._unet.set_attention_slice(slice_size)
 
     """
