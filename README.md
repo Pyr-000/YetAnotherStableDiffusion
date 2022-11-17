@@ -107,7 +107,7 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 #
 ## Additional flags
 - `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. See: [Automatic model install](#option-a-automatic-model-install-via-huggingface)
-- `-lm`/`--local-model` can be used to specify a directory containing local model files (this directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` file each. See: [Manual model install](#option-b-manual-model-install)
+- `-lm`/`--local-model` can be used to specify a directory containing local model files. This directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` file each. See: [Manual model install](#option-b-manual-model-install)
 - `-od`/`--output-dir` sets an override for the base output directory. The directory will be created if it is not already present.
 - `--no-check-nsfw` disables the NSFW check entirely, which slightly speeds up the generation process. By default, `generate.py` will only display a warning and attach an extra tag in image metadata if potential NSFW concepts are detected.
 - `--animate` will store any intermediate (unfinished) latents during the sampling process in CPU memory. After sampling has concluded, an animation (and image grid) will be created in the `/animated` folder in the output directory
