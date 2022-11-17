@@ -147,9 +147,12 @@ Visualization of the difference between outputs in this example (highlighting of
 - Some basic settings (saving outputs to disk, precision, devices, command prefix) can be set using global variables at the top of the script:
   - `SAVE_OUTPUTS_TO_DISK` can be set to `False` if outputs generated through bot commands should not be saved on the device running the bot.
   - `DEFAULT_HALF_PRECISION` can be set to `False` if the fp32 version of the UNET should be used
-  - `IO_DEVICE` can be set to `"cuda"` if running in a less memory optimized (slightly faster) configuration is desired.
+  - `IO_DEVICE` can be set to `"cpu"` if running in a more memory optimized (slightly slower) configuration is desired.
   - `RUN_ALL_IMAGES_INDIVIDUAL` can be set to `True` to default to running batch items in sequence. Otherwise, the automatic failover should trigger in response to oversized batches.
   - `FLAG_POTENTIAL_NSFW` can be set to `False` to entirely disable the content check. This will speed up generation slightly, while no longer flagging images and marking them as spoilers.
+  - `USE_HALF_LATENTS` see: `--latents-half` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
+  - `ATTENTION_SLICING` see: `-as` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
+  - `CPU_OFFLOAD` see: `-co` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
 - The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it be utilized as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.
@@ -172,10 +175,10 @@ pip install py-cord
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution. Accepts an optional image attachment for performing image-to-image
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
-  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <ddim_eta> <eta_seed> <img2img_strength> <Image attachment> <amount>`
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <ddim_eta> <eta_seed>`
     - `Width` and `height` are specified as multiples of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
-    - if `eta` is set to a value greater than `0`, the scheduler automatically switches to `ddim`. Otherwise, `pndm` is used.
+    - `scheduler` and `gs_schedule` display available options.
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
 - All commands come with a short documentation of their available parameters.
