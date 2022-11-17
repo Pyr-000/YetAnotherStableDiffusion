@@ -204,21 +204,21 @@ async def switch_h(ctx):
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def square(ctx, prompt:str, init_image:discord.Attachment=None):
-    reply = run_advanced(ctx, prompt, attachment=init_image)
+    reply = run_advanced(ctx, prompt, init_image=init_image)
     await ctx.send_response(reply)
 
 @bot.slash_command(name="portrait", description="generate an image with portrait aspect ratio (512x768)")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def portrait(ctx, prompt:str, init_image:discord.Attachment=None):
-    reply = run_advanced(ctx, prompt, height=4, attachment=init_image)
+    reply = run_advanced(ctx, prompt, height=4, init_image=init_image)
     await ctx.send_response(reply)
 
 @bot.slash_command(name="landscape", description="generate an image with landscape aspect ratio (768x512)")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
-    reply = run_advanced(ctx, prompt, width=4, attachment=init_image)
+    reply = run_advanced(ctx, prompt, width=4, init_image=init_image)
     await ctx.send_response(reply)
 
 @bot.slash_command(name="advanced", description="generate an image with custom parameters")
