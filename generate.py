@@ -176,7 +176,7 @@ def main():
             except Exception as e:
                 print_exc()
 
-def load_models(half_precision=False, unet_only=False, cpu_offloading=False):
+def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False):
     global using_local_unet, using_local_vae
     if cpu_offloading:
         if not is_accelerate_available():
@@ -211,23 +211,27 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False):
             vae_model_id = vae_dir
             using_local_vae = True
 
-    # Load the UNet model for generating the latents.
-    if half_precision:
-        unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet, torch_dtype=torch.float16, revision="fp16")
-    else:
-        unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet)
+    if not vae_only:
+        # Load the UNet model for generating the latents.
+        if half_precision:
+            unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet, torch_dtype=torch.float16, revision="fp16")
+        else:
+            unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet)
 
-    if cpu_offloading:
-        cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
-    
-    if unet_only:
-        return unet
+        if cpu_offloading:
+            cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+
+        if unet_only:
+            return unet
 
     # Load the autoencoder model which will be used to decode the latents into image space.
     if False:
         vae = AutoencoderKL.from_pretrained(vae_model_id, subfolder="vae", use_auth_token=use_auth_token_vae, torch_dtype=torch.float16)
     else:
         vae = AutoencoderKL.from_pretrained(vae_model_id, subfolder="vae", use_auth_token=use_auth_token_vae)
+    if vae_only:
+        return vae
+
     # Load the tokenizer and text encoder to tokenize and encode the text. 
     tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
     text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
@@ -608,7 +612,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         latents = 1 / 0.18215 * latents
         latents = latents.to(IO_DEVICE)
         latents = latents.to(vae.dtype)
-        image = vae.decode(latents)
+        image = vae_decode_with_failover(vae, latents)
 
         # latents are decoded and copied (if requested) by now.
         del latents
@@ -633,13 +637,55 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             torch.cuda.synchronize()
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
-                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae.decode((item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_decode_with_failover(vae,(item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
             torch.cuda.synchronize()
             vae.to(IO_DEVICE)
             unet.to(DIFFUSION_DEVICE)
         SUPPLEMENTARY["io"]["time"] = time() - START_TIME
 
         return pil_images, SUPPLEMENTARY
+
+    def cleanup_memory():
+        gc.collect()
+        if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
+            torch.cuda.empty_cache()
+
+    # can optionally move the unet out of the way to make space
+    @torch.no_grad()
+    def vae_decode_with_failover(vae, latents:torch.Tensor):
+        try:
+            image_out = vae.decode(latents)
+            return image_out
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
+                if vae.device != "cpu":
+                    return vae_decode_cpu(vae, latents)
+                else:
+                    raise RuntimeError(f"VAE decode ran out of memory, with VAE already on CPU: {e}")
+            else:
+                # there was some RuntimeError, but it wasn't OOM.
+                raise e
+
+    @torch.no_grad()
+    def vae_decode_cpu(vae, latents:torch.Tensor):
+        tqdm.write("Decode moved to CPU.")
+        cleanup_memory()
+        try:
+            prev_device = vae.device
+            vae = vae.to(device="cpu")
+            latents = latents.to(device="cpu")
+            image_out = vae.decode(latents)
+            vae = vae.to(device=prev_device)
+        except NotImplementedError as e:
+            if "Cannot copy out of meta tensor" in str(e):
+                # vae is offloaded through accelerate. use a temporary stand-in vae.
+                new_vae = load_models(vae_only=True)
+                new_vae = new_vae.to(device="cpu")
+                latents = latents.to(device="cpu")
+                image_out = new_vae.decode(latents)
+                del new_vae
+                cleanup_memory()
+        return image_out
 
     @torch.no_grad()
     def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True, encoder_level_negative_prompts=False):
@@ -987,10 +1033,14 @@ class Placeholder():
 
 placeholder = Placeholder()
 class QuickGenerator():
-    def __init__(self,tokenizer,text_encoder,unet,vae,IO_DEVICE,UNET_DEVICE,rate_nsfw,use_half_latents):
+    # can be used externally without requiring an instance
+    def cleanup(devices):
         gc.collect()
-        if "cuda" in [IO_DEVICE, UNET_DEVICE]:
+        if "cuda" in devices:
             torch.cuda.empty_cache()
+            torch.cuda.reset_max_memory_allocated()
+    def __init__(self,tokenizer,text_encoder,unet,vae,IO_DEVICE,UNET_DEVICE,rate_nsfw,use_half_latents):
+        QuickGenerator.cleanup([IO_DEVICE,UNET_DEVICE])
         self._tokenizer=tokenizer
         self._text_encoder=text_encoder
         self._unet=unet
