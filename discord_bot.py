@@ -15,10 +15,18 @@ from PIL import Image
 import discord
 from discord.ext import commands, tasks
 
+import generate
 from generate import load_models, QuickGenerator, IMPLEMENTED_SCHEDULERS, IMPLEMENTED_GS_SCHEDULES
 from tokens import get_discord_token
 
-model_id = "CompVis/stable-diffusion-v1-4"
+# set to True to enable the /reload command.
+PERMIT_RELOAD = False
+# permitted models act as a white-list. Dict keys specify the model name (used in /reload), while the value specifies the id/path respectively
+# example: {"hub_v1.4":"CompVis/stable-diffusion-v1-4", "hub_v1.5":"runwayml/stable-diffusion-v1-5"}
+permitted_model_ids = {"default_hub":generate.model_id}
+# example: {"local_v1.4":"models/stable-diffusion-v1-4", "local_v1.5":"models/v1.5"}
+permittel_local_model_paths = {"default_local":generate.models_local_dir}
+
 UNET_DEVICE = "cuda"
 IO_DEVICE = "cuda"
 SAVE_OUTPUTS_TO_DISK = True
@@ -58,8 +66,9 @@ def flatten_sublist(input_item):
         return concat
 
 class command_task():
-    def __init__(self,ctx:discord.commands.context.ApplicationContext,command:str) -> None:
+    def __init__(self,ctx:discord.commands.context.ApplicationContext,type:str,command:dict) -> None:
         self.ctx=ctx
+        self.type=type
         self.command=command
         self.response:str="no response was returned"
 
@@ -137,21 +146,10 @@ def main():
     global completed_tasks
     global currently_generating
     global precision_target_half
+    global CPU_OFFLOAD
+    global ATTENTION_SLICING
     precision_target_half = DEFAULT_HALF_PRECISION
-    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(precision_target_half, cpu_offloading=CPU_OFFLOAD)
-    if not FLAG_POTENTIAL_NSFW:
-        del rate_nsfw
-        rate_nsfw = lambda x: False
-    generator = QuickGenerator(
-        tokenizer=tokenizer,
-        text_encoder=text_encoder,
-        unet=unet,
-        vae=vae,
-        IO_DEVICE=IO_DEVICE,
-        UNET_DEVICE=UNET_DEVICE,
-        rate_nsfw=rate_nsfw,
-        use_half_latents=USE_HALF_LATENTS
-    )
+    generator = load_generator()
     print("loaded models!")
     while True:
         if len(task_queue) == 0:
@@ -166,8 +164,28 @@ def main():
                 completed_tasks.append(task)
                 print(f"Done: '{task.prompt}', queued: {len(task_queue)}")
             elif isinstance(task,command_task):
-                target = task.command
-                task.response = f"Ignoring: {target}. Currently disabled"
+                if task.type == "reload" and PERMIT_RELOAD:
+                    model_target = task.command["model"]
+                    if model_target in permittel_local_model_paths:
+                        pass
+                        local_model_path = permittel_local_model_paths[model_target]
+                        generate.models_local_dir = local_model_path
+                    elif model_target in permitted_model_ids:
+                        pass
+                        local_model_id = permitted_model_ids[model_target]
+                        generate.model_id = local_model_id
+                        # disable local model override
+                        generate.models_local_dir = None
+                    else:
+                        task.response = "Unable to find model despite passing model check!"
+                        return
+                    ATTENTION_SLICING = int(task.command["attention_slice"])
+                    CPU_OFFLOAD = bool(task.command["offload"])
+                    del generator
+                    generator = load_generator()
+                    task.response = f"Re-loaded generator using model {model_target}. CPU offloading is {'enabled' if CPU_OFFLOAD else 'disabled'}"
+                else:
+                    task.response = f"Ignoring: {task.type} is not available."
                 completed_tasks.append(task)
             else:
                 print(f"WARNING: unknown task type found in task_queue: {type(task)}")
@@ -180,6 +198,27 @@ def main():
             if task is not None:
                 task.response = f"Something went horribly wrong: {e}"
                 completed_tasks.append(task)
+
+def load_generator():
+    cleanup_devices = [IO_DEVICE,UNET_DEVICE]
+    if CPU_OFFLOAD:
+        cleanup_devices.append(generate.OFFLOAD_EXEC_DEVICE)
+    QuickGenerator.cleanup(cleanup_devices)
+    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(precision_target_half, cpu_offloading=CPU_OFFLOAD)
+    if not FLAG_POTENTIAL_NSFW:
+        del rate_nsfw
+        rate_nsfw = lambda x: False
+    generator = QuickGenerator(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        unet=unet,
+        vae=vae,
+        IO_DEVICE=IO_DEVICE if not CPU_OFFLOAD else generate.OFFLOAD_EXEC_DEVICE,
+        UNET_DEVICE=UNET_DEVICE if not CPU_OFFLOAD else generate.OFFLOAD_EXEC_DEVICE,
+        rate_nsfw=rate_nsfw,
+        use_half_latents=USE_HALF_LATENTS
+    )
+    return generator
 
 # p = load_pipeline(model_id,device,True)
 intents = discord.Intents.all()
@@ -199,6 +238,18 @@ async def switch_h(ctx):
     task_queue.append(command_task(ctx,"half"))
     await ctx.reply(f"Attaching command to switch to half precision to queue! {len(task_queue)+ (1 if currently_generating else 0)} in queue.", delete_after=10.0)
 """
+
+model_names = list(permittel_local_model_paths.keys()) + list(permitted_model_ids.keys())
+@bot.slash_command(name="reload", description="Reload the generator with new parameters")
+@discord.option("model",str,description="Model name (must be configured a permitted model name)",choices=[discord.OptionChoice(name=opt,value=opt) for opt in model_names],required=True)
+@discord.option("offload",bool,description="Enable CPU offloading, slowing down generation but allowing significantly larger generations",required=False,default=False)
+@discord.option("attention_slice",int,choices=[discord.OptionChoice(name=str(x), value=x) for x in [-1,0,1]],description="Set attention slicing: -1 -> None, 0 -> recommended, 1 -> max",required=False,default=0)
+async def square(ctx, model:str, offload:bool, attention_slice:int):
+    if not (model in permitted_model_ids or model in permittel_local_model_paths):
+        await ctx.send_response(f"Requested model is not available: {model}",delete_after=60)
+    else:
+        await ctx.send_response(f"Acknowledged. Your task is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.")
+        task_queue.append(command_task(ctx,type="reload",command={"model":model,"offload":offload,"attention_slice":attention_slice}))
 
 @bot.slash_command(name="square", description="generate a default, square image (512x512)")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
@@ -330,7 +381,7 @@ async def poll():
             else:
                 await task.ctx.edit(content=f"{task.response}", files=None, delete_after=60)
         elif isinstance(task, command_task):
-            await task.ctx.edit(content=f"{task.response}", delete_after=60)
+            await task.ctx.edit(content=f"{task.response}")
         else:
             print(f"WARNING: unknown task type found in completed_tasks queue: {type(task)}")
         del task

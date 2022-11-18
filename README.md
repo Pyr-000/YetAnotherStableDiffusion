@@ -153,6 +153,8 @@ Visualization of the difference between outputs in this example (highlighting of
   - `USE_HALF_LATENTS` see: `--latents-half` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
   - `ATTENTION_SLICING` see: `-as` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
   - `CPU_OFFLOAD` see: `-co` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
+  - `PERMIT_RELOAD` can be set to `True` to allow users to switch the current model, toggle CPU offloading and set attention slicing via the `/reload` command.
+    - If set to `True`, `permittel_local_model_paths` specifies a whitelist of local model names with their respective model paths (see: [Manual model install](#option-b-manual-model-install)), while `permitted_model_ids` specifies a whitelist of names with respective huggingface hub model ids (see: [Automatic model install](#option-a-automatic-model-install-via-huggingface))
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
 - The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it be utilized as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.
@@ -181,6 +183,7 @@ pip install py-cord
     - `scheduler` and `gs_schedule` display available options.
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
+  - `/reload <model name> <enable cpu offload> <attention slicing>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
 - All commands come with a short documentation of their available parameters.
 
 #
