@@ -228,7 +228,7 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("seed",int,description="Initial noise seed for reproducing/modifying outputs (default: -1 will select a random seed)",required=False,default=-1)
 @discord.option("gs",float,description="Guidance scale (increasing may increse adherence to prompt but decrease 'creativity'). Default: 7.5",required=False,default=7.5)
 @discord.option("steps",int,description="Amount of sampling steps. More can help with detail, but increase computation time. Default: 50",required=False,default=50)
-@discord.option("strength",float,description="Strength of img2img. 0.0 -> unchanged, 1.0 -> remade entirely. Requires valid image attachment.",required=False,default=0.0)
+@discord.option("strength",float,description="Strength of img2img. 0.0 -> unchanged, 1.0 -> remade entirely. Requires valid image attachment.",required=False,default=0.75)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 @discord.option("amount",int,description="Amount of images to batch at once.",required=False,default=1)
 @discord.option("scheduler",str,description="Scheduler for the diffusion sampling loop.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_SCHEDULERS],required=False,default="pndm")
