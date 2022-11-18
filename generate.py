@@ -521,7 +521,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             image_processing = np.array(init_image).astype(np.float32) / 255.0
             image_processing = image_processing[None].transpose(0, 3, 1, 2)
             init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
-            init_latents = vae.encode(init_image_tensor.to(IO_DEVICE)).sample()
+            init_latents = vae.encode(init_image_tensor.to(IO_DEVICE)).latent_dist.sample()
             # apply inverse scaling
             init_latents = 0.18215 * init_latents
             init_latents = torch.cat([init_latents] * batch_size)
