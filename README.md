@@ -5,7 +5,7 @@ Stable Diffusion script(s) based on huggingface diffusers. Comes with extra conf
 - `diffusers` should be updated. `accelerate` can now be used to perform automatic CPU offloading.
 - Now requires `scikit-image` package to perform color correction during image cycling
 
-# Installation
+# Python Installation
 ## Install `pytorch` (skip when using a pre-existing StableDiffusion-compatible environment)
 Get the correct installation for your hardware at https://pytorch.org/get-started/locally/.
 
@@ -19,7 +19,19 @@ pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingfac
 ```
 Most pre-existing StableDiffusion-compatible environments will already have some of these installed.
 #
-## Install models
+# Model Installation
+## Local installation via git
+Git must be installed on your system. Equivalent to [Option B: Manual model install](#option-b-manual-model-install), but automated.
+Note the license terms ([CreativeML OpenRAIL++-M](https://huggingface.co/stabilityai/stable-diffusion-2/blob/main/LICENSE-MODEL))
+In the root directory of `yasd`, clone your model repository (this example will clone StableDiffusionv2.1):
+```shell
+git lfs clone https://huggingface.co/stabilityai/stable-diffusion-2-1 models/stable-diffusion-2-1 --progress -X "v2-1_768-ema-pruned.ckpt","v2-1_768-nonema-pruned.ckpt"
+```
+This may take a while.
+Using 'git lfs clone' will yield a deprecation warning, however, cloning through 'git clone' may fail to display any progress information on some platforms.
+
+#
+## Alternative model installation options
 Models can either be automatically installed by providing a huggingface token, or manually installed by downloading them from huggingface yourself.
 
 ### A Note on StableDiffusion version 2.x+:
@@ -30,7 +42,7 @@ In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and
 - `models/*/tokenizer/`: `merges.txt`, `special_tokens_map.json`, `tokenizer_config.json` and `vocab.json`
 If `scheduler/scheduler_config.json` is not provided, the model will be presumed to not be a v_prediction model (this will cause issues with anything but the _base_ variant of SD2.x). If `text_encoder` and `tokenizer` do not provide the required files, the model will be loaded with `openai/clip-vit-large-patch14`, which is used in SD1.x-style models. This is incompatible with SD2.x.
 
-## Option A: Automatic model install via huggingface:
+### Option A: Automatic model install via huggingface:
 You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4. Manually logging in and accepting the license on the huggingface webpage is no longer required.
 
 Model installation should occur automatically, even without being logged into huggingface hub.
@@ -42,7 +54,7 @@ As manually accepting the license on the huggingface webpage should no longer be
 - Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
 - Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
 
-## Option B: Manual model install:
+### Option B: Manual model install:
 - Navigate to https://huggingface.co/CompVis/stable-diffusion-v1-4/. Note the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) (logging in to accept the license should no longer be required).
 - Head to the `Files and versions` tab, and navigate to `stable-diffusion-v1-4/unet`
   - Download both `config.json` and `diffusion_pytorch_model.bin`

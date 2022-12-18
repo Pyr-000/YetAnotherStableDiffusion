@@ -36,7 +36,7 @@ import uuid
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
 # for manual model installs
-models_local_dir = "models/stable-diffusion-v1-4"
+models_local_dir = "models/stable-diffusion-2-1"
 # for metadata, written during model load
 using_local_unet, using_local_vae = False,False
 # location of textual inversion concepts (if present). (recursively) search for any .bin files. see see: https://huggingface.co/sd-concepts-library
