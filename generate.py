@@ -12,7 +12,7 @@ import torch
 from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
-from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.utils import is_accelerate_available
 import argparse
@@ -31,6 +31,7 @@ from io import BytesIO
 from pathlib import Path
 import re
 from tokens import get_huggingface_token
+import uuid
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -48,6 +49,8 @@ IO_DEVICE = "cpu"
 OFFLOAD_EXEC_DEVICE = "cuda"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
+# global flag signifying if a v_prediction model is in use.
+V_PREDICTION_MODEL = False
 
 OUTPUT_DIR_BASE = "outputs"
 OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
@@ -59,8 +62,19 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
-IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "ipndm", "euler", "euler_ancestral"]
+IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun"] # ipndm not supported
+V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
 IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "rand", "frand"]
+
+# sd2.0 default negative prompt
+DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
+
+# THIS WIL AUTOMATICALLY RESET. DO NOT ADD CUSTOM VALUES HERE. substitutions/shortcuts in prompts. Will be filled with substitions for multi-token custom embeddings.
+PROMPT_SUBST = {}
+# Custom combinations of "shortname":"substitution string", could be added here.
+CUSTOM_PROMPT_SUBST = {
+    "<negative>":"ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft",
+}
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -68,14 +82,14 @@ def parse_args():
     parser.add_argument("-ii", "--init-img", type=str, default=None, help="use img2img mode. path to the input image", dest="init_img_path")
     parser.add_argument("-st", "--strength", type=float, default=0.75, help="strength of initial image in img2img. 0.0 -> no new information, 1.0 -> only new information", dest="strength")
     parser.add_argument("-s","--steps", type=int, default=50, help="number of sampling steps", dest="steps")
-    parser.add_argument("-sc","--scheduler", type=str, default="pndm", choices=IMPLEMENTED_SCHEDULERS, help="scheduler used when sampling in the diffusion loop", dest="sched_name")
+    parser.add_argument("-sc","--scheduler", type=str, default="mdpms", choices=IMPLEMENTED_SCHEDULERS, help="scheduler used when sampling in the diffusion loop", dest="sched_name")
     parser.add_argument("-e", "--ddim-eta", type=float, default=0.0, help="eta adds additional random noise when sampling, only applied on ddim sampler. 0 -> deterministic", dest="ddim_eta")
     parser.add_argument("-es","--ddim-eta-seed", type=int, default=None, help="secondary seed for the eta noise with ddim sampler and eta>0", dest="eta_seed")
     parser.add_argument("-H","--H", type=int, default=512, help="image height, in pixel space", dest="height")
     parser.add_argument("-W","--W", type=int, default=512, help="image width, in pixel space", dest="width")
     parser.add_argument("-n", "--n-samples", type=int, default=1, help="how many samples to produce for each given prompt. A.k.a. batch size", dest="n_samples")
     parser.add_argument("-seq", "--sequential_samples", action="store_true", help="Run batch in sequence instead of in parallel. Removes VRAM requirement for increased batch sizes, increases processing time.", dest="sequential_samples")
-    parser.add_argument("-cs", "--scale", type=float, default=7.5, help="(classifier free) guidance scale (higher values may increse adherence to prompt but decrease 'creativity')", dest="guidance_scale")
+    parser.add_argument("-cs", "--scale", type=float, default=9, help="(classifier free) guidance scale (higher values may increse adherence to prompt but decrease 'creativity')", dest="guidance_scale")
     parser.add_argument("-S","--seed", type=int, default=None, help="initial noise seed for reproducing/modifying outputs (None will select a random seed)", dest="seed")
     parser.add_argument("--unet-full", action='store_false', help="Run diffusion UNET at full precision (fp32). Default is half precision (fp16). Increases memory load.", dest="half")
     parser.add_argument("--latents-half", action='store_true', help="Generate half precision latents (fp16). Default is full precision latents (fp32), memory usage will only reduce by <1MB. Outputs will be slightly different.", dest="half_latents")
@@ -102,17 +116,20 @@ def parse_args():
     parser.add_argument("-lm","--local-model", type=str, default=None, help="Set a path to a directory containing local model files (should contain unet and vae dirs, see local install in readme).", dest="local_model")
     parser.add_argument("-od","--output-dir", type=str, default=None, help="Set an override for the base output directory. The directory will be created if not already present.", dest="output_dir")
     parser.add_argument("-mn","--mix-negative-prompts", action="store_true", help="Mix negative prompts directly into the prompt itself, instead of using them as uncond embeddings.", dest="negative_prompt_mixing")
+    parser.add_argument("-dnp","--default-negative-prompt", type=str, default="", help="Specify a default negative prompt to use when none are specified.", dest="default_negative")
     return parser.parse_args()
 
 def main():
     global DIFFUSION_DEVICE, IO_DEVICE
     global model_id, models_local_dir
     global OUTPUT_DIR_BASE, OUTPUTS_DIR, INDIVIDUAL_OUTPUTS_DIR, UNPUB_DIR, ANIMATIONS_DIR
+    global DEFAULT_NEGATIVE_PROMPT
     args = parse_args()
     if args.cpu_offloading:
         args.diffusion_device, args.io_device = OFFLOAD_EXEC_DEVICE, OFFLOAD_EXEC_DEVICE
     DIFFUSION_DEVICE = args.diffusion_device
     IO_DEVICE = args.io_device
+    DEFAULT_NEGATIVE_PROMPT = args.default_negative
 
     if args.online_model is not None:
         # set the online model id
@@ -177,7 +194,9 @@ def main():
                 print_exc()
 
 def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False):
-    global using_local_unet, using_local_vae
+    global using_local_unet, using_local_vae, PROMPT_SUBST
+    # re-set substitution list (re-loading model would otherwise re-add custom embedding substitutions)
+    PROMPT_SUBST = CUSTOM_PROMPT_SUBST
     if cpu_offloading:
         if not is_accelerate_available():
             print("accelerate library is not installed! Unable to utilise CPU offloading!")
@@ -194,22 +213,50 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
 
     unet_model_id = model_id
     vae_model_id = model_id
+    text_encoder_id = "openai/clip-vit-large-patch14" # sd 1.x default
+    tokenizer_id = "openai/clip-vit-large-patch14" # sd 1.x default
     use_auth_token_unet=get_huggingface_token()
     use_auth_token_vae=get_huggingface_token()
 
+    default_local_model_files_per_dir = ["config.json", "diffusion_pytorch_model.bin"]
     if models_local_dir is not None and len(models_local_dir) > 0:
         unet_dir = os.path.join(models_local_dir, "unet")
-        if os.path.exists(os.path.join(unet_dir, "config.json")) and os.path.exists(os.path.join(unet_dir, "diffusion_pytorch_model.bin")):
+        if all([os.path.exists(os.path.join(unet_dir, f)) for f in default_local_model_files_per_dir]):
             use_auth_token_unet=False
-            print("Using local unet model files!")
+            print(f"Using local unet model files! ({models_local_dir})")
             unet_model_id = unet_dir
             using_local_unet = True
+        else:
+            print(f"Using unet '{unet_model_id}' (no local data present at {unet_dir})")
         vae_dir = os.path.join(models_local_dir, "vae")
-        if os.path.exists(os.path.join(vae_dir, "config.json")) and os.path.exists(os.path.join(vae_dir, "diffusion_pytorch_model.bin")):
+        if all([os.path.exists(os.path.join(vae_dir, f)) for f in default_local_model_files_per_dir]):
             use_auth_token_vae=False
-            print("Using local vae model files!")
+            print(f"Using local vae model files! ({models_local_dir})")
             vae_model_id = vae_dir
             using_local_vae = True
+        else:
+            print(f"Using vae '{vae_model_id}' (no local data present at {vae_dir})")
+        text_encoder_dir = os.path.join(models_local_dir, "text_encoder")
+        if all([os.path.exists(os.path.join(text_encoder_dir, f)) for f in ["config.json", "pytorch_model.bin"]]):
+            print(f"Using local text encoder! ({models_local_dir})")
+            text_encoder_id = text_encoder_dir
+        else:
+            print(f"Using text encoder '{text_encoder_id}' (no local data present at {text_encoder_dir})")
+        tokenizer_dir = os.path.join(models_local_dir, "tokenizer")
+        if all([os.path.exists(os.path.join(tokenizer_dir, f)) for f in ["merges.txt","vocab.json"]]):
+            print(f"Using local tokenizer! ({models_local_dir})")
+            tokenizer_id = tokenizer_dir
+        else:
+            print(f"Using tokenizer '{tokenizer_id}' (no local data present at {tokenizer_dir})")
+
+        # crude check to find out if a v_prediction model is present. To be replaced by proper "model default config" at some point.
+        global V_PREDICTION_MODEL
+        scheduler_config_file_path = os.path.join(models_local_dir, "scheduler/scheduler_config.json")
+        if os.path.exists(scheduler_config_file_path):
+            with open(scheduler_config_file_path) as f:
+                V_PREDICTION_MODEL = '"v_prediction"' in f.read()
+        else:
+            V_PREDICTION_MODEL = False
 
     if not vae_only:
         # Load the UNet model for generating the latents.
@@ -232,22 +279,28 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     if vae_only:
         return vae
 
-    # Load the tokenizer and text encoder to tokenize and encode the text. 
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+    # Load the tokenizer and text encoder to tokenize and encode the text.
+    #tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    #text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+    tokenizer = CLIPTokenizer.from_pretrained(tokenizer_id)
+    text_encoder = CLIPTextModel.from_pretrained(text_encoder_id)
 
     if cpu_offloading:
         cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
-        cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        # does not work when incompatible custom embeddings are present in concepts folder.
+        #cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
 
     #rate_nsfw = get_safety_checker(cpu_offloading=cpu_offloading)
     rate_nsfw = get_safety_checker(cpu_offloading=False)
     concepts_path = Path(concepts_dir)
-    available_concepts = [f for f in concepts_path.rglob("*.bin")]
+    available_concepts = [f for f in concepts_path.rglob("*.bin")] + [f for f in concepts_path.rglob("*.pt")]
     if len(available_concepts) > 0:
         print(f"Adding {len(available_concepts)} Textual Inversion concepts found in {concepts_path}: ")
         for item in available_concepts:
-            load_learned_embed_in_clip(item, text_encoder, tokenizer)
+            try:
+                load_learned_embed_in_clip(item, text_encoder, tokenizer)
+            except Exception as e:
+                print(f"Loading concept from {item} failed: {e}")
         print("")
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
@@ -265,18 +318,45 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
 
     @torch.no_grad()
     def perform_text_encode(prompt):
+        # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
+        sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
+        # first, grab all substitutions and replace them by a temporary UUID. This avoids substring collisions between substitution values and subsequent (shorter) substitution keys.
+        for (p,subst,uuid) in sorted_substitutions:
+            prompt = prompt.replace(p, f"<{uuid}>")
+        # then, replace UUID placeholders with substitution values. Substring collisions should not be an issue.
+        for (p,subst,uuid) in sorted_substitutions:
+            prompt = prompt.replace(f"<{uuid}>", subst)
+
         io_data = {}
         # text embeddings
         text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt", return_overflowing_tokens=True)
         num_truncated_tokens = text_input.num_truncated_tokens
-        io_data["text_readback"] = tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)
+        io_data["text_readback"] = [t.strip() for t in tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)]
+        # SD2.0 openCLIP seems to pad with '!'. compact these down.
+        trailing_char_counts = []
+        for i, readback_string in enumerate(io_data["text_readback"]):
+            new_count = 0
+            for char in readback_string[::-1]: # reverse string -> move inwards from the back
+                if char == '!':
+                    new_count += 1
+                else:
+                    break
+            if new_count > 0: # [:-0] would be [:0], thus eliminating the entire string.
+                io_data["text_readback"][i] = readback_string[:-new_count]
+            trailing_char_counts.append(new_count)
         # if a batch element had items truncated, the remaining token count is the negative of the amount of truncated tokens
         # otherwise, count the amount of <|endoftext|> in the readback. Sidenote: this will report incorrectly if the prompt is below the token limit and happens to contain "<|endoftext|>" for some unthinkable reason.
         io_data["remaining_token_count"] = [(- item) if item>0 else (io_data["text_readback"][idx].count("<|endoftext|>") - 1) for (item,idx) in zip(num_truncated_tokens,range(len(num_truncated_tokens)))]
+        # If there is more space when looking at SD2.0 padding (trailing '!'), output it instead.
+        io_data["remaining_token_count"] = [max(remaining, trailing) for (remaining,trailing) in zip(io_data["remaining_token_count"], trailing_char_counts)]
         io_data["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in io_data["text_readback"]]
         io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist()
         # TODO: implement custom attention masks?
-        text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE))[0]
+        if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask:
+            attention_mask = text_input.attention_mask.to(IO_DEVICE)
+        else:
+            attention_mask = None
+        text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE), attention_mask=attention_mask)[0]
         if prompt == "<damaged_uncond>":
             uncond, _ = perform_text_encode("")
             for i in range(uncond.shape[1]):
@@ -317,7 +397,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             if len(prompt_segments) == 1:
                 # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
                 new_embedding_positive, new_io_data = perform_text_encode(raw_item)
-                new_embedding_negative, _ = perform_text_encode("")
+                new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT)
             else:
                 # print(f"Mixing {len(prompt_segments)//2} prompts with their respective weights")
                 # perpare invalid segments list to desired shape after splitting
@@ -381,7 +461,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                     # use mixed prompt tensor as prompt embedding
                     new_embedding_positive = new_text_embeddings
                     # use default, empty uncond embedding
-                    new_embedding_negative, _ = perform_text_encode("")
+                    new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT)
                 else:
                     if encodings_sum_positive is None:
                         # add an empty prompt for positive embeddings. Saving iodata of an empty placeholder is probably not necessary.
@@ -391,7 +471,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                         new_embedding_positive = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is None:
                         # create default, empty uncond embedding. Skip iodata. It would not normally be saved for the empty uncond embedding.
-                        replacement_encoding_negative, additional_io_data = perform_text_encode("")
+                        replacement_encoding_negative, additional_io_data = perform_text_encode(DEFAULT_NEGATIVE_PROMPT)
                         new_embedding_negative = replacement_encoding_negative
                     else:
                         new_embedding_negative = (encodings_sum_negative / multiplier_sum_negative)
@@ -419,6 +499,32 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         text_embeddings = text_embeddings.to(UNET_DEVICE)
 
         return text_embeddings, batch_size, io_data
+
+    def get_gs_mult(gs_schedule:str, progress_factor:float):
+        gs_mult = 1
+        if gs_schedule is None or gs_schedule == "":
+            pass
+        elif gs_schedule == "sin": # half-sine (between 0 and pi; 0 -> 1 -> 0)
+            gs_mult = np.sin(np.pi * progress_factor)
+        elif gs_schedule == "isin": # inverted half-sine (1 -> 0 -> 1)
+            gs_mult = 1.0 - np.sin(np.pi * progress_factor)
+        elif gs_schedule == "fsin": # full sine (0 -> 1 -> 0 -> -1 -> 0) for experimentation
+            gs_mult = np.sin(2*np.pi * progress_factor)
+        elif gs_schedule == "anneal5": # rectified 2.5x full sine (5 bumps)
+            gs_mult = np.abs(np.sin(2*np.pi * progress_factor*2.5))
+        elif gs_schedule == "cos": # quarter-cos (between 0 and pi/2; 1 -> 0)
+            gs_mult = np.cos(np.pi/2 * progress_factor)
+        elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
+            gs_mult = 1.0 - np.cos(np.pi/2 * progress_factor)
+        elif gs_schedule == "rand": # random multiplier in [0,1)
+            gs_mult = np.random.rand()
+        elif gs_schedule == "frand": # random multiplier, with negative values
+            gs_mult = np.random.rand()*2-1
+        else:
+            # Could add a warning here.
+            pass
+        return gs_mult
+            
 
     @torch.no_grad()
     def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True, encoder_level_negative_prompts=False):
@@ -488,19 +594,36 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             # stablediffusion default
             beta_start = 0.00085
             beta_end = 0.012
+        scheduler_params = {"beta_start":beta_start, "beta_end":beta_end, "beta_schedule":"scaled_linear", "num_train_timesteps":1000}
+        if V_PREDICTION_MODEL:
+            if not sched_name in V_PREDICTION_SCHEDULERS:
+                tqdm.write(f"WARNING: A v_prediction model is running, but the selected scheduler {sched_name} is not listed as v_prediction enabled. THIS WILL YIELD BAD RESULTS! Switch to one of {V_PREDICTION_SCHEDULERS}")
+            else:
+                scheduler_params["prediction_type"] = "v_prediction"
         if "lms" == sched_name:
-            scheduler = LMSDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+            scheduler = LMSDiscreteScheduler(**scheduler_params)
         elif "pndm" == sched_name:
             # "for some models like stable diffusion the prk steps can/should be skipped to produce better results."
-            scheduler = PNDMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000, skip_prk_steps=True) # <-- pipeline default
+            scheduler = PNDMScheduler(**scheduler_params, skip_prk_steps=True) # <-- pipeline default
         elif "ddim" == sched_name:
-            scheduler = DDIMScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+            scheduler = DDIMScheduler(**scheduler_params)
         elif "ipndm" == sched_name:
-            scheduler = IPNDMScheduler(num_train_timesteps=1000)
+            scheduler = IPNDMScheduler(**scheduler_params)
         elif "euler" == sched_name:
-            scheduler = EulerDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+            scheduler = EulerDiscreteScheduler(**scheduler_params)
         elif "euler_ancestral" == sched_name:
-            scheduler = EulerAncestralDiscreteScheduler(beta_start=beta_start, beta_end=beta_end, beta_schedule="scaled_linear", num_train_timesteps=1000)
+            scheduler = EulerAncestralDiscreteScheduler(**scheduler_params)
+        elif "mdpms" == sched_name:
+            scheduler = DPMSolverMultistepScheduler(**scheduler_params)
+        elif "sdpms" == sched_name:
+            scheduler = DPMSolverSinglestepScheduler(**scheduler_params)
+        elif "kdpm2" == sched_name:
+            scheduler = KDPM2DiscreteScheduler(**scheduler_params)
+        elif "kdpm2_ancestral" == sched_name:
+            scheduler = KDPM2AncestralDiscreteScheduler(**scheduler_params)
+        elif "heun" == sched_name:
+            scheduler = HeunDiscreteScheduler(**scheduler_params)
+
         else:
             raise ValueError(f"Requested unknown scheduler: {sched_name}")
         # set timesteps. Also offset, as pipeline does this
@@ -532,7 +655,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             init_timestep = int(steps * img_strength) + scheduler_offset
             init_timestep = min(init_timestep, steps)
             timesteps = scheduler.timesteps[-init_timestep]
-            timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=IO_DEVICE)
+            #timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=IO_DEVICE)
+            timesteps = torch.stack([timesteps] * batch_size).to(dtype=torch.long, device=IO_DEVICE)
             noise = torch.randn(init_latents.shape, generator=generator_unet, device=IO_DEVICE)
             init_latents = scheduler.add_noise(init_latents, noise, timesteps)
             if half_precision_latents:
@@ -562,25 +686,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             progress_factor = i/len(scheduler.timesteps[starting_timestep:])
-            if gs_schedule is None or gs_schedule == "":
-                gs_mult = 1
-            elif gs_schedule == "sin": # half-sine (between 0 and pi; 0 -> 1 -> 0)
-                gs_mult = np.sin(np.pi * progress_factor)
-            elif gs_schedule == "isin": # inverted half-sine (1 -> 0 -> 1)
-                gs_mult = 1.0 - np.sin(np.pi * progress_factor)
-            elif gs_schedule == "fsin": # full sine (0 -> 1 -> 0 -> -1 -> 0) for experimentation
-                gs_mult = np.sin(2*np.pi * progress_factor)
-            elif gs_schedule == "anneal5": # rectified 2.5x full sine (5 bumps)
-                gs_mult = np.abs(np.sin(2*np.pi * progress_factor*2.5))
-            elif gs_schedule == "cos": # quarter-cos (between 0 and pi/2; 1 -> 0)
-                gs_mult = np.cos(np.pi/2 * progress_factor)
-            elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
-                gs_mult = 1.0 - np.cos(np.pi/2 * progress_factor)
-            elif gs_schedule == "rand": # random multiplier in [0,1)
-                gs_mult = np.random.rand()
-            elif gs_schedule == "frand": # random multiplier, with negative values
-                gs_mult = np.random.rand()*2-1
-
+            gs_mult = get_gs_mult(gs_schedule, progress_factor)
             progress_bar.set_description(f"gs={gs*gs_mult:.3f}")
             noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
 
@@ -589,7 +695,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             del noise_pred_uncond, noise_pred_text
             # compute the previous noisy sample x_t -> x_t-1
             if isinstance(scheduler, LMSDiscreteScheduler):
-                latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
+                #latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
+                latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
             elif isinstance(scheduler, DDIMScheduler):
                 latents = scheduler.step(noise_pred, t, latents, eta=eta, generator=generator_eta)["prev_sample"]
             else:
@@ -619,7 +726,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
 
         def to_pil(image, should_rate_nsfw:bool=True):
             image = (image.sample / 2 + 0.5).clamp(0, 1)
-            image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+            #image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
             if should_rate_nsfw:
                 has_nsfw = rate_nsfw(image)
             else:
@@ -737,36 +845,76 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             return out, SUPPLEMENTARY
     return generate_segmented_wrapper
 
-# see: https://huggingface.co/sd-concepts-library | derived from the "Inference Colab" notebook
+# see: https://huggingface.co/sd-concepts-library | adapted from the "Inference Colab" notebook
 # load learned embeds (textual inversion) into an encoder and tokenizer
 @torch.no_grad()
 def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, target_device="cpu", token=None):
+    global PROMPT_SUBST
     loaded_learned_embeds = torch.load(learned_embeds_path, map_location=target_device)
-    # separate token and the embeds
-    trained_token = list(loaded_learned_embeds.keys())[0]
-    embeds = loaded_learned_embeds[trained_token]
+    if isinstance(loaded_learned_embeds, dict) and all([k in loaded_learned_embeds for k in ["string_to_param", "name"]]):
+        # .pt-style concepts
+        token = loaded_learned_embeds["name"]
+        param = loaded_learned_embeds["string_to_param"]
+        embeds = param[list(param.keys())[0]]
+    else:
+        # sd-concepts-library-style concepts
+        trained_token = list(loaded_learned_embeds.keys())[0]
+        token = token if token is not None else trained_token
+        embeds = loaded_learned_embeds[trained_token]
+
+    # convert [768] Tensor to [1,768]
+    if len(embeds.shape) == 1:
+        embeds = torch.stack([embeds])
     # cast to dtype of text_encoder
     dtype = text_encoder.get_input_embeddings().weight.dtype
     embeds.to(dtype)
-    # add the token in tokenizer
-    token = token if token is not None else trained_token
-    num_added_tokens = tokenizer.add_tokens(token)
-    if num_added_tokens == 0:
-        # simply attempt to add the token with a number suffix
-        for i in range(0, 64):
+    embeds.requires_grad = False
+
+    # store original token for substitution dict
+    original_token = token
+    # remove leading and trailing <> if present.
+    token = token[1 if token.startswith("<") else None:-1 if token.endswith(">") else None]
+    tokens = [f"<{token}>"] if embeds.shape[0] == 1 else [f"<{token}{i}>" for i in range(embeds.shape[0])]
+    token_subst_value = "".join(tokens)
+
+    # add the token(s) in tokenizer
+    for (token, embeds) in zip(tokens, embeds):
+        try:
+            num_added_tokens = tokenizer.add_tokens(token)
             if num_added_tokens == 0:
-                num_added_tokens = tokenizer.add_tokens(f"{token}{i}")
-            else:
-                break
-        if num_added_tokens == 0:
-            print(f"WARNING: The tokenizer already contains the token {token}. Skipping addition!")
+                # simply attempt to add the token with a number suffix
+                for i in range(0, 256):
+                    if num_added_tokens == 0:
+                        num_added_tokens = tokenizer.add_tokens(f"{token}{i}")
+                    else:
+                        break
+                if num_added_tokens == 0:
+                    print(f"WARNING: Unable to add token {token} to tokenizer. Too many instances? Skipping addition!")
+                    continue
+            # resize the token embeddings
+            text_encoder.resize_token_embeddings(len(tokenizer))
+            # get the id for the token and assign the embeds
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            text_encoder.get_input_embeddings().weight.data[token_id] = embeds
+            # print(f"{' ' if first_token_of_seq else ''}{token}", end="")
+        except RuntimeError as e:
+            print(f" (incompatible: {token})")
             return
-    # resize the token embeddings
-    text_encoder.resize_token_embeddings(len(tokenizer))
-    # get the id for the token and assign the embeds
-    token_id = tokenizer.convert_tokens_to_ids(token)
-    text_encoder.get_input_embeddings().weight.data[token_id] = embeds
-    print(f" {token}", end="")
+            #print_exc()
+
+    if not original_token in PROMPT_SUBST:
+        PROMPT_SUBST[original_token] = token_subst_value
+        print(f" {original_token}{'' if len(tokens)==1 else ' (<-'+str(len(tokens))+' tokens)'}", end="")
+        return
+    else:
+        for i in range(256):
+            alt_token = f"{original_token}{i}"
+            if not alt_token in PROMPT_SUBST:
+                PROMPT_SUBST[f"{original_token}{i}"] = token_subst_value
+                print(f" {original_token}{i}{'' if len(tokens)==0 else '('+str(len(tokens))+' tokens)'}", end="")
+                return
+        # if for loop failed to return
+        print(f"Failed to find index for substitution item for token {original_token}! Too many instances?")
 
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 @torch.no_grad()
@@ -1056,10 +1204,10 @@ class QuickGenerator():
             "sample_count":1,
             "width":512,
             "height":512,
-            "steps":50,
-            "guidance_scale":7.5,
+            "steps":35,
+            "guidance_scale":9,
             "seed":None,
-            "sched_name":"pndm",
+            "sched_name":"mdpms",
             "ddim_eta":0.0,
             "eta_seed":None,
             "strength":0.75,
@@ -1137,15 +1285,24 @@ class QuickGenerator():
         if not isinstance(attention_slicing, Placeholder) and not (attention_slicing==self.attention_slicing):
             # None disables slicing if parameter is False
             slice_size = None
-
             # 'True' / 0 -> use diffusers recommended 'automatic' value for "a good trade-off between speed and memory"
             # use bool instance check and bool value: otherwise (int)1==True -> True would be caught!
-            if (isinstance(attention_slicing, int) and attention_slicing <= 0) or (isinstance(attention_slicing, bool) and attention_slicing):
-                slice_size = self._unet.config.attention_head_dim//2
-            # int -> use as slice size
-            elif isinstance(attention_slicing, int):
-                slice_size = attention_slicing
-            # False / None / unknown type will disable slicing with default value of None.
+            use_recommended_slicing = (isinstance(attention_slicing, int) and attention_slicing <= 0) or (isinstance(attention_slicing, bool) and attention_slicing)
+
+            if isinstance(self._unet.config.attention_head_dim, int):
+                if use_recommended_slicing:
+                    slice_size = self._unet.config.attention_head_dim//2
+                # int -> use as slice size
+                elif isinstance(attention_slicing, int):
+                    slice_size = attention_slicing
+                # False / None / unknown type will disable slicing with default value of None.
+            elif isinstance(self._unet.config.attention_head_dim, list):
+                if attention_slicing == 1:
+                    # 1 is a valid setting.
+                    pass
+                # if any slicing is requested (not None, not False) with an attention list, pick the smallest size (diffusers pipeline implementation)
+                elif use_recommended_slicing or (attention_slicing is not None and not (isinstance(attention_slicing,bool) and not attention_slicing)):
+                    attention_slicing = min(self._unet.config.attention_head_dim)
 
             self.attention_slicing = attention_slicing
             self._unet.set_attention_slice(slice_size)
@@ -1245,7 +1402,7 @@ class QuickGenerator():
             return prompts[prompt_idx] if not prompt_idx+1 in range(len(prompts)) else f"{prompts[prompt_idx]};{iter_per_prompt-progress_in_idx};{prompts[prompt_idx+1]};{progress_in_idx};"
         correction_target = None
         # first frame is the initial image, if it exists.
-        frames = [init_image] if init_image is not None else []
+        frames = [] if init_image is None else [init_image.resize((self.width, self.height), resample=Image.Resampling.LANCZOS)]
         try:
             for i in tqdm(range(img_cycles), position=0, desc="Image cycle"):
                 # if correction should be applied, the correction target array is not present, and a source image to generate the array from is present, create it.

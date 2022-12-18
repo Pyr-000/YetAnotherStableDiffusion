@@ -39,7 +39,7 @@ RUN_ALL_IMAGES_INDIVIDUAL = False
 # if set to False, images are not checked for potential NSFW content. This disables flagging them as spoilers and speeds up generation slightly.
 FLAG_POTENTIAL_NSFW = True
 # -as flag of generate.py: None to disable. Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings
-ATTENTION_SLICING = 0
+ATTENTION_SLICING = 1
 # -co flag of generate.py: CPU offloading via accelerate. Should enable compatibility with minimal VRAM at the cost of speed.
 CPU_OFFLOAD = False
 
@@ -92,6 +92,11 @@ class prompt_task():
         # reset configuration to defaults
         generator.init_config()
         # load any config args stored in the configuration dict
+        # use default size (add an extra 256) of 768 for SD2 | Do not access through 'from generate import (...)', this would create a constant!
+        if (self.generator_config["width"], self.generator_config["height"]) == (512,512):
+            size_add = 0 if not generate.V_PREDICTION_MODEL else 256
+            self.generator_config["width"] += size_add
+            self.generator_config["height"] += size_add
         generator.configure(**self.generator_config)
         # run generator
         out,SUPPLEMENTARY,save_return_data = generator.one_generation(
@@ -184,6 +189,9 @@ def main():
                     del generator
                     generator = load_generator()
                     task.response = f"Re-loaded generator using model {model_target}. CPU offloading is {'enabled' if CPU_OFFLOAD else 'disabled'}"
+                elif task.type == "default_negative":
+                    generate.DEFAULT_NEGATIVE_PROMPT = task.command
+                    task.response = f"Default prompt is now '{generate.DEFAULT_NEGATIVE_PROMPT}'" if generate.DEFAULT_NEGATIVE_PROMPT != "" else f"Default prompt has been reset."
                 else:
                     task.response = f"Ignoring: {task.type} is not available."
                 completed_tasks.append(task)
@@ -241,15 +249,21 @@ async def switch_h(ctx):
 
 model_names = list(permittel_local_model_paths.keys()) + list(permitted_model_ids.keys())
 @bot.slash_command(name="reload", description="Reload the generator with new parameters")
-@discord.option("model",str,description="Model name (must be configured a permitted model name)",choices=[discord.OptionChoice(name=opt,value=opt) for opt in model_names],required=True)
+@discord.option("model",str,description="Model name (must be configured as permitted model name)",choices=[discord.OptionChoice(name=opt,value=opt) for opt in model_names],required=True)
 @discord.option("offload",bool,description="Enable CPU offloading, slowing down generation but allowing significantly larger generations",required=False,default=False)
-@discord.option("attention_slice",int,choices=[discord.OptionChoice(name=str(x), value=x) for x in [-1,0,1]],description="Set attention slicing: -1 -> None, 0 -> recommended, 1 -> max",required=False,default=0)
+@discord.option("attention_slice",int,choices=[discord.OptionChoice(name=str(x), value=x) for x in [-1,0,1]],description="Set attention slicing: -1 -> None, 0 -> recommended, 1 -> max",required=False,default=1)
 async def square(ctx, model:str, offload:bool, attention_slice:int):
     if not (model in permitted_model_ids or model in permittel_local_model_paths):
         await ctx.send_response(f"Requested model is not available: {model}",delete_after=60)
     else:
         await ctx.send_response(f"Acknowledged. Your task is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.")
         task_queue.append(command_task(ctx,type="reload",command={"model":model,"offload":offload,"attention_slice":attention_slice}))
+
+@bot.slash_command(name="default_negative", description="Set default negative prompt (used if none specified)")
+@discord.option("negative_prompt",str,description="Default negative prompt, used if none is specified. Leave empty to reset.",required=False, default="")
+async def square(ctx, negative_prompt:str):
+    await ctx.send_response(f"Acknowledged. Your task is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.")
+    task_queue.append(command_task(ctx,type="default_negative",command=negative_prompt))
 
 @bot.slash_command(name="square", description="generate a default, square image (512x512)")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
@@ -276,21 +290,21 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
 @discord.option("width",int,description="Width modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
 @discord.option("height",int,description="Height modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
-@discord.option("seed",int,description="Initial noise seed for reproducing/modifying outputs (default: -1 will select a random seed)",required=False,default=-1)
-@discord.option("gs",float,description="Guidance scale (increasing may increse adherence to prompt but decrease 'creativity'). Default: 7.5",required=False,default=7.5)
+@discord.option("seed",str,description="Initial noise seed for reproducing/modifying outputs (default: -1 will select a random seed)",required=False,default="-1")
+@discord.option("gs",float,description="Guidance scale (increasing may increse adherence to prompt but decrease 'creativity'). Default: 9",required=False,default=9)
 @discord.option("steps",int,description="Amount of sampling steps. More can help with detail, but increase computation time. Default: 50",required=False,default=50)
 @discord.option("strength",float,description="Strength of img2img. 0.0 -> unchanged, 1.0 -> remade entirely. Requires valid image attachment.",required=False,default=0.75)
 @discord.option("init_image",discord.Attachment,description="Initial image for performing image-to-image",required=False,default=None)
 @discord.option("amount",int,description="Amount of images to batch at once.",required=False,default=1)
-@discord.option("scheduler",str,description="Scheduler for the diffusion sampling loop.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_SCHEDULERS],required=False,default="pndm")
+@discord.option("scheduler",str,description="Scheduler for the diffusion sampling loop.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_SCHEDULERS],required=False,default="mdpms")
 @discord.option("gs_schedule",str,description="Variable guidance scale schedule. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
 @discord.option("eta",float,description="Higher 'eta' -> more random noise during sampling. Ignored unless scheduler=ddim",required=False,default=0.0)
-@discord.option("eta_seed",int,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default=-1)
-async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1, scheduler:str="pndm", gs_schedule:str=None, eta:float=0.0, eta_seed:int=-1):
+@discord.option("eta_seed",str,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default="-1")
+async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1, scheduler:str="mdpms", gs_schedule:str=None, eta:float=0.0, eta_seed:str="-1"):
     reply = run_advanced(**locals())
     await ctx.send_response(reply)
 
-def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:int=-1, gs:float=7.5, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1, scheduler:str="pndm", gs_schedule:str=None, eta:float=0.0, eta_seed:int=-1):
+def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1, scheduler:str="mdpms", gs_schedule:str=None, eta:float=0.0, eta_seed:str="-1"):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
     global task_queue
@@ -299,6 +313,14 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
     steps = steps if steps > 0 else 1
     steps = steps if steps <= 150 else 150
     amount = amount if amount <= 16 else 16
+    try:
+        seed = int(seed)
+    except:
+        seed = -1
+    try:
+        eta_seed = int(eta_seed)
+    except:
+        eta_seed = -1
     seed = seed if seed > 0 else None
     eta_seed = eta_seed if eta_seed > 0 else None
     w = 512 + (width*64)

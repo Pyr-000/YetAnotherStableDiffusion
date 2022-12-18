@@ -3,9 +3,14 @@ pyproject.toml
 # repo specific files
 outputs/
 bot_token.py
-config.json
-diffusion_pytorch_model.bin
+poetry.lock
+models/**/config.json
+models/**/diffusion_pytorch_model.bin
+models/**/pytorch_model.bin
+models/**/*.zip
+models/**/*.7z
 models/concepts/**/*.bin
+models/concepts/**/*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

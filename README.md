@@ -1,6 +1,7 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
 ## Recent changes to requirements
+- Updating `diffusers`, `transformers`, `huggingface-hub` and `accelerate` is recommended.
 - `diffusers` should be updated. `accelerate` can now be used to perform automatic CPU offloading.
 - Now requires `scikit-image` package to perform color correction during image cycling
 
@@ -20,17 +21,29 @@ Most pre-existing StableDiffusion-compatible environments will already have some
 #
 ## Install models
 Models can either be automatically installed by providing a huggingface token, or manually installed by downloading them from huggingface yourself.
+
+## A Note on StableDiffusion version 2.x+:
+Currently, only [Option B: manual model install](#option-b-manual-model-install) is supported for SD2.x models. StableDiffusion v2.1 can be acquired from https://huggingface.co/stabilityai/stable-diffusion-2-1.
+In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and `tokenizer` folders must also be added to the model directory, together with their respective files:
+- `models/*/scheduler/`: `scheduler_config.json`
+- `models/*/text_encoder/`: `config.json` and `pytorch_model.bin`
+- `models/*/tokenizer/`: `merges.txt`, `special_tokens_map.json`, `tokenizer_config.json` and `vocab.json`
+If `scheduler/scheduler_config.json` is not provided, the model will be presumed to not be a v_prediction model (this will cause issues with anything but the _base_ variant of SD2.x). If `text_encoder` and `tokenizer` do not provide the required files, the model will be loaded with `openai/clip-vit-large-patch14`, which is used in SD1.x-style models. This is incompatible with SD2.x.
+
 ## Option A: Automatic model install via huggingface:
-The automated installation process requires you to have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4.
+You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4. Manually logging in and accepting the license on the huggingface webpage is no longer required.
 
-If you have already logged into huggingface-cli on your machine, you can skip the model installation step. Models will be downloaded automatically.
+Model installation should occur automatically, even without being logged into huggingface hub.
 
-Otherwise, get a valid token with read access for your huggingface account, accessible at https://huggingface.co/settings/tokens. You can then:
+<!--If you have already logged into huggingface-cli on your machine, you can skip the model installation step. Models will be downloaded automatically.
+
+Otherwise, get a valid token with read access for your huggingface account, accessible at https://huggingface.co/settings/tokens. You can then:-->
+As manually accepting the license on the huggingface webpage should no longer be required, you should no longer need to log in. If your online model repository requires access credentials, you can provide them via the following:
 - Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
 - Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
 
 ## Option B: Manual model install:
-- Log in at https://huggingface.co/CompVis/stable-diffusion-v1-4/. If you have not done so already, you will need to read and accept the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) in order to access the models.
+- Navigate to https://huggingface.co/CompVis/stable-diffusion-v1-4/. Note the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) (logging in to accept the license should no longer be required).
 - Head to the `Files and versions` tab, and navigate to `stable-diffusion-v1-4/unet`
   - Download both `config.json` and `diffusion_pytorch_model.bin`
   - place both files in `models/stable-diffusion-v1-4/unet`
@@ -40,6 +53,7 @@ Otherwise, get a valid token with read access for your huggingface account, acce
 - It is recommended to keep the branch on the default: `main` instead of switching to `fp16`. The fp32 weights are larger (3.44GB instead of 1.72GB), but can be loaded for both full precision (fp32) and half precision (fp16) use. 
 - Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over directly.
   - If required, custom (monolithic) model checkpoints designated for the "standard StableDiffusion" implementation can be converted to separate models for use with diffusers using their provided conversion script: [diffusers/scripts/convert_original_stable_diffusion_to_diffusers.py](https://github.com/huggingface/diffusers/blob/main/scripts/convert_original_stable_diffusion_to_diffusers.py), available from the [huggingface diffusers repository](https://github.com/huggingface/diffusers).
+- Note: The VAE files can instead be replaced by an StabilityAIs improved `ft-EMA` / `ft-MSE` VAEs, which are available under [huggingface.co/stabilityai/sd-vae-ft-mse/tree/main](https://huggingface.co/stabilityai/sd-vae-ft-mse/tree/main)
 
 #
 # Usage & Features
@@ -51,7 +65,7 @@ Otherwise, get a valid token with read access for your huggingface account, acce
   - Optionally, a different output directory can be specified (`-od`, see: [Additional flags](#additional-flags)).
 - The NSFW check is enabled by default, but will only print a warning message and attach a metadata label, leaving the output images untouched. It can also be fully disabled via a commandline flag (see: [Additional Flags](#additional-flags))
 - Cycling through iterations of image-to-image comes with a mitigation for keeping the color scheme unchanged, preventing effects such as 'magenta shifting'. (`-icc`, see: [Image to image cycling](#image-to-image-cycling))
-- "Textual Inversion Concepts" from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically.
+- "Textual Inversion Concepts", custom prompt embeddings, from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically. `.pt`-style custom embeddings are also supported in the same way.
 - Prompts can be mixed using prompt weights: When prompts are separated by `;;`, their representation within the text encoder space will be averaged. Custom prompt weights can be set by putting a number between the `;;` trailing the prompt. If no value is specified, the default value of 1 will be used as the prompt weight. 
   - Example: `"Painting of a cat ;3; Photograph of a cat ;1;"` Will yield the text representation of `3/4 * "Painting of a cat" + 1/4 "Photograph of a cat"`
   - By default, all negative subprompts will be mixed accoring to their weight, and used in place of the unconditional embedding for classifier free guidance (standard "negative prompts"). In this case, the difference in weights between the positive and negative prompts is not considered, as this is given by the guidance scale (`-cs`).
@@ -73,7 +87,17 @@ python generate.py "a painting of a painter painting a painting"
 - `-S`/`--seed` will set the image seed. So long as the image size remains the same, keeping the seed should yield "the same image" under a similar prompt, or "a similar composition" under different prompts.
 - `-s`/`--steps` will set the amount of diffusion steps performed. Higher values can help increase detail, but will be more computationally expensive.
 - `-cs`/`--scale` sets the guidance scale. Increasing this value may make outputs more adherent to the prompt, while decreasing it may increase 'creativity'. The effect of different values will be different depending on the scheduler used.
-- `-sc`/`--scheduler` sets the sampling scheduler. Currently, the following schedulers are available: `"lms"`, `"pndm"`, `"ddim"`, `"euler"`, `"euler_ancestral"`
+- `-sc`/`--scheduler` sets the sampling scheduler, with `mdpms` being used by default. See [the huggingface diffusers list of implemented schedulers](https://huggingface.co/docs/diffusers/api/schedulers#implemented-schedulers) for more information. Currently, the following schedulers are available: <!--["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun"]-->
+  - `"lms"`: LMSDiscrete
+  - `"pndm"`: PNDM
+  - `"ddim"`: DDIM
+  - `"euler"`: EulerDiscrete
+  - `"euler_ancestral"`: EulerAncestralDiscrete
+  - `"mdpms"`: DPMSolverMultistep (dpmsolver++ algorithm, lower-order-final for \<15 timesteps)
+  - `"sdpms"`: DPMSolverSinglestep (dpmsolver++ algorithm, lower-order-final)
+  - `"kdpm2"`: KDPM2Discrete
+  - `"kdpm2_ancestral"`: KDPM2AncestralDiscrete
+  - `"heun"`: HeunDiscrete
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
 - `-gsc`/`--gs-schedule` sets a schedule for variable guidance scale. This can help with mitigating potential visual artifacts and other issues caused by high guidance scales. By default (None), a static guidance scale with no schedule will be used. The schedule will be scaled across the amount of diffusion steps (`-s`), yielding a multiplier between `0` and `1` for the guidance scale specified via `-cs`.
@@ -116,6 +140,7 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-in`/`--interpolate-latents` accepts two image paths for retrieving and interpolating latents from the images. This will only work for images of the same size which have had their latents stored in metadata (`generate.py` does this by default, as it will only increase image size by 50-100kB). While the interpolation occurs in the latent space (after which the VAE is applied to decode individual images), results will usually not differ from crossfading the images in image space directly. Results are saved like in `--animate`.
 - `-cfi`/`--cycle-fresh-image` when combined with image cycles (`-ic`), a new image will be created via text-to-image for each cycle. Can be used to interpolate between prompts purely in text-to-image mode (fixed seed recommended).
 - `-mn`/`--mix-negative-prompts` switches to mixing negative prompts directly into the prompt itself, instead of using them as uncond embeddings. See [Usage & Features](#usage--features)
+- `-dnp`/`--default-negative-prompt` can be used to specify a default negative prompt, which will be utilized whenever no negative prompts is given.
 
 
 # Precision
@@ -156,7 +181,7 @@ Visualization of the difference between outputs in this example (highlighting of
   - `PERMIT_RELOAD` can be set to `True` to allow users to switch the current model, toggle CPU offloading and set attention slicing via the `/reload` command.
     - If set to `True`, `permittel_local_model_paths` specifies a whitelist of local model names with their respective model paths (see: [Manual model install](#option-b-manual-model-install)), while `permitted_model_ids` specifies a whitelist of names with respective huggingface hub model ids (see: [Automatic model install](#option-a-automatic-model-install-via-huggingface))
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
-- The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it be utilized as the input for image-to-image.
+- The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it will be used as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.
 
 ## Installation
@@ -174,7 +199,7 @@ pip install py-cord
 - Set the bot token in the `tokens.py` file: `DISCORD_TOKEN = "your token here"`.
 - Start `discord_bot.py`. The bot should now be accessible to anyone with access to whichever channels the bot is present in.
 - The bot includes the following example commands (using discord slash commands):
-  - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution. Accepts an optional image attachment for performing image-to-image
+  - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution (overridden to 768x768 for SD2.x). Accepts an optional image attachment for performing image-to-image.
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
   - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <ddim_eta> <eta_seed>`
@@ -184,6 +209,7 @@ pip install py-cord
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
   - `/reload <model name> <enable cpu offload> <attention slicing>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
+  - `/default_negative <negative prompt>` can be used to set a default negative prompt (see: `-dnp`, [Additional flags](#additional-flags)). If <negative_prompt> is not specified, the default negative prompt will be reset.
 - All commands come with a short documentation of their available parameters.
 
 #
