@@ -22,7 +22,7 @@ Most pre-existing StableDiffusion-compatible environments will already have some
 ## Install models
 Models can either be automatically installed by providing a huggingface token, or manually installed by downloading them from huggingface yourself.
 
-## A Note on StableDiffusion version 2.x+:
+### A Note on StableDiffusion version 2.x+:
 Currently, only [Option B: manual model install](#option-b-manual-model-install) is supported for SD2.x models. StableDiffusion v2.1 can be acquired from https://huggingface.co/stabilityai/stable-diffusion-2-1.
 In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and `tokenizer` folders must also be added to the model directory, together with their respective files:
 - `models/*/scheduler/`: `scheduler_config.json`

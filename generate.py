@@ -321,11 +321,11 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
         sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
         # first, grab all substitutions and replace them by a temporary UUID. This avoids substring collisions between substitution values and subsequent (shorter) substitution keys.
-        for (p,subst,uuid) in sorted_substitutions:
-            prompt = prompt.replace(p, f"<{uuid}>")
+        for (p,subst,identifier) in sorted_substitutions:
+            prompt = prompt.replace(p, f"<{identifier}>")
         # then, replace UUID placeholders with substitution values. Substring collisions should not be an issue.
-        for (p,subst,uuid) in sorted_substitutions:
-            prompt = prompt.replace(f"<{uuid}>", subst)
+        for (p,subst,identifier) in sorted_substitutions:
+            prompt = prompt.replace(f"<{identifier}>", subst)
 
         io_data = {}
         # text embeddings
@@ -655,7 +655,6 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             init_timestep = int(steps * img_strength) + scheduler_offset
             init_timestep = min(init_timestep, steps)
             timesteps = scheduler.timesteps[-init_timestep]
-            #timesteps = torch.tensor([timesteps] * batch_size, dtype=torch.long, device=IO_DEVICE)
             timesteps = torch.stack([timesteps] * batch_size).to(dtype=torch.long, device=IO_DEVICE)
             noise = torch.randn(init_latents.shape, generator=generator_unet, device=IO_DEVICE)
             init_latents = scheduler.add_noise(init_latents, noise, timesteps)
@@ -676,9 +675,6 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             latent_model_input = torch.cat([latents] * 2)
             if hasattr(scheduler, "scale_model_input"):
                 latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-            #if isinstance(scheduler, LMSDiscreteScheduler):
-                #sigma = scheduler.sigmas[i]
-                #latent_model_input = latent_model_input / ((sigma**2 + 1) ** 0.5)
             # predict the noise residual
             with torch.no_grad():
                 cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
@@ -896,7 +892,6 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
             # get the id for the token and assign the embeds
             token_id = tokenizer.convert_tokens_to_ids(token)
             text_encoder.get_input_embeddings().weight.data[token_id] = embeds
-            # print(f"{' ' if first_token_of_seq else ''}{token}", end="")
         except RuntimeError as e:
             print(f" (incompatible: {token})")
             return
@@ -1307,21 +1302,6 @@ class QuickGenerator():
             self.attention_slicing = attention_slicing
             self._unet.set_attention_slice(slice_size)
 
-    """
-        if cpu_offloading==True and not self.cpu_offloading: # as this is currently an irreversible operation, the parameter type check can be skipped.
-            if not is_accelerate_available():
-                print("accelerate library is not installed! Unable to utilise CPU offloading!")
-            else:
-                print("Enabling CPU offloading on UNET and VAE models.")
-                from accelerate import cpu_offload
-                self.cpu_offload = True
-                # this only offloads parameters, but not buffers by default.
-                cpu_offload(self._unet, offload_buffers=True)
-                cpu_offload(self._vae, offload_buffers=True)
-                # TODO: potentially include safety checker, which is currently always on CPU.
-                print(self._unet.device)
-                print("CPU offloading enabled!")
-    """
 
     @torch.no_grad()
     def one_generation(self, prompt:str=None, init_image:Image=None, save_images:bool=True):
