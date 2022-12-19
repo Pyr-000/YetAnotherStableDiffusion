@@ -22,8 +22,9 @@ Most pre-existing StableDiffusion-compatible environments will already have some
 # Model Installation
 ## Local installation via git
 Git must be installed on your system. Equivalent to [Option B: Manual model install](#option-b-manual-model-install), but automated.
-Note the license terms ([CreativeML OpenRAIL++-M](https://huggingface.co/stabilityai/stable-diffusion-2/blob/main/LICENSE-MODEL))
-In the root directory of `yasd`, clone your model repository (this example will clone StableDiffusionv2.1):
+Note the license terms ([CreativeML OpenRAIL++-M](https://huggingface.co/stabilityai/stable-diffusion-2/blob/main/LICENSE-MODEL)).
+
+From the root directory of this repository, clone your model repository into `models/` (this example will clone StableDiffusion v2.1):
 ```shell
 git lfs clone https://huggingface.co/stabilityai/stable-diffusion-2-1 models/stable-diffusion-2-1 --progress -X "v2-1_768-ema-pruned.ckpt","v2-1_768-nonema-pruned.ckpt"
 ```
@@ -40,7 +41,9 @@ In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and
 - `models/*/scheduler/`: `scheduler_config.json`
 - `models/*/text_encoder/`: `config.json` and `pytorch_model.bin`
 - `models/*/tokenizer/`: `merges.txt`, `special_tokens_map.json`, `tokenizer_config.json` and `vocab.json`
-If `scheduler/scheduler_config.json` is not provided, the model will be presumed to not be a v_prediction model (this will cause issues with anything but the _base_ variant of SD2.x). If `text_encoder` and `tokenizer` do not provide the required files, the model will be loaded with `openai/clip-vit-large-patch14`, which is used in SD1.x-style models. This is incompatible with SD2.x.
+
+If `scheduler/scheduler_config.json` is not provided, the model will be presumed to not be a v_prediction model (this will cause issues with anything but the _base_ variant of SD2.x).
+If `text_encoder` and `tokenizer` do not provide the required files, the model will be loaded with `openai/clip-vit-large-patch14`, which is used in SD1.x-style models. This is incompatible with SD2.x.
 
 ### Option A: Automatic model install via huggingface:
 You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4. Manually logging in and accepting the license on the huggingface webpage is no longer required.
@@ -215,7 +218,7 @@ pip install py-cord
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
   - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <ddim_eta> <eta_seed>`
-    - `Width` and `height` are specified as multiples of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
+    - `Width` and `height` are specified either as pixels (for values >64), or as a multiplier of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
     - `scheduler` and `gs_schedule` display available options.
     - Unless a source image is attached, `img2img_strength` is ignored.

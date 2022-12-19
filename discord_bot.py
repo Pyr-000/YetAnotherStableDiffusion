@@ -288,8 +288,8 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 
 @bot.slash_command(name="advanced", description="generate an image with custom parameters")
 @discord.option("prompt",str,description="text prompt for generating. Multiple prompts can be specified in parallel, separated by two pipes ||",required=True)
-@discord.option("width",int,description="Width modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
-@discord.option("height",int,description="Height modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
+@discord.option("width",int,description="Width in pixels or modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
+@discord.option("height",int,description="Height in pixels or modifier offset in factor of 64 (0 -> 512 pixels, 2 -> 512+64*2, -2 -> 512-64*2)",required=False,default=0)
 @discord.option("seed",str,description="Initial noise seed for reproducing/modifying outputs (default: -1 will select a random seed)",required=False,default="-1")
 @discord.option("gs",float,description="Guidance scale (increasing may increse adherence to prompt but decrease 'creativity'). Default: 9",required=False,default=9)
 @discord.option("steps",int,description="Amount of sampling steps. More can help with detail, but increase computation time. Default: 50",required=False,default=50)
@@ -323,8 +323,9 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
         eta_seed = -1
     seed = seed if seed > 0 else None
     eta_seed = eta_seed if eta_seed > 0 else None
-    w = 512 + (width*64)
-    h = 512 + (height*64)
+    # if values above 64 are given, presume them to be pixel values
+    w = (512 + (width*64)) if width < 64 else width
+    h = (512 + (height*64)) if height < 64 else height
     w = w if w > 64 else 64
     h = h if h > 64 else 64
     scheduler = None if scheduler == "None" else scheduler
