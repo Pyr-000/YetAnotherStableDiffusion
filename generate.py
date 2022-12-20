@@ -285,11 +285,6 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     tokenizer = CLIPTokenizer.from_pretrained(tokenizer_id)
     text_encoder = CLIPTextModel.from_pretrained(text_encoder_id)
 
-    if cpu_offloading:
-        cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
-        # does not work when incompatible custom embeddings are present in concepts folder.
-        #cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
-
     #rate_nsfw = get_safety_checker(cpu_offloading=cpu_offloading)
     rate_nsfw = get_safety_checker(cpu_offloading=False)
     concepts_path = Path(concepts_dir)
@@ -302,6 +297,12 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
             except Exception as e:
                 print(f"Loading concept from {item} failed: {e}")
         print("")
+
+    # text encoder should be offloaded after adding custom embeddings to ensure that every embedding is actually on the same device.
+    if cpu_offloading:
+        cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
 def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False):
@@ -874,8 +875,15 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
     token_subst_value = "".join(tokens)
 
     # add the token(s) in tokenizer
-    for (token, embeds) in zip(tokens, embeds):
+    for (token, embed) in zip(tokens, embeds):
         try:
+            encoder_shape = text_encoder.get_input_embeddings().weight.data[0].shape
+            if not encoder_shape == embed.shape:
+                if encoder_shape[0] in [768, 1024] and embed.shape[0] in [768,1024]:
+                    sd1_clip = "SD_1.x" #"CLIP-ViT-L/14, SD_1.x"
+                    sd2_clip = "SD_2.x" #"OpenCLIP-ViT/H, SD_2.x"
+                    raise RuntimeError(f"Text encoder: {sd1_clip if encoder_shape[0] == 768 else sd2_clip}, embed: {sd1_clip if embed.shape[0] == 768 else sd2_clip}")
+                raise RuntimeError(f"Incompatible: embed shape {embed.shape} does not match text encoder shape {text_encoder.get_input_embeddings().weight.data[0].shape}")
             num_added_tokens = tokenizer.add_tokens(token)
             if num_added_tokens == 0:
                 # simply attempt to add the token with a number suffix
@@ -889,11 +897,11 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
                     continue
             # resize the token embeddings
             text_encoder.resize_token_embeddings(len(tokenizer))
-            # get the id for the token and assign the embeds
+            # get the id for the token and assign the embed
             token_id = tokenizer.convert_tokens_to_ids(token)
-            text_encoder.get_input_embeddings().weight.data[token_id] = embeds
+            text_encoder.get_input_embeddings().weight.data[token_id] = embed
         except RuntimeError as e:
-            print(f" (incompatible: {token})")
+            print(f" (incompatible: {token}) {e}")
             return
             #print_exc()
 
@@ -1317,6 +1325,7 @@ class QuickGenerator():
                 enhancer_sharpen = ImageEnhance.Sharpness(init_image)
                 init_image = enhancer_sharpen.enhance(1.15)
 
+        QuickGenerator.cleanup([self._IO_DEVICE,self._UNET_DEVICE])
         out, SUPPLEMENTARY = self.generate_exec(
             prompts,
             width=self.width,
