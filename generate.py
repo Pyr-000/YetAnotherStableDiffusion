@@ -51,6 +51,8 @@ OFFLOAD_EXEC_DEVICE = "cuda"
 IMAGE_CYCLE_DISPLAY_CV2 = True
 # global flag signifying if a v_prediction model is in use.
 V_PREDICTION_MODEL = False
+# will be read and overridden from the text encoder layer count on model load. Inclusive range limit. 12 for ViT-L/14 (SD1.x) or 23 for ViT-H (SD2.x)
+MAX_CLIP_SKIP = 12
 
 OUTPUT_DIR_BASE = "outputs"
 OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
@@ -97,6 +99,7 @@ def parse_args():
     parser.add_argument("--io-device", type=str, default="cpu", help="Device for running text encoding and VAE decoding. Keep on CPU for reduced VRAM load.", dest="io_device")
     parser.add_argument("--animate", action="store_true", help="save animation of generation process. Very slow unless --io_device is set to \"cuda\"", dest="animate")
     parser.add_argument("-in", "--interpolate", nargs=2, type=str, help="Two image paths for generating an interpolation animation", default=None, dest='interpolation_targets')
+    parser.add_argument("-inx", "--interpolate_extend", type=float, help="Interpolate beyond the specified images in the latent space by the given factor. Disabled with 0. Unlikely to provide useful results.", default=0, dest='interpolation_extend')
     parser.add_argument("--no-check-nsfw", action="store_true", help="NSFW check will only print a warning and add a metadata label if enabled. This flag disables NSFW check entirely to speed up generation.", dest="no_check")
     parser.add_argument("-pf", "--prompts-file", type=str, help="Path of file containing prompts. One line per prompt.", default=None, dest='prompts_file')
     parser.add_argument("-ic", "--image-cycles", type=int, help="Repetition count when using image2image. Will interpolate between multiple prompts when || is used.", default=0, dest='img_cycles')
@@ -117,6 +120,7 @@ def parse_args():
     parser.add_argument("-od","--output-dir", type=str, default=None, help="Set an override for the base output directory. The directory will be created if not already present.", dest="output_dir")
     parser.add_argument("-mn","--mix-negative-prompts", action="store_true", help="Mix negative prompts directly into the prompt itself, instead of using them as uncond embeddings.", dest="negative_prompt_mixing")
     parser.add_argument("-dnp","--default-negative-prompt", type=str, default="", help="Specify a default negative prompt to use when none are specified.", dest="default_negative")
+    parser.add_argument("-cls", "--clip-layer-skip", type=int, default=0, help="Skip last n layers of CLIP text encoder. Reduces processing/interpretation level of prompt. Recommended for some custom models", dest="clip_skip_layers")
     return parser.parse_args()
 
 def main():
@@ -165,11 +169,11 @@ def main():
         # swap places between UNET and VAE to speed up large batch decode.
         unet = unet.to(IO_DEVICE)
         vae = vae.to(DIFFUSION_DEVICE)
-        create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae)
+        create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae, args.interpolation_extend)
         exit()
 
     generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
-    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule, args.negative_prompt_mixing)
+    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule, args.negative_prompt_mixing, args.clip_skip_layers)
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
 
@@ -194,7 +198,7 @@ def main():
                 print_exc()
 
 def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False):
-    global using_local_unet, using_local_vae, PROMPT_SUBST
+    global using_local_unet, using_local_vae, PROMPT_SUBST, MAX_CLIP_SKIP
     # re-set substitution list (re-loading model would otherwise re-add custom embedding substitutions)
     PROMPT_SUBST = CUSTOM_PROMPT_SUBST
     if cpu_offloading:
@@ -285,6 +289,13 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     tokenizer = CLIPTokenizer.from_pretrained(tokenizer_id)
     text_encoder = CLIPTextModel.from_pretrained(text_encoder_id)
 
+    try:
+        MAX_CLIP_SKIP = len(text_encoder.text_model.encoder.layers)
+    except Exception:
+        print_exc()
+        print("Unable to infer encoder hidden layer count (CLIP skip limit) from the text encoder!")
+    print(f"Encoder hidden layer count (max CLIP skip): {MAX_CLIP_SKIP}")
+
     #rate_nsfw = get_safety_checker(cpu_offloading=cpu_offloading)
     rate_nsfw = get_safety_checker(cpu_offloading=False)
     concepts_path = Path(concepts_dir)
@@ -305,7 +316,13 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
 
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
-def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False):
+def generate_segmented(
+        tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer,
+        text_encoder:transfomers_models.clip.modeling_clip.CLIPTextModel,
+        unet:diffusers_models.unet_2d_condition.UNet2DConditionModel,
+        vae:diffusers_models.vae.AutoencoderKL,
+        IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False
+    ):
     if not vae.device == torch.device("meta"):
         vae.to(IO_DEVICE)
     if not text_encoder.device == torch.device("meta"):
@@ -318,7 +335,19 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
     #    half_precision_latents = True
 
     @torch.no_grad()
-    def perform_text_encode(prompt):
+    def perform_text_encode(prompt,clip_skip_layers=0):
+        io_data = {}
+
+        prompt = prompt.strip()
+        clip_skip_prompt_override = re.search('\{cls[0-9]+\}$', prompt) # match only '{cls<int>}' at the end of the prompt
+        if clip_skip_prompt_override is not None:
+            clip_skip_layers = min(int(clip_skip_prompt_override[0][4:-1]), MAX_CLIP_SKIP) # take match, drop leading '{cls' and trailing '}'. Clamp to possible value limit
+            # since this only matches on the end of the string, splitting multiple times on unfortunate prompts is not possible
+            prompt = re.split('\{cls[0-9]+\}$', prompt)[0]
+        io_data["clip_skip_layers"] = [clip_skip_layers]
+        # set rerun layers *after* checking for skip override. this allows producing of 'special tensors' with a trailing clip skip override
+        rerun_self_kwargs = {"clip_skip_layers":clip_skip_layers}
+
         # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
         sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
         # first, grab all substitutions and replace them by a temporary UUID. This avoids substring collisions between substitution values and subsequent (shorter) substitution keys.
@@ -328,7 +357,6 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         for (p,subst,identifier) in sorted_substitutions:
             prompt = prompt.replace(f"<{identifier}>", subst)
 
-        io_data = {}
         # text embeddings
         text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt", return_overflowing_tokens=True)
         num_truncated_tokens = text_input.num_truncated_tokens
@@ -357,9 +385,14 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             attention_mask = text_input.attention_mask.to(IO_DEVICE)
         else:
             attention_mask = None
-        text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE), attention_mask=attention_mask)[0]
+        if clip_skip_layers <= 0: # a value of 0 (index: [-1]) would yield the final layer output, equivalent to default behavior
+            text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE), attention_mask=attention_mask)[0]
+        else:
+            text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states[-(clip_skip_layers+1)]
+            text_embeddings = text_encoder.text_model.final_layer_norm(text_embeddings)
+
         if prompt == "<damaged_uncond>":
-            uncond, _ = perform_text_encode("")
+            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
             for i in range(uncond.shape[1]):
                 # create some tensor damage: mix half of the vector elements with a random element of the same vector.
                 idx = torch.randperm(uncond.shape[2])
@@ -368,28 +401,29 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                         uncond[:,i,j] = (uncond[:,i,j]*2 + uncond[:,i,idx[j]]) /3
             text_embeddings=uncond
         elif prompt == "<alpha_dropout_uncond>":
-            uncond, _ = perform_text_encode("")
+            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
             text_embeddings = torch.nn.functional.alpha_dropout(uncond, p=0.5)
         elif prompt == "<all_starts>":
-            uncond, _ = perform_text_encode("")
+            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
             for i in range(1,uncond.shape[1]):
                 uncond[:,i] = uncond[:,0]
             text_embeddings = uncond
         elif prompt == "<all_ends>":
-            uncond, _ = perform_text_encode("")
+            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
             for i in range(0,uncond.shape[1]-1):
                 uncond[:,i] = uncond[:,-1]
             text_embeddings = uncond
         elif prompt == "<all_start_end>":
-            uncond, _ = perform_text_encode("")
+            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
             for i in range(1,uncond.shape[1]-1):
                 uncond[:,i] = uncond[:,0] if i%2==0 else uncond[:,-1]
             text_embeddings = uncond
         return text_embeddings, io_data
 
     @torch.no_grad()
-    def encode_prompt(prompt, encoder_level_negative_prompts=False):
-        io_data = {"text_readback":[], "remaining_token_count":[], "attention":[]}
+    def encode_prompt(prompt, encoder_level_negative_prompts=False, clip_skip_layers=0):
+        perform_encode_kwargs = {"clip_skip_layers":clip_skip_layers}
+        io_data = {"text_readback":[], "remaining_token_count":[], "attention":[], "clip_skip_layers":[]}
         embeddings_list_uncond = []
         embeddings_list_prompt = []
         for raw_item in prompt:
@@ -397,8 +431,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*);", raw_item)
             if len(prompt_segments) == 1:
                 # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
-                new_embedding_positive, new_io_data = perform_text_encode(raw_item)
-                new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT)
+                new_embedding_positive, new_io_data = perform_text_encode(raw_item, **perform_encode_kwargs)
+                new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
             else:
                 # print(f"Mixing {len(prompt_segments)//2} prompts with their respective weights")
                 # perpare invalid segments list to desired shape after splitting
@@ -416,10 +450,10 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 encodings_sum_negative = None
                 multiplier_sum_positive = 0
                 multiplier_sum_negative = 0
-                new_io_data = {"text_readback":[], "remaining_token_count":[], "attention":[]}
+                new_io_data = {"text_readback":[], "remaining_token_count":[], "attention":[], "clip_skip_layers":[]}
                 for i, segment in enumerate(prompt_segments):
                     if i % 2 == 0:
-                        next_encoding, next_io_data = perform_text_encode(segment)
+                        next_encoding, next_io_data = perform_text_encode(segment, **perform_encode_kwargs)
                         for key in next_io_data:
                             # glue together the io_data sublist of all the prompts being mixed
                             new_io_data[key] += next_io_data[key]
@@ -451,7 +485,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                     # old mixing mode. leaves uncond embeddings untouched, mixes negative prompts directly into the prompt embedding itself.
                     if encodings_sum_positive is None:
                         tqdm.write("WARNING: only negative multipliers for prompt mixing are present. Using '' as a placeholder for positive prompts!")
-                        encodings_sum_positive, _ = perform_text_encode("")
+                        encodings_sum_positive, _ = perform_text_encode("", **perform_encode_kwargs)
                         multiplier_sum_positive = 1.0
                     new_text_embeddings = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is not None:
@@ -462,17 +496,17 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                     # use mixed prompt tensor as prompt embedding
                     new_embedding_positive = new_text_embeddings
                     # use default, empty uncond embedding
-                    new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT)
+                    new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
                 else:
                     if encodings_sum_positive is None:
                         # add an empty prompt for positive embeddings. Saving iodata of an empty placeholder is probably not necessary.
-                        replacement_encoding_positive, additional_io_data = perform_text_encode("")
+                        replacement_encoding_positive, additional_io_data = perform_text_encode("", **perform_encode_kwargs)
                         new_embedding_positive = replacement_encoding_positive
                     else:
                         new_embedding_positive = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is None:
                         # create default, empty uncond embedding. Skip iodata. It would not normally be saved for the empty uncond embedding.
-                        replacement_encoding_negative, additional_io_data = perform_text_encode(DEFAULT_NEGATIVE_PROMPT)
+                        replacement_encoding_negative, additional_io_data = perform_text_encode(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
                         new_embedding_negative = replacement_encoding_negative
                     else:
                         new_embedding_negative = (encodings_sum_negative / multiplier_sum_negative)
@@ -528,7 +562,11 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             
 
     @torch.no_grad()
-    def generate_segmented_exec(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False, animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True, encoder_level_negative_prompts=False):
+    def generate_segmented_exec(
+            prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False,
+            animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
+            encoder_level_negative_prompts=False, clip_skip_layers=0
+        ):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
             torch.cuda.empty_cache()
@@ -553,6 +591,8 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
                 "attention" : [],
                 "unet_model" : f"{models_local_dir} (local)" if using_local_unet else model_id,
                 "vae_model" : f"{models_local_dir} (local)" if using_local_vae else model_id,
+                "encoder_level_negative" : encoder_level_negative_prompts,
+                "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
             },
             "latent" : {
                 "final_latent" : None,
@@ -568,9 +608,9 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         SUPPLEMENTARY["io"]["height"] = height
         SUPPLEMENTARY["io"]["width"] = width
         # torch.manual_seed: Value must be within the inclusive range [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff], negative values remapped to positive
-        # 0xffff_ffff_ffff_ffff == 18446744073709551615
-        seed = seed if seed is not None else random.randint(1, 18446744073709551615)
-        eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709551615)
+        # 0xffff_ffff_ffff_ffff == 18446744073709551615 theoretical max. In the EXTREMELY unlikely event that something very close to the max value is picked in sequential mode, leave some headroom. (>50k in this case.)
+        seed = seed if seed is not None else random.randint(1, 18446744073709500000)
+        eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709500000)
         SUPPLEMENTARY["io"]["seed"] = seed
         SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
         generator_eta = torch.manual_seed(eta_seed)
@@ -582,7 +622,7 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         sched_name = sched_name.lower().strip()
         SUPPLEMENTARY["io"]["sched_name"]=sched_name
 
-        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts)
+        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers)
         for key in io_data:
             SUPPLEMENTARY["io"][key] = io_data[key]
 
@@ -793,8 +833,16 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
         return image_out
 
     @torch.no_grad()
-    def generate_segmented_wrapper(prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True, encoder_level_negative_prompts=False):
-        exec_args = {"width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,"animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff,"encoder_level_negative_prompts":encoder_level_negative_prompts}
+    def generate_segmented_wrapper(
+            prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None,
+            animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True,
+            encoder_level_negative_prompts=False, clip_skip_layers=0
+        ):
+        exec_args = {
+            "width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,
+            "animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff,
+            "encoder_level_negative_prompts":encoder_level_negative_prompts,"clip_skip_layers":clip_skip_layers,
+        }
         if not sequential:
             try:
                 return generate_segmented_exec(prompt=prompt, **exec_args)
@@ -817,6 +865,9 @@ def generate_segmented(tokenizer,text_encoder,unet,vae,IO_DEVICE="cpu",UNET_DEVI
             SUPPLEMENTARY = None
             try:
                 for prompt_item in tqdm(prompt, position=0, desc="Sequential Batch"):
+                    # have deterministic seeds in sequential mode: every index after the first will be assigned n+1 as a seed.
+                    exec_args["seed"] = exec_args["seed"] if len(seeds) == 0 else seeds[-1] + 1
+                    exec_args["eta_seed"] = exec_args["eta_seed"] if len(eta_seeds) == 0 else eta_seeds[-1] + 1
                     new_out, new_supplementary = generate_segmented_exec(prompt=prompt_item, **exec_args)
                     # reassemble list of outputs
                     out += new_out
@@ -1129,10 +1180,11 @@ def load_latents_from_image(path, index=0):
 # interpolate between two latents (if multiple images are contained in a latent, only the first one is used)
 # returns latent sequence, which can be passed into VAE to retrieve image sequence.
 @torch.no_grad()
-def interpolate_latents(latent_a, latent_b, steps=1):
-    # TODO: Add overextension: get diff between a,b, then keep applying diff beyond the range between a,b (follow linear function outside of endpoints)
-    a = latent_a[0]
-    b = latent_b[0]
+def interpolate_latents(latent_a, latent_b, steps=1, overextend=0):
+    _a = latent_a[0]
+    _b = latent_b[0]
+    a = _a + (_a-(_a+_b)/2)*overextend
+    b = _b + (_b-(_a+_b)/2)*overextend
     # split interval [0..1] among step count
     size_per_step = 1/steps
     # as range(n) will iterate every item from 0 to n-1, 'a' (starting tensor of interpolation) is included. Attach ending tensor 'b' to the end.
@@ -1162,13 +1214,13 @@ def save_animations(images_with_frames):
     print(f"Saved files with prefix {image_basepath}")
     return image_basepath
 
-def create_interpolation(a, b, steps, vae):
+def create_interpolation(a, b, steps, vae, overextend=0.5):
     al = load_latents_from_image(a)
     bl = load_latents_from_image(b)
     with torch.no_grad():
-        interpolated = interpolate_latents(al,bl,steps)
-    def to_pil(image):
-        image = (image.sample / 2 + 0.5).clamp(0, 1)
+        interpolated = interpolate_latents(al,bl,steps,overextend)
+    def to_pil(image:torch.Tensor):
+        image = (getattr(image, "sample", image) / 2 + 0.5).clamp(0, 1)
         image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
         images = (image * 255).round().astype("uint8")
         pil_images = [Image.fromarray(image) for image in images]
@@ -1176,7 +1228,7 @@ def create_interpolation(a, b, steps, vae):
     print("decoding...")
     with torch.no_grad():
         # processing images in target device one-by-one saves VRAM.
-        image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
+        image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
 
 class Placeholder():
@@ -1222,6 +1274,7 @@ class QuickGenerator():
             "animate_pred_diff":True,
             "gs_scheduler":None,
             "encoder_level_negative_prompts":False,
+            "clip_skip_layers":0,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -1253,10 +1306,11 @@ class QuickGenerator():
             animate_pred_diff:bool=placeholder,
             gs_scheduler:str=placeholder,
             encoder_level_negative_prompts:bool=placeholder,
+            clip_skip_layers:int=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
-        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts"]
+        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers"]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
                 setattr(self, option, settings[option])
@@ -1343,11 +1397,17 @@ class QuickGenerator():
             sequential=self.sequential_samples,
             gs_schedule=self.gs_scheduler,
             animate_pred_diff=self.animate_pred_diff,
-            encoder_level_negative_prompts=self.encoder_level_negative_prompts
+            encoder_level_negative_prompts=self.encoder_level_negative_prompts,
+            clip_skip_layers=self.clip_skip_layers,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
         PIL_animation_frames = argdict.pop("image_sequence")
+        # reduce prompt representation: only output one prompt instance for a larger batch of the same prompt
+        argdict["text_readback"] = collapse_representation(argdict.pop("text_readback"))
+        argdict["remaining_token_count"] = collapse_representation(argdict["remaining_token_count"])
+        argdict["attention"] = collapse_representation(argdict["attention"], keep_lowest_level=True, n=2)
+        argdict["clip_skip_layers"] = collapse_representation(argdict.pop("clip_skip_layers"))
         if argdict["width"] == 512:
             argdict.pop("width")
         if argdict["height"] == 512:
@@ -1362,6 +1422,10 @@ class QuickGenerator():
             argdict["model"] = argdict.pop("unet_model")
         if argdict["gs_sched"] is None:
             argdict.pop("gs_sched")
+        if argdict["encoder_level_negative"] is False:
+            argdict.pop("encoder_level_negative")
+        if argdict["clip_skip_layers"] == "0":
+            argdict.pop("clip_skip_layers")
         full_image, full_metadata, metadata_items = save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
         if self.animate:
             # init frames by image list
@@ -1384,22 +1448,46 @@ class QuickGenerator():
         # sequence prompts across all iterations
         prompts = [p.strip() for p in in_prompt.split("||")]
         iter_per_prompt = (img_cycles / (len(prompts)-1)) if text2img and (len(prompts) > 1) else img_cycles / len(prompts)
+
+        # set/modify prompt weights with a given factor
+        def process_prompt_weights(prompt,scale_mult):
+            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*);", prompt)
+            if prompt_segments[-1] == "":
+                # if last prompt in sequence is terminated by a weight, remove trailing empty segment created by splitting.
+                prompt_segments = prompt_segments[:-1]
+            if len(prompt_segments) % 2 == 1:
+                # if the final/only segment does not have a trailing factor, give it the factor 1
+                prompt_segments.append("1")
+            resulting_prompt = ""
+            for i, item in enumerate(prompt_segments):
+                # text-prompt segments are appended as-is. Trailing weight segments are appended inside ;; with the scale factor applied. For empty weights, use base weight of 1
+                resulting_prompt += item if i % 2 == 0 else f";{(1 if item=='' else int(item))*scale_mult};"
+            return resulting_prompt
+
         def index_prompt(i):
             prompt_idx = int(i/iter_per_prompt)
             progress_in_idx = i % iter_per_prompt
             # interpolate through the prompts in the text encoding space, using prompt mixing. Set weights from the frame count between the prompts
-            return prompts[prompt_idx] if not prompt_idx+1 in range(len(prompts)) else f"{prompts[prompt_idx]};{iter_per_prompt-progress_in_idx};{prompts[prompt_idx+1]};{progress_in_idx};"
+            if not prompt_idx+1 in range(len(prompts)):
+                return prompts[prompt_idx]
+            else:
+                # apply scale factors to both the previous and upcoming text prompts, then concatenate them. Both will already terminate with trailing weights.
+                return f"{process_prompt_weights(prompts[prompt_idx], iter_per_prompt-progress_in_idx)}{process_prompt_weights(prompts[prompt_idx+1], progress_in_idx)}"
+
         correction_target = None
         # first frame is the initial image, if it exists.
         frames = [] if init_image is None else [init_image.resize((self.width, self.height), resample=Image.Resampling.LANCZOS)]
         try:
-            for i in tqdm(range(img_cycles), position=0, desc="Image cycle"):
+            cycle_bar = tqdm(range(img_cycles), position=0, desc="Image cycle")
+            for i in cycle_bar:
                 # if correction should be applied, the correction target array is not present, and a source image to generate the array from is present, create it.
                 if color_correct and correction_target is None and (init_image is not None or color_target_image is not None):
                     correction_target = image_to_correction_target(color_target_image if color_target_image is not None else init_image)
                 # if text-to-image should be used, set input image for cycle to None
                 init_image = init_image if not text2img else None
-                out, SUPPLEMENTARY, _ = self.one_generation(index_prompt(i), init_image, save_images=save_individual)
+                next_prompt = index_prompt(i)
+                cycle_bar.set_description(next_prompt if len(next_prompt) <= 64 else f'{next_prompt[:28]} (...) {next_prompt[-28:]}')
+                out, SUPPLEMENTARY, _ = self.one_generation(next_prompt, init_image, save_images=save_individual)
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -1419,6 +1507,30 @@ class QuickGenerator():
         final_latent = SUPPLEMENTARY['latent']['final_latent']
         full_image, full_metadata, metadata_items = save_output(in_prompt, out, argdict, (not save_individual), final_latent, False)
         animation_files_basepath = save_animations([frames])
+
+
+# unpack object from potential (nested) single-element list(s)
+def unpack_encapsulated_lists(x):
+    while isinstance(x, list) and len(x) == 1:
+        x = x[0]
+    return x
+
+# create a string from a list, while removing duplicate string items in a row. Returns "[]" for empty lists. n>1 recursively re-applies the function.
+def collapse_representation(item_list, keep_lowest_level=False, n=1):
+    if n <= 0:
+        return str(item_list)
+    item_list = unpack_encapsulated_lists(item_list)
+    collapsed = []
+    if isinstance(item_list, list) and ((not keep_lowest_level) or (all([isinstance(x,list) for x in item_list]))):
+        for item in item_list:
+            # drop sequential repetitions: only append the next item if it differs from the last item to be added
+            if len(collapsed) == 0 or collapsed[-1] != item:
+                collapsed.append(item)
+    else:
+        return collapse_representation(item_list, keep_lowest_level, n-1)
+    # unpack a second time, turning a potential list of only a single item into the item itself
+    collapsed = unpack_encapsulated_lists(collapsed)
+    return collapse_representation(collapsed, keep_lowest_level, n-1)
 
 if __name__ == "__main__":
     main()

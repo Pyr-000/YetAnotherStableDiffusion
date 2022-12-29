@@ -42,18 +42,8 @@ FLAG_POTENTIAL_NSFW = True
 ATTENTION_SLICING = 1
 # -co flag of generate.py: CPU offloading via accelerate. Should enable compatibility with minimal VRAM at the cost of speed.
 CPU_OFFLOAD = False
-
-# create a string from a list, while removing duplicate string items in a row.
-def collapse_representation(item_list):
-    collapsed = []
-    for item in item_list:
-        if (not len(collapsed) > 0) or collapsed[-1] != str(item):
-            collapsed.append(str(item))
-    if len(collapsed) == 1:
-        return collapsed[0]
-    else:
-        # this also catches len(collapsed)==0, returning "[]"
-        return str(collapsed)
+# setting to skip last n CLIP (text encoder) layers. Recommended for some custom models.
+CLIP_SKIP_LAYERS = 0
 
 
 def flatten_sublist(input_item):
@@ -82,6 +72,7 @@ class prompt_task():
         self.generator_config = generator_config
         self.generator_config["sequential_samples"] = RUN_ALL_IMAGES_INDIVIDUAL
         self.generator_config["attention_slicing"] = ATTENTION_SLICING
+        self.generator_config["clip_skip_layers"] = CLIP_SKIP_LAYERS
         self.generator_config["display_with_cv2"] = False
 
         self.datas = None
@@ -138,8 +129,7 @@ class prompt_task():
         argdict["time"] = round(argdict["time"], 2)
         argdict.pop("attention", None)
 
-        text_readback = collapse_representation(argdict.pop("text_readback"))
-        argdict["remaining_token_count"] = collapse_representation(argdict["remaining_token_count"])
+        text_readback = argdict["text_readback"]
         self.response = f"{text_readback} ```{argdict}```"
 
 task_queue = []
@@ -153,6 +143,7 @@ def main():
     global precision_target_half
     global CPU_OFFLOAD
     global ATTENTION_SLICING
+    global CLIP_SKIP_LAYERS
     precision_target_half = DEFAULT_HALF_PRECISION
     generator = load_generator()
     print("loaded models!")
@@ -186,6 +177,7 @@ def main():
                         return
                     ATTENTION_SLICING = int(task.command["attention_slice"])
                     CPU_OFFLOAD = bool(task.command["offload"])
+                    CLIP_SKIP_LAYERS = int(task.command["clip_skip_layers"])
                     del generator
                     generator = load_generator()
                     task.response = f"Re-loaded generator using model {model_target}. CPU offloading is {'enabled' if CPU_OFFLOAD else 'disabled'}"
@@ -204,7 +196,12 @@ def main():
         except Exception as e:
             print_exc()
             if task is not None:
-                task.response = f"Something went horribly wrong: {e}"
+                if isinstance(e, RuntimeError) and 'out of memory' in str(e).lower():
+                    task.response = f"Out of memory for devices {UNET_DEVICE}(unet), {IO_DEVICE}(io)!"
+                    task.response += ' CPU offloading currently not enabled. Consider loading the model with CPU_OFFLOAD=True' if not CPU_OFFLOAD else ''
+                    task.response += ' Attention slicing is not set to the most memory efficient value. Consider loading the model with ATTENTION_SLICING=1' if ATTENTION_SLICING != 1 else ''
+                else:
+                    task.response = f"Something went horribly wrong: {e}"
                 completed_tasks.append(task)
 
 def load_generator():
@@ -252,12 +249,13 @@ model_names = list(permittel_local_model_paths.keys()) + list(permitted_model_id
 @discord.option("model",str,description="Model name (must be configured as permitted model name)",choices=[discord.OptionChoice(name=opt,value=opt) for opt in model_names],required=True)
 @discord.option("offload",bool,description="Enable CPU offloading, slowing down generation but allowing significantly larger generations",required=False,default=False)
 @discord.option("attention_slice",int,choices=[discord.OptionChoice(name=str(x), value=x) for x in [-1,0,1]],description="Set attention slicing: -1 -> None, 0 -> recommended, 1 -> max",required=False,default=1)
-async def square(ctx, model:str, offload:bool, attention_slice:int):
+@discord.option("clip_skip_layers",int,description="Skip last n layers of CLIP text encoder. Recommended for some custom models",required=False,default=0)
+async def square(ctx, model:str, offload:bool, attention_slice:int, clip_skip_layers:int):
     if not (model in permitted_model_ids or model in permittel_local_model_paths):
         await ctx.send_response(f"Requested model is not available: {model}",delete_after=60)
     else:
         await ctx.send_response(f"Acknowledged. Your task is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.")
-        task_queue.append(command_task(ctx,type="reload",command={"model":model,"offload":offload,"attention_slice":attention_slice}))
+        task_queue.append(command_task(ctx,type="reload",command={"model":model,"offload":offload,"attention_slice":attention_slice,"clip_skip_layers":clip_skip_layers,}))
 
 @bot.slash_command(name="default_negative", description="Set default negative prompt (used if none specified)")
 @discord.option("negative_prompt",str,description="Default negative prompt, used if none is specified. Leave empty to reset.",required=False, default="")

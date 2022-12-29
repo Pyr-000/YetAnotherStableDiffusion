@@ -85,6 +85,12 @@ As manually accepting the license on the huggingface webpage should no longer be
   - Example: `"Painting of a cat ;3; Photograph of a cat ;1;"` Will yield the text representation of `3/4 * "Painting of a cat" + 1/4 "Photograph of a cat"`
   - By default, all negative subprompts will be mixed accoring to their weight, and used in place of the unconditional embedding for classifier free guidance (standard "negative prompts"). In this case, the difference in weights between the positive and negative prompts is not considered, as this is given by the guidance scale (`-cs`).
   - Alternatively, prompts with negative weight values can be directly mixed into the prompt itself, leaving the unconditional embedding untouched (`-mn`, [Additional Flags](#additional-flags)). In this case, negative prompts are not directly 'subtracted'. Instead, the prompt is amplified in its difference from the negative prompts (moving away from the prompt, in the opposite direction of the negative prompt). Relative weight values between positive and negative prompts are considered. This way of applying negative prompts tends to be far more chaotic, but can yield interesting results. In this mode, a loose list of unwanted attributes as a negative prompt will usually perform worse than a description of the desired image together with negative attributes.
+- Prompts can be specified with an (individual) CLIP-skip setting by appending a trailing `{cls<n>}` for a setting of `n`. This will skip the last *n* layers of CLIP, the text encoder. Increasing this value will reduce the "amount of processing"/"depth of interpretation" performed by the text encoder. A value of `0` is equivalent to specifying no CLIP-skip setting.
+  - Example: `"Painting of a cat{cls2}"` will encode "Painting of a cat", while skipping the final two layers of the text encoder.
+  - When combined with prompt mixing or negative prompts (`;;`, see above), the prompt separator must be specified after the CLIP-skip setting. The skip setting is independent for each sub-prompt.
+    - Example: `"Painting of a cat{cls1};3; Photograph of a cat{cls2};1;"`
+    - As shown in the example, this can also be used to mix text prompts with themselves under different skip settings, or for interpolating between the same prompt under different skip settings (see: [Cycling](#image-to-image-cycling) and `-cfi` under [Additional Flags](#additional-flags))
+  - For some custom models, using a specific CLIP-skip setting by default is recommended. The default value used when none is specified can be set via `-cls` (see: [Additional Flags](#additional-flags)).
 
 # 
 ## text to image
@@ -138,6 +144,7 @@ When applying image-to-image multiple times sequentially (often with a lower str
 For faster generation cycles, it is recommended to pass the flags `--no-check-nsfw` (you will not receive warnings about potential NSFW content being detected, see: [Additional Flags](#additional-flags)) and `--io-device cuda` (VRAM usage will be increased, see: [Device settings](#device-settings))
 - `-ic`/`--image-cycles` sets the amount of image-to-image cycles that will be performed. An animation (and image grid) will be stored in the `/animated` folder in the output directory. While running, this mode will attempt to display the current image via cv2. This can be disabled by setting the global variable `IMAGE_CYCLE_DISPLAY_CV2=False` near the top of `generate.py`.
   - When multiple prompts are specified via `||` (see: [Multiple Prompts](#multiple-prompts)), an interpolation through the prompt sequence will be performed in the text encoder space.
+    - Unlike in earlier versions of this repository, this now works for interpolating between complex prompts which combine/mix multiple subprompts with their own internal prompt weights (see: `;;` in [Usage & Features](#usage--features))
 - `-cni`/`--cycle-no-save-individual` disables the saving of image-to-image cycle frames as individual images when specified.
 - `-iz`/`--image-zoom` sets the amount of zoom applied between image-to-image steps. The value specifies the amount of pixels cropped per side. Disabled with a value of `0` by default.
 - `-ir`/`--image-rotate` sets the amount of degrees of (counter-clockwise) rotation applied between image-to-image steps. Disabled with a value of `0` by default.
@@ -156,6 +163,7 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-cfi`/`--cycle-fresh-image` when combined with image cycles (`-ic`), a new image will be created via text-to-image for each cycle. Can be used to interpolate between prompts purely in text-to-image mode (fixed seed recommended).
 - `-mn`/`--mix-negative-prompts` switches to mixing negative prompts directly into the prompt itself, instead of using them as uncond embeddings. See [Usage & Features](#usage--features)
 - `-dnp`/`--default-negative-prompt` can be used to specify a default negative prompt, which will be utilized whenever no negative prompts is given.
+- `-cls`/`--clip-layer-skip` can be used to specify a default CLIP (text encoder) skip value if none is specified in the prompt. See [Usage & Features](#usage--features)
 
 
 # Precision
@@ -223,7 +231,7 @@ pip install py-cord
     - `scheduler` and `gs_schedule` display available options.
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
-  - `/reload <model name> <enable cpu offload> <attention slicing>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
+  - `/reload <model name> <enable cpu offload> <attention slicing> <default CLIP skip>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
   - `/default_negative <negative prompt>` can be used to set a default negative prompt (see: `-dnp`, [Additional flags](#additional-flags)). If <negative_prompt> is not specified, the default negative prompt will be reset.
 - All commands come with a short documentation of their available parameters.
 
