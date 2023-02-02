@@ -296,13 +296,21 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("amount",int,description="Amount of images to batch at once.",required=False,default=1)
 @discord.option("scheduler",str,description="Scheduler for the diffusion sampling loop.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_SCHEDULERS],required=False,default="mdpms")
 @discord.option("gs_schedule",str,description="Variable guidance scale schedule. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
+@discord.option("static_length",int,description="Static embedding length. Disables dynamic length mode. 77 to reproduce previous behavior",required=False,default=-1)
+@discord.option("mix_concatenate",bool,description="When mixing prompts, concatenate the embeddings instead of computing their weighted sum.",required=False,default=False)
 @discord.option("eta",float,description="Higher 'eta' -> more random noise during sampling. Ignored unless scheduler=ddim",required=False,default=0.0)
 @discord.option("eta_seed",str,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default="-1")
-async def advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1, scheduler:str="mdpms", gs_schedule:str=None, eta:float=0.0, eta_seed:str="-1"):
+async def advanced(
+    ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
+    scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
+):
     reply = run_advanced(**locals())
     await ctx.send_response(reply)
 
-def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1, scheduler:str="mdpms", gs_schedule:str=None, eta:float=0.0, eta_seed:str="-1"):
+def run_advanced(
+    ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
+    scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
+):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
     global task_queue
@@ -327,6 +335,7 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
     w = w if w > 64 else 64
     h = h if h > 64 else 64
     scheduler = None if scheduler == "None" else scheduler
+    static_length = None if static_length < 3 else static_length
 
     init_img, additional_text = get_init_image_from_attachment(init_image)
 
@@ -343,6 +352,8 @@ def run_advanced(ctx:discord.commands.context.ApplicationContext, prompt:str, wi
         "eta_seed":eta_seed,
         "strength":strength,
         "gs_scheduler":gs_schedule,
+        "static_length":static_length,
+        "mix_mode_concat":mix_concatenate,
     }
 
     task_queue.append(prompt_task(ctx, prompt=prompt, init_img=init_img, generator_config=generator_config))

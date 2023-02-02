@@ -22,7 +22,7 @@ import codecs
 import cv2
 import numpy as np
 from traceback import print_exc
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageColor
 from tqdm.auto import tqdm
 from time import time
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -32,6 +32,7 @@ from pathlib import Path
 import re
 from tokens import get_huggingface_token
 import uuid
+from dataclasses import dataclass
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -49,10 +50,22 @@ IO_DEVICE = "cpu"
 OFFLOAD_EXEC_DEVICE = "cuda"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
+# Window title for cv2 display
+CV2_TITLE="Output"
 # global flag signifying if a v_prediction model is in use.
 V_PREDICTION_MODEL = False
 # will be read and overridden from the text encoder layer count on model load. Inclusive range limit. 12 for ViT-L/14 (SD1.x) or 23 for ViT-H (SD2.x)
 MAX_CLIP_SKIP = 12
+# when mixing prompts via concatenation, this will drop embeddings with a weight of zero, instead of adding them as "empty" (zeroed) tensors. Makes a (slight) difference when interpolating prompts, especially for longer sequences.
+CONCAT_DROP_ZERO_WEIGHT_EMBEDDINGS = True
+# when interpolating prompts, skew ramp-up/ramp-down of prompts, so that both values cross over at the set point. Increasing from 0.5 should reduce lack of definition at the crossover point in concat mode (dynamic length), but will compress or reduce variety in-between prompts.
+# should be between 0 and 1, with values >=0.5 being recommended. 0.5 corresponds to no skew.
+PROMPT_INTERPOLATION_CROSSOVER_POINT = 0.5
+# pixels of separation between individual images in an image grid.
+GRID_IMAGE_SEPARATION = 1
+# background color of grid images. Accepts any color definition understood by 'PIL.ImageColor', including hex (#rrggbb) and common HTML color names ("darkslategray"). Will be visible both between images (separation) and in empty grid spots (e.g. 8 images on a 3x3 grid)
+GRID_IMAGE_BACKGROUND_COLOR = "#2A2B2E"
+assert ImageColor.getrgb(GRID_IMAGE_BACKGROUND_COLOR) # check requested color for validity before running the script.
 
 OUTPUT_DIR_BASE = "outputs"
 OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
@@ -108,7 +121,7 @@ def parse_args():
     parser.add_argument("-ir", "--image-rotate", type=int, help="Amount of rotation (counter-clockwise degrees) for each subsequent img2img cycle", default=0, dest='img_rotation')
     parser.add_argument("-it", "--image-translate", type=int, help="Amount of translation (x,y tuple in pixels) for each subsequent img2img cycle", default=None, nargs=2, dest='img_translation')
     parser.add_argument("-irc", "--image-rotation-center", type=int, help="Center of rotational axis when applying rotation (0,0 -> top left corner) Default is the image center", default=None, nargs=2, dest='img_center')
-    parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.2, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
+    parser.add_argument("-ics", "--image-cycle-sharpen", type=float, default=1.0, help="Sharpening factor applied when zooming and/or rotating. Reduces effect of constant image blurring due to resampling. Sharpens at >1.0, softens at <1.0", dest="cycle_sharpen")
     parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep lightness and colorization distribution the same as it was initially (LAB histogram cdf matching). Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
     parser.add_argument("-cfi", "--cycle-fresh-image", action="store_true", help="When cycling images (-ic), create a fresh image (use text-to-image) in each cycle. Useful for interpolating prompts (especially with fixed seed)", dest="cycle_fresh")
     parser.add_argument("-cb", "--cuda-benchmark", action="store_true", help="Perform CUDA benchmark. Should improve throughput when computing on CUDA, but may slightly increase VRAM usage.", dest="cuda_benchmark")
@@ -121,6 +134,10 @@ def parse_args():
     parser.add_argument("-mn","--mix-negative-prompts", action="store_true", help="Mix negative prompts directly into the prompt itself, instead of using them as uncond embeddings.", dest="negative_prompt_mixing")
     parser.add_argument("-dnp","--default-negative-prompt", type=str, default="", help="Specify a default negative prompt to use when none are specified.", dest="default_negative")
     parser.add_argument("-cls", "--clip-layer-skip", type=int, default=0, help="Skip last n layers of CLIP text encoder. Reduces processing/interpretation level of prompt. Recommended for some custom models", dest="clip_skip_layers")
+    parser.add_argument("-rnc", "--re-encode", type=str, default=None, help="Re-encode an image or folder using the VAE of the loaded model. Works using latents saved in PNG metadata", dest="re_encode")
+    parser.add_argument("-sel", "--static-embedding-length", type=int, default=None, help="Process prompts without dynamic length. A value of 77 should reproduce results of previous/other implementations. Switches from embedding concatenation to mixing.", dest="static_length")
+    parser.add_argument("-mc", "--mix_concat", action="store_true", help="When mixing prompts, perform a concatenation of their embeddings instead of calculating a weighted sum.", dest="mix_mode_concat")
+
     return parser.parse_args()
 
 def main():
@@ -172,13 +189,37 @@ def main():
         create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae, args.interpolation_extend)
         exit()
 
+    if args.re_encode is not None:
+        unet = unet.to(IO_DEVICE)
+        vae = vae.to(DIFFUSION_DEVICE)
+        enc_path = Path(args.re_encode)
+        if enc_path.is_file():
+            targets = [enc_path]
+        elif enc_path.is_dir():
+            targets = [f for f in enc_path.rglob("*.png")]
+        print(f"Accumulated {len(targets)} target files for re-encode!")
+        for item in tqdm(targets, desc="Re-encoding"):
+            try:
+                encoded = re_encode(item, vae)
+                meta = load_metadata_from_image(item)
+                meta["filename"] = str(item)
+                meta["re-encode"] = f"{models_local_dir} (local)" if using_local_vae else model_id
+                save_output(p=None, imgs=encoded, argdict=None, data_override=meta)
+            except:
+                print_exc()
+        exit()
+
     generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
-    generator.configure(args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength, args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule, args.negative_prompt_mixing, args.clip_skip_layers)
+    generator.configure(
+        args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength,
+        args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule,
+        args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
+    )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
 
     if args.img_cycles > 0:
-        generator.perform_image_cycling(args.prompt, args.img_cycles, args.image_cycle_save_individual, init_image, args.cycle_fresh, args.cycle_color_correction, None, args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen)
+        generator.perform_image_cycling(args.prompt, args.img_cycles, args.image_cycle_save_individual, True, init_image, args.cycle_fresh, args.cycle_color_correction, None, args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen)
         exit()
 
     if args.prompts_file is not None:
@@ -334,8 +375,125 @@ def generate_segmented(
     #if UNET_DEVICE == "meta" and unet.dtype == torch.float16:
     #    half_precision_latents = True
 
+    def try_int(s:str, default:int=None):
+        try:
+            return int(s)
+        except ValueError:
+            return default
+    def try_float(s:str, default:float=None):
+        try:
+            return float(s)
+        except ValueError:
+            return default
+
+    def process_prompt_segmentation(prompt, default_skip=0):
+        segment_weights = []
+        processed_segments = []
+        segment_skips = []
+        # the start token is not part of the segments - add a leading weight of 1 and a leading skip of <default> for it.
+        token_weights = [1]
+        token_skips = [default_skip]
+        # split out segments where custom weights are defined. Use non-greedy content matching to identify the segment: '.+?'
+        weighted_segments = re.split("\((.+?:-?[\.0-9;]+)\)", prompt)
+        for segment in weighted_segments:
+            segment = segment.strip()
+            # empty segments will exclusively show up with zero-length prompts, which produce one empty segment. Their handling can be ignored.
+            segment_weight = 1
+            segment_skip = default_skip
+            split_by_segment_weight = re.split(":(-?[\.0-9;]+)$",segment)
+            if len(split_by_segment_weight)>1:
+                # should result in _exactly_ three segments: prompt, weight capture group, trailing empty segment (caused by the '\)$' at the end of the regex expression
+                # multiple captures shall be impossible, as the regex requires the end of the string '$'
+                assert len(split_by_segment_weight) == 3
+                # take first item of regex split (the prompt). leading '(' will have been removed by the split, as it is outside the capture group.
+                segment = split_by_segment_weight[0].strip()
+                # take second item (captured prompt weight with potential skip) - leading ':' and trailing ')' shall have been excluded from the capture
+                weight_item = split_by_segment_weight[1].strip()
+                # split off a potential skip value
+                weight_item_split = weight_item.split(";")
+                if len(weight_item_split) > 2:
+                    tqdm.write(f"NOTE: malformed prompt segment value: {weight_item}")
+                segment_weight = try_float(weight_item_split[0],1)
+                segment_skip = default_skip if len(weight_item_split)<=1 else try_int(weight_item_split[1],default_skip)
+            processed_segments.append(segment)
+            segment_weights.append(segment_weight)
+            segment_skips.append(segment_skip)
+            segment_tokens = tokenizer(segment,padding=False,max_length=None,truncation=False,return_tensors="pt",return_overflowing_tokens=False).input_ids[0]
+            # tokenize segment without padding, remove leading <|startoftext|> and trailing <|endoftext|> to measure the segment token count. see note below about max_length=None
+            segment_token_count = len(segment_tokens)-2
+            token_weights += [segment_weight]*segment_token_count
+            token_skips += [segment_skip]*segment_token_count
+
+        # join segments back together, but keep a space between then (otherwise words would amalgamate at the join points)
+        prompt = " ".join(processed_segments)
+        return prompt, token_weights, token_skips
+
+    # build attention io_data in reduced form
+    def weight_summary_item_string(i, prev_seg_count, prev_weight, prev_skip, text_input):
+        segment_start_index = i - prev_seg_count
+        # from start_index to (inclusive) start_index+count-1 - ':start_index+count' as the second index of l[a:b] is exclusive
+        segment_text = tokenizer.batch_decode([text_input.input_ids[0][segment_start_index:segment_start_index+prev_seg_count]])[0].strip()
+        segment_text = segment_text if not len(segment_text) > 14 else segment_text[:5]+"..."+segment_text[-5:]
+        return f" ({prev_weight}{';'+str(prev_skip) if prev_skip>0 else ''}@{segment_text})"
+    def prompt_weight_summary_string(token_weights, token_skips, text_input):
+        summary = ""
+        if len(token_weights) > 2: # do not run processing on empty prompts.
+            prev_seg=(token_weights[1],token_skips[1])
+            prev_seg_count = 1
+            for i,seg in enumerate(zip(token_weights,token_skips)):
+                if i <= 1:
+                    # skip value of leading start token. Additionally, skip first weight, as it is initialized outside the loop. not excluded from the list to keep enum indices correct.
+                    continue
+                if prev_seg == seg:
+                    prev_seg_count += 1
+                else:
+                    # extract first token of attention value start - first index is <count> before the current index (which is no longer included), +1 as the weights start after startoftext
+                    summary+=(weight_summary_item_string(i, prev_seg_count, prev_seg[0], prev_seg[1], text_input))
+                    prev_seg = seg
+                    prev_seg_count = 1
+            # append final weight and count, which would occur from the subsequent weight i+1
+            summary+=(weight_summary_item_string(i+1, prev_seg_count, prev_seg[0], prev_seg[1], text_input))
+        else:
+            summary = ""
+        return summary.strip()
+
+    def encode_embedding_vectors(text_chunks, attention_mask, token_skips, default_clip_skip):
+        if all([skip <= 0 for skip in token_skips]): # a value of 0 (index: [-1]) would yield the final layer output, equivalent to default behavior
+            # unpack state, batch dim from every encode
+            processed_chunks = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask)[0][0] for text_chunk in text_chunks]
+            token_counts = [len(c) for c in processed_chunks]
+            # re-attach chunks
+            embedding_vectors = torch.cat(processed_chunks)
+            return embedding_vectors, token_counts
+        else:
+            # [text_encoder.text_model.final_layer_norm(text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states[-(clip_skip_layers+1)]) for text_chunk in text_chunks]
+            # encode every chunk, retrieve all hidden layers
+            text_chunks_hidden_states = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states for text_chunk in text_chunks]
+            # embeddings must be available for any token skip level requested, as well as for the default skip level (applied on start/end/padding tokens)
+            embedding_vectors = {
+                required_skip_level : torch.cat([text_encoder.text_model.final_layer_norm(chunk_hidden_states[-(required_skip_level+1)])[0] for chunk_hidden_states in text_chunks_hidden_states])
+                for required_skip_level in set(token_skips+[default_clip_skip])
+            }
+            # use the default skip level to extract per-chunk token counts
+            processed_chunks_of_default_skip = [text_encoder.text_model.final_layer_norm(chunk_hidden_states[-(default_clip_skip+1)])[0] for chunk_hidden_states in text_chunks_hidden_states]
+            token_counts = [len(c) for c in processed_chunks_of_default_skip]
+            # re-build resulting embedding vectors by interleaving the embedding vectors for different skip levels according to token_skips_after_start
+            new_embedding_vectors = []
+            # iterate over the vector count of the embedding (equal length for every decoded skip level)
+            for i in range(len(embedding_vectors[default_clip_skip])):
+                # retrieve the skip value of state i, use the default value if reading states of trailing end/padding tokens without a specified value.
+                skip_level = default_clip_skip if not i in range(len(token_skips)) else token_skips[i]
+                # select the embedding of the requested skip level, pick the vector at the index of the current iteration
+                new_embedding_vectors.append(embedding_vectors[skip_level][i])
+            embedding_vectors = torch.stack(new_embedding_vectors)
+            return embedding_vectors, token_counts
+
+    def apply_embedding_vector_weights(embedding_vectors, token_weights):
+        # Ignore (ending and padding) vectors outside of the stored range of token weights. Their weight will be 1.
+        return torch.stack([emb_vector if not i in range(len(token_weights)) else emb_vector*token_weights[i] for i,emb_vector in enumerate(embedding_vectors)])
+
     @torch.no_grad()
-    def perform_text_encode(prompt,clip_skip_layers=0):
+    def perform_text_encode(prompt,clip_skip_layers=0,pad_to_length=None,prefer_default_length=False):
         io_data = {}
 
         prompt = prompt.strip()
@@ -346,7 +504,7 @@ def generate_segmented(
             prompt = re.split('\{cls[0-9]+\}$', prompt)[0]
         io_data["clip_skip_layers"] = [clip_skip_layers]
         # set rerun layers *after* checking for skip override. this allows producing of 'special tensors' with a trailing clip skip override
-        rerun_self_kwargs = {"clip_skip_layers":clip_skip_layers}
+        rerun_self_kwargs = {"clip_skip_layers":clip_skip_layers,"pad_to_length":pad_to_length,"prefer_default_length":prefer_default_length}
 
         # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
         sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
@@ -358,8 +516,20 @@ def generate_segmented(
             prompt = prompt.replace(f"<{identifier}>", subst)
 
         # text embeddings
-        text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt", return_overflowing_tokens=True)
-        num_truncated_tokens = text_input.num_truncated_tokens
+        prompt, token_weights, token_skips = process_prompt_segmentation(prompt,clip_skip_layers)
+
+        text_input = tokenizer(
+            prompt,
+            padding="max_length" if pad_to_length is not None else False,
+            max_length=pad_to_length, # NOTE: None may be treated as "auto-select length limit of model" according to docs - however, no limit seems to be set with both L/14 (SD1.x) and OpenClip (SD2.x)
+            truncation=(pad_to_length is not None),
+            return_tensors="pt",
+            return_overflowing_tokens=(pad_to_length is not None),
+        )
+        # if the prompt is shorter than the standard token limit without a specified padding setting, but default-size embeddings are preferred, rerun with default pad length.
+        if len(text_input.input_ids[0]) <= tokenizer.model_max_length and pad_to_length is None and prefer_default_length:
+            return perform_text_encode(prompt,pad_to_length=tokenizer.model_max_length,prefer_default_length=False,**{k:v for k,v in rerun_self_kwargs.items() if not k in ["pad_to_length","prefer_default_length"]})
+        num_truncated_tokens = getattr(text_input,"num_truncated_tokens",[0])
         io_data["text_readback"] = [t.strip() for t in tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)]
         # SD2.0 openCLIP seems to pad with '!'. compact these down.
         trailing_char_counts = []
@@ -375,60 +545,120 @@ def generate_segmented(
             trailing_char_counts.append(new_count)
         # if a batch element had items truncated, the remaining token count is the negative of the amount of truncated tokens
         # otherwise, count the amount of <|endoftext|> in the readback. Sidenote: this will report incorrectly if the prompt is below the token limit and happens to contain "<|endoftext|>" for some unthinkable reason.
-        io_data["remaining_token_count"] = [(- item) if item>0 else (io_data["text_readback"][idx].count("<|endoftext|>") - 1) for (item,idx) in zip(num_truncated_tokens,range(len(num_truncated_tokens)))]
+        io_data["remaining_token_count"] = [(- item) if item>0 else (io_data["text_readback"][idx].count("<|endoftext|>") - 1) if item!=0 and pad_to_length is not None else float('inf') for idx,item in enumerate(num_truncated_tokens)]
         # If there is more space when looking at SD2.0 padding (trailing '!'), output it instead.
         io_data["remaining_token_count"] = [max(remaining, trailing) for (remaining,trailing) in zip(io_data["remaining_token_count"], trailing_char_counts)]
         io_data["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in io_data["text_readback"]]
-        io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist()
-        # TODO: implement custom attention masks?
+        #io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist() # unused, as the text encoders of both SD1.x and SD2.x lack a "use_attention_mask" attribute denoting manual attention maps.
+        io_data["weights"] = [prompt_weight_summary_string(token_weights, token_skips, text_input)]
+
+        chunk_count = (len(text_input.input_ids[0]) // tokenizer.model_max_length) + (1 if (len(text_input.input_ids[0])%tokenizer.model_max_length) > 0 else 0)
+        text_chunks = torch.chunk(text_input.input_ids[0], chunk_count)
+        # reassemble chunk items into batches of size 1
+        text_chunks = [torch.stack([chunk]) for chunk in text_chunks]
+
         if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask:
             attention_mask = text_input.attention_mask.to(IO_DEVICE)
         else:
             attention_mask = None
-        if clip_skip_layers <= 0: # a value of 0 (index: [-1]) would yield the final layer output, equivalent to default behavior
-            text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE), attention_mask=attention_mask)[0]
-        else:
-            text_embeddings = text_encoder(text_input.input_ids.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states[-(clip_skip_layers+1)]
-            text_embeddings = text_encoder.text_model.final_layer_norm(text_embeddings)
 
+        embedding_vectors, io_data["tokens"] = encode_embedding_vectors(text_chunks, attention_mask, token_skips, clip_skip_layers)
+
+        embedding_vectors = apply_embedding_vector_weights(embedding_vectors, token_weights)
+        # repack batch dimension around the embedding vectors
+        text_embeddings = torch.stack([embedding_vectors])
+
+        special_embeddings = get_special_embeddings(prompt, rerun_self_kwargs)
+        if special_embeddings is not None:
+            text_embeddings = special_embeddings
+
+        return text_embeddings, io_data
+
+    def get_special_embeddings(prompt, run_encode_kwargs):
         if prompt == "<damaged_uncond>":
-            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
             for i in range(uncond.shape[1]):
                 # create some tensor damage: mix half of the vector elements with a random element of the same vector.
                 idx = torch.randperm(uncond.shape[2])
                 for j in range(uncond.shape[2]):
                     if torch.rand(1) > 0.5:
                         uncond[:,i,j] = (uncond[:,i,j]*2 + uncond[:,i,idx[j]]) /3
-            text_embeddings=uncond
+            return uncond
         elif prompt == "<alpha_dropout_uncond>":
-            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
-            text_embeddings = torch.nn.functional.alpha_dropout(uncond, p=0.5)
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
+            return torch.nn.functional.alpha_dropout(uncond, p=0.5)
         elif prompt == "<all_starts>":
-            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
             for i in range(1,uncond.shape[1]):
                 uncond[:,i] = uncond[:,0]
-            text_embeddings = uncond
+            return uncond
         elif prompt == "<all_ends>":
-            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
             for i in range(0,uncond.shape[1]-1):
                 uncond[:,i] = uncond[:,-1]
-            text_embeddings = uncond
+            return uncond
         elif prompt == "<all_start_end>":
-            uncond, _ = perform_text_encode("", **rerun_self_kwargs)
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
             for i in range(1,uncond.shape[1]-1):
                 uncond[:,i] = uncond[:,0] if i%2==0 else uncond[:,-1]
-            text_embeddings = uncond
-        return text_embeddings, io_data
+            return uncond
+        return None
+
+    def apply_pad_tensor_to_embedding(in_tensor:torch.Tensor, pad_source:torch.Tensor, encapsulated=True):
+        if encapsulated:
+            # unpack and re-pack batch dimension of prompt
+            return torch.stack([apply_pad_tensor_to_embedding(in_tensor[0],pad_source[0],False)])
+
+        if in_tensor.shape[0] == pad_source.shape[0]:
+            return in_tensor
+        elif in_tensor.shape[0] > pad_source.shape[0]:
+            tqdm.write(f"WARNING: Embed chunk too large when applying padding! Padding {in_tensor.shape} with {pad_source.shape} requested!")
+            return in_tensor[:][:len(pad_source)]
+        else:
+            # fill as many vectors with data from the input tensor as possible. If the index is out of range for the input tensor, fill with the pad tensor. Rebuild batch dim.
+            return torch.stack([in_tensor[i] if i in range(len(in_tensor)) else pad_vector for i, pad_vector in enumerate(pad_source)])
+
+    def equalize_embedding_lengths(a:torch.Tensor, b:torch.Tensor):
+        # if the embeddings are not of equal length, zero-pad the shorter of the two embeddings to make the shapes equal.
+        if a is None and b is None:
+            raise ValueError("Unable to equalize embedding lengths as both embeddings are None")
+        a = a if a is not None else torch.zeros_like(b)
+        b = b if b is not None else torch.zeros_like(a)
+        a = a if not (b.shape[1] > a.shape[1]) else apply_pad_tensor_to_embedding(a,torch.zeros_like(b))
+        b = b if not (a.shape[1] > b.shape[1]) else apply_pad_tensor_to_embedding(b,torch.zeros_like(a))
+        return a,b
+
+    def add_encoding_sum(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_from_prev:bool, concat_direct_to_next:bool):
+        next_encoding *= next_multiplier
+        # if the length of the current sum does not match the length of the next encoding, pad the shorter tensor.
+        current_sum, next_encoding = equalize_embedding_lengths(current_sum, next_encoding)
+        return (next_encoding if current_sum is None else current_sum + next_encoding), current_multiplier+next_multiplier
+
+    def add_encoding_cat(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_from_prev:bool, concat_direct_to_next:bool):
+        next_encoding *= next_multiplier
+        # Remove startoftext vector if previous item was a direct concat. Remove endoftext if this item is a direct concat
+        next_encoding = next_encoding if not concat_direct_from_prev else next_encoding[:,1:]
+        next_encoding = next_encoding if not concat_direct_to_next else next_encoding[:,:-1]
+        # concat in dim 1 - skip batch dim. Return multiplier as 1 - no division by a scale sum should be performed in concat mode.
+        return (next_encoding if current_sum is None else torch.cat([current_sum,next_encoding],dim=1)), 1
 
     @torch.no_grad()
-    def encode_prompt(prompt, encoder_level_negative_prompts=False, clip_skip_layers=0):
-        perform_encode_kwargs = {"clip_skip_layers":clip_skip_layers}
-        io_data = {"text_readback":[], "remaining_token_count":[], "attention":[], "clip_skip_layers":[]}
+    def encode_prompt(prompt, encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False, extended_length_enforce_minimum=False, drop_zero_weight_encodings=CONCAT_DROP_ZERO_WEIGHT_EMBEDDINGS):
+        # invalid (too small) lengths -> use model default
+        static_length = tokenizer.model_max_length if (static_length is not None) and (static_length <= 2) else static_length
+        perform_encode_kwargs = {
+            "clip_skip_layers":clip_skip_layers,
+            "pad_to_length":static_length,
+            #"prefer_default_length":not dynamic_length_mode,
+        }
+        def io_data_template():
+            return {"text_readback":[], "remaining_token_count":[], "weights":[], "clip_skip_layers":[], "tokens":[]}
+        io_data = io_data_template()
         embeddings_list_uncond = []
         embeddings_list_prompt = []
         for raw_item in prompt:
             # create sequence of substrings followed by weight multipliers: substr,w,substr,w,... (w may be empty string - use default: 1, last trailing substr may be empty string)
-            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*);", raw_item)
+            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*\+?);", raw_item)
             if len(prompt_segments) == 1:
                 # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
                 new_embedding_positive, new_io_data = perform_text_encode(raw_item, **perform_encode_kwargs)
@@ -450,7 +680,8 @@ def generate_segmented(
                 encodings_sum_negative = None
                 multiplier_sum_positive = 0
                 multiplier_sum_negative = 0
-                new_io_data = {"text_readback":[], "remaining_token_count":[], "attention":[], "clip_skip_layers":[]}
+                new_io_data = io_data_template()
+                concat_direct_from_prev = False
                 for i, segment in enumerate(prompt_segments):
                     if i % 2 == 0:
                         next_encoding, next_io_data = perform_text_encode(segment, **perform_encode_kwargs)
@@ -459,30 +690,29 @@ def generate_segmented(
                             new_io_data[key] += next_io_data[key]
                     else:
                         # get multiplier. 1 if no multiplier is present.
+                        concat_direct_to_next = segment.endswith('+')
+                        segment = segment[:-1] if concat_direct_to_next else segment # remove trailing '+' if present.
                         multiplier = 1 if segment == "" else float(segment)
-                        new_io_data["text_readback"].append(f";{multiplier};")
+                        new_io_data["text_readback"][-1] += f";{multiplier}{'+' if concat_direct_to_next else ''};"
                         # add either to positive, or to negative encodings & multipliers
                         is_negative_multiplier = multiplier < 0
-                        if is_negative_multiplier:
+                        # in dynamic length mode, concatenate prompts together instead of mixing. Otherwise, add new encodings to respective sum based on their multiplier.
+                        add_encoding = add_encoding_cat if mix_mode_concat else add_encoding_sum
+                        if drop_zero_weight_encodings and multiplier == 0:
+                            pass
+                        elif is_negative_multiplier:
                             multiplier = abs(multiplier)
-                            multiplier_sum_negative += multiplier
-                            if encodings_sum_negative is None:
-                                # if sum is empty, write first item.
-                                encodings_sum_negative = next_encoding*multiplier
-                            else:
-                                # add new encodings to sum based on their multiplier
-                                encodings_sum_negative += next_encoding*multiplier
+                            encodings_sum_negative, multiplier_sum_negative = add_encoding(encodings_sum_negative, next_encoding, multiplier_sum_negative, multiplier, concat_direct_from_prev, concat_direct_to_next)
                         else:
-                            multiplier_sum_positive += multiplier
-                            if encodings_sum_positive is None:
-                                # if sum is empty, write first item.
-                                encodings_sum_positive = next_encoding*multiplier
-                            else:
-                                # add new encodings to sum based on their multiplier
-                                encodings_sum_positive += next_encoding*multiplier
+                            encodings_sum_positive, multiplier_sum_positive = add_encoding(encodings_sum_positive, next_encoding, multiplier_sum_positive, multiplier, concat_direct_from_prev, concat_direct_to_next)                                
+
+                        # in case of direct concatenation, write flag for the next cycle.
+                        concat_direct_from_prev = concat_direct_to_next
 
                 if encoder_level_negative_prompts:
                     # old mixing mode. leaves uncond embeddings untouched, mixes negative prompts directly into the prompt embedding itself.
+                    # if the length of the current sum does not match the length of the next encoding, pad the shorter tensor with zero-vectors to make the shapes equal.
+                    encodings_sum_positive, encodings_sum_negative = equalize_embedding_lengths(encodings_sum_positive, encodings_sum_negative)
                     if encodings_sum_positive is None:
                         tqdm.write("WARNING: only negative multipliers for prompt mixing are present. Using '' as a placeholder for positive prompts!")
                         encodings_sum_positive, _ = perform_text_encode("", **perform_encode_kwargs)
@@ -521,6 +751,15 @@ def generate_segmented(
             for key in io_data:
                 io_data[key] = io_data[key][0]
 
+        embedding_lengths = [embedding.shape[1] for embedding in embeddings_list_prompt+embeddings_list_uncond]
+        # if embedding sizes do not match, or if embeddings are shorter than an enforced minimum length, pad them wherever necessary.
+        if (not all([el == embedding_lengths[0] for el in embedding_lengths])) or (extended_length_enforce_minimum and embedding_lengths[0]<tokenizer.model_max_length):
+            max_embed_length = max(embedding_lengths)
+            # if enforced, extend prompts to at least the default length
+            max_embed_length = max_embed_length if not extended_length_enforce_minimum else max([tokenizer.model_max_length,max_embed_length])
+            padded_uncond_embedding, _ = perform_text_encode("", **{k:v for k,v in perform_encode_kwargs.items() if not k in ["pad_to_length"]}, pad_to_length=max_embed_length)
+            embeddings_list_prompt = [apply_pad_tensor_to_embedding(emb,padded_uncond_embedding) for emb in embeddings_list_prompt]
+            embeddings_list_uncond = [apply_pad_tensor_to_embedding(emb,padded_uncond_embedding) for emb in embeddings_list_uncond]
         # stack list of text encodings to be processed back into a tensor
         text_embeddings = torch.cat(embeddings_list_prompt)
         # get the resulting batch size
@@ -565,7 +804,7 @@ def generate_segmented(
     def generate_segmented_exec(
             prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False,
             animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
-            encoder_level_negative_prompts=False, clip_skip_layers=0
+            encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
         ):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
@@ -588,11 +827,13 @@ def generate_segmented(
                 "eta_seed" : 0,
                 "eta" : eta,
                 "sched_name" : None,
-                "attention" : [],
+                "weights" : [],
                 "unet_model" : f"{models_local_dir} (local)" if using_local_unet else model_id,
                 "vae_model" : f"{models_local_dir} (local)" if using_local_vae else model_id,
                 "encoder_level_negative" : encoder_level_negative_prompts,
                 "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
+                "static_length" : static_length,
+                "concat" : mix_mode_concat,
             },
             "latent" : {
                 "final_latent" : None,
@@ -603,8 +844,8 @@ def generate_segmented(
         # truncate incorrect input dimensions to a multiple of 64
         if isinstance(prompt, str):
             prompt = [prompt]
-        height = int(height/64.0)*64
-        width = int(width/64.0)*64
+        height = int(height/8.0)*8
+        width = int(width/8.0)*8
         SUPPLEMENTARY["io"]["height"] = height
         SUPPLEMENTARY["io"]["width"] = width
         # torch.manual_seed: Value must be within the inclusive range [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff], negative values remapped to positive
@@ -622,7 +863,7 @@ def generate_segmented(
         sched_name = sched_name.lower().strip()
         SUPPLEMENTARY["io"]["sched_name"]=sched_name
 
-        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers)
+        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers, static_length, mix_mode_concat)
         for key in io_data:
             SUPPLEMENTARY["io"][key] = io_data[key]
 
@@ -798,11 +1039,20 @@ def generate_segmented(
     # can optionally move the unet out of the way to make space
     @torch.no_grad()
     def vae_decode_with_failover(vae, latents:torch.Tensor):
+        cleanup_memory()
         try:
             image_out = vae.decode(latents)
             return image_out
         except RuntimeError as e:
             if 'out of memory' in str(e):
+                if latents.shape[0] > 1:
+                    tqdm.write("Decoding as batch ran out of memory. Switching to sequential decode.")
+                    try:
+                        return diffusers_models.vae.DecoderOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
+                    except RuntimeError as e:
+                        # if attempting sequential decode failed with an OOM error (edge case, should usually occur in recursive decode), move on to direct CPU decode.
+                        if 'out of memory' in str(e):
+                            pass
                 if vae.device != "cpu":
                     return vae_decode_cpu(vae, latents)
                 else:
@@ -836,12 +1086,12 @@ def generate_segmented(
     def generate_segmented_wrapper(
             prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None,
             animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True,
-            encoder_level_negative_prompts=False, clip_skip_layers=0
+            encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None,mix_mode_concat=False,
         ):
         exec_args = {
             "width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,
             "animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff,
-            "encoder_level_negative_prompts":encoder_level_negative_prompts,"clip_skip_layers":clip_skip_layers,
+            "encoder_level_negative_prompts":encoder_level_negative_prompts,"clip_skip_layers":clip_skip_layers,"static_length":static_length,"mix_mode_concat":mix_mode_concat,
         }
         if not sequential:
             try:
@@ -883,7 +1133,7 @@ def generate_segmented(
                         SUPPLEMENTARY['io']['text_readback'] += new_supplementary['io']['text_readback']
                         SUPPLEMENTARY['io']['remaining_token_count'] += new_supplementary['io']['remaining_token_count']
                         SUPPLEMENTARY['io']['time'] += new_supplementary['io']['time']
-                        SUPPLEMENTARY['io']['attention'] += new_supplementary['io']['attention']
+                        SUPPLEMENTARY['io']['weights'] += new_supplementary['io']['weights']
                         SUPPLEMENTARY['io']['nsfw'] = SUPPLEMENTARY['io']['nsfw'] or new_supplementary['io']['nsfw']
                     SUPPLEMENTARY['io']['seed'] = seeds
                     SUPPLEMENTARY['io']['eta_seed'] = eta_seeds
@@ -972,7 +1222,7 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
 
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 @torch.no_grad()
-def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False):
+def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False, data_override:dict=None):
     if isinstance(imgs, list):
         if len(imgs) > 1:
             multiple_images = True
@@ -984,40 +1234,47 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
         multiple_images = False
         img = imgs
 
-    grid_latent_string = tensor_to_encoded_string(latents)
-    # keep original shape: tensor[image_index][...], by creating tensor with only one index
-    if multiple_images:
-        if latents is None:
-            item_latent_strings = [""]*len(imgs)
-        else:
-            item_latent_strings = [tensor_to_encoded_string(torch.stack([x])) for x in latents]
-
     TIMESTAMP = datetime.today().strftime('%Y%m%d%H%M%S')
-    prompts_for_filename, pm = cleanup_str(p)
-    prompts_for_metadata = pm.replace("\n","\\n")
+    metadata = PngInfo()
 
-    argdict_str = str(argdict).replace('\n', '\\n')
+    if data_override is None:
+        grid_latent_string = tensor_to_encoded_string(latents)
+        # keep original shape: tensor[image_index][...], by creating tensor with only one index
+        if multiple_images:
+            if latents is None:
+                item_latent_strings = [""]*len(imgs)
+            else:
+                item_latent_strings = [tensor_to_encoded_string(torch.stack([x])) for x in latents]
+        prompts_for_filename, pm = cleanup_str(p)
+        prompts_for_metadata = pm.replace("\n","\\n")
 
-    item_metadata_list = []
-    if multiple_images:
-        for (new_img, i) in zip(imgs, range(len(imgs))):
-            _, item_pm = cleanup_str(p[i])
-            item_prompt_for_metadata = item_pm.replace("\n","\\n")
-            item_metadata = PngInfo()
-            item_metadata.add_text("prompt", f"{item_prompt_for_metadata}\n{argdict_str}")
-            item_metadata.add_text("index", str(i))
-            item_metadata.add_text("latents", item_latent_strings[i])
-            filepath_noext = os.path.join(INDIVIDUAL_OUTPUTS_DIR, f"{TIMESTAMP}_{prompts_for_filename}_{i}")
-            if perform_save:
-                new_img.save(filepath_noext+".png", pnginfo=item_metadata)
-            item_metadata_list.append(item_metadata)
+        argdict_str = str(argdict).replace('\n', '\\n')
+
+        item_metadata_list = []
+        if multiple_images:
+            for (new_img, i) in zip(imgs, range(len(imgs))):
+                _, item_pm = cleanup_str(p[i])
+                item_prompt_for_metadata = item_pm.replace("\n","\\n")
+                item_metadata = PngInfo()
+                item_metadata.add_text("prompt", f"{item_prompt_for_metadata}\n{argdict_str}")
+                item_metadata.add_text("index", str(i))
+                item_metadata.add_text("latents", item_latent_strings[i])
+                filepath_noext = os.path.join(INDIVIDUAL_OUTPUTS_DIR, f"{TIMESTAMP}_{prompts_for_filename}_{i}")
+                if perform_save:
+                    new_img.save(filepath_noext+".png", pnginfo=item_metadata)
+                item_metadata_list.append(item_metadata)
+
+        metadata.add_text("prompt", f"{prompts_for_metadata}\n{argdict_str}")
+        metadata.add_text("latents", grid_latent_string)
+    else:
+        prompts_for_filename, prompts_for_metadata = cleanup_str(data_override.pop("filename",""))
+        argdict = argdict if argdict is not None else data_override
+        argdict.pop("latents", None)
+        for k,v in data_override.items():
+            metadata.add_text(str(k), str(v))
 
     base_filename = f"{TIMESTAMP}_{prompts_for_filename}"
     filepath_noext = os.path.join(OUTPUTS_DIR, f'{base_filename}')
-
-    metadata = PngInfo()
-    metadata.add_text("prompt", f"{prompts_for_metadata}\n{argdict_str}")
-    metadata.add_text("latents", grid_latent_string)
 
     if perform_save:
         img.save(filepath_noext+".png", pnginfo=metadata)
@@ -1051,9 +1308,8 @@ def cleanup_str(input):
     return new_string[:64], s
 
 def show_image(img):
-    title="Output"
     try:
-        cv2.imshow(title, cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR))
+        cv2.imshow(CV2_TITLE, cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR))
         cv2.waitKey(5)
     except:
         pass
@@ -1061,7 +1317,6 @@ def show_image(img):
 # function to create one image containing all input images in a grid.
 # currently not intended for images of differing sizes.
 def image_autogrid(imgs, fixed_rows=None) -> Image:
-    GRID_IMAGE_SEPARATION = 1
     if fixed_rows is not None:
         rows = fixed_rows
         cols = math.ceil(len(imgs)/fixed_rows)
@@ -1082,7 +1337,7 @@ def image_autogrid(imgs, fixed_rows=None) -> Image:
     w += GRID_IMAGE_SEPARATION
     h += GRID_IMAGE_SEPARATION
     # remove one image separation size from the overall size (no added padding after the final row/col)
-    grid = Image.new('RGB', size=(cols*w-GRID_IMAGE_SEPARATION, rows*h-GRID_IMAGE_SEPARATION))
+    grid = Image.new('RGB', size=(cols*w-GRID_IMAGE_SEPARATION, rows*h-GRID_IMAGE_SEPARATION), color=GRID_IMAGE_BACKGROUND_COLOR)
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i%cols*w, i//cols*h))
     return grid
@@ -1174,7 +1429,19 @@ def load_latents_from_image(path, index=0):
             # original shape before VAE encode is tensor[image_index][...], recreate shape with selected index.
             return torch.stack([params[index]])
     except:
-        print(print_exc())
+        print_exc()
+        return None
+
+# load any stored data from png metadata
+def load_metadata_from_image(path):
+    try:
+        pil_image = Image.open(path)
+        if not hasattr(pil_image, "text"):
+            return None
+        else:
+            return pil_image.text
+    except:
+        print_exc()
         return None
 
 # interpolate between two latents (if multiple images are contained in a latent, only the first one is used)
@@ -1214,22 +1481,29 @@ def save_animations(images_with_frames):
     print(f"Saved files with prefix {image_basepath}")
     return image_basepath
 
+def tensor_to_pil(image:torch.Tensor):
+    image = (getattr(image, "sample", image) / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+    images = (image * 255).round().astype("uint8")
+    pil_images = [Image.fromarray(image) for image in images]
+    return pil_images
+
 def create_interpolation(a, b, steps, vae, overextend=0.5):
     al = load_latents_from_image(a)
     bl = load_latents_from_image(b)
     with torch.no_grad():
         interpolated = interpolate_latents(al,bl,steps,overextend)
-    def to_pil(image:torch.Tensor):
-        image = (getattr(image, "sample", image) / 2 + 0.5).clamp(0, 1)
-        image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-        images = (image * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
-        return pil_images
     print("decoding...")
     with torch.no_grad():
         # processing images in target device one-by-one saves VRAM.
-        image_sequence = to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
+        image_sequence = tensor_to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
+
+def re_encode(filepath, vae):
+    latent = load_latents_from_image(filepath)
+    with torch.no_grad():
+        image = tensor_to_pil(vae.decode(latent.to(DIFFUSION_DEVICE) * (1 / 0.18215))[0])
+    return image
 
 class Placeholder():
     pass
@@ -1275,6 +1549,8 @@ class QuickGenerator():
             "gs_scheduler":None,
             "encoder_level_negative_prompts":False,
             "clip_skip_layers":0,
+            "static_length":None,
+            "mix_mode_concat":False,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -1307,10 +1583,12 @@ class QuickGenerator():
             gs_scheduler:str=placeholder,
             encoder_level_negative_prompts:bool=placeholder,
             clip_skip_layers:int=placeholder,
+            static_length:int=placeholder,
+            mix_mode_concat:bool=placeholder
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
-        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers"]
+        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat"]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
                 setattr(self, option, settings[option])
@@ -1318,9 +1596,9 @@ class QuickGenerator():
         if not isinstance(sample_count, Placeholder):
             self.sample_count = max(1,sample_count)
         if not isinstance(width, Placeholder):
-            self.width = int(width/64)*64
+            self.width = int(width/8)*8
         if not isinstance(height, Placeholder):
-            self.height = int(height/64)*64
+            self.height = int(height/8)*8
         if not isinstance(steps, Placeholder):
             self.steps = max(1,steps)
         if not isinstance(strength, Placeholder):
@@ -1399,15 +1677,18 @@ class QuickGenerator():
             animate_pred_diff=self.animate_pred_diff,
             encoder_level_negative_prompts=self.encoder_level_negative_prompts,
             clip_skip_layers=self.clip_skip_layers,
+            static_length=self.static_length,
+            mix_mode_concat=self.mix_mode_concat,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
         PIL_animation_frames = argdict.pop("image_sequence")
         # reduce prompt representation: only output one prompt instance for a larger batch of the same prompt
-        argdict["text_readback"] = collapse_representation(argdict.pop("text_readback"))
-        argdict["remaining_token_count"] = collapse_representation(argdict["remaining_token_count"])
-        argdict["attention"] = collapse_representation(argdict["attention"], keep_lowest_level=True, n=2)
-        argdict["clip_skip_layers"] = collapse_representation(argdict.pop("clip_skip_layers"))
+        argdict["text_readback"] = collapse_representation(argdict.pop("text_readback"), n=3)
+        argdict["remaining_token_count"] = collapse_representation(argdict["remaining_token_count"], n=3)
+        argdict["weights"] = collapse_representation(argdict.pop("weights"), n=3)
+        argdict["clip_skip_layers"] = collapse_representation(argdict.pop("clip_skip_layers"),n=3)
+        # argdict["tokens"] = collapse_representation(argdict.pop("tokens"),n=3)
         if argdict["width"] == 512:
             argdict.pop("width")
         if argdict["height"] == 512:
@@ -1441,9 +1722,9 @@ class QuickGenerator():
 
     @torch.no_grad()
     def perform_image_cycling(self,
-            in_prompt:str="", img_cycles:int=100, save_individual:bool=False,
+            in_prompt:str="", img_cycles:int=100, save_individual:bool=False, save_final:bool=True,
             init_image:Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image=None,
-            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.2,
+            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.0,
         ):
         # sequence prompts across all iterations
         prompts = [p.strip() for p in in_prompt.split("||")]
@@ -1451,7 +1732,7 @@ class QuickGenerator():
 
         # set/modify prompt weights with a given factor
         def process_prompt_weights(prompt,scale_mult):
-            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*);", prompt)
+            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*\+?);", prompt)
             if prompt_segments[-1] == "":
                 # if last prompt in sequence is terminated by a weight, remove trailing empty segment created by splitting.
                 prompt_segments = prompt_segments[:-1]
@@ -1461,7 +1742,7 @@ class QuickGenerator():
             resulting_prompt = ""
             for i, item in enumerate(prompt_segments):
                 # text-prompt segments are appended as-is. Trailing weight segments are appended inside ;; with the scale factor applied. For empty weights, use base weight of 1
-                resulting_prompt += item if i % 2 == 0 else f";{(1 if item=='' else int(item))*scale_mult};"
+                resulting_prompt += item if i % 2 == 0 else f";{(1 if item in ['','+'] else int(item[:-1]) if item.endswith('+') else int(item))*scale_mult:.5}{'+' if item.endswith('+') else ''};"
             return resulting_prompt
 
         def index_prompt(i):
@@ -1472,7 +1753,22 @@ class QuickGenerator():
                 return prompts[prompt_idx]
             else:
                 # apply scale factors to both the previous and upcoming text prompts, then concatenate them. Both will already terminate with trailing weights.
-                return f"{process_prompt_weights(prompts[prompt_idx], iter_per_prompt-progress_in_idx)}{process_prompt_weights(prompts[prompt_idx+1], progress_in_idx)}"
+                if PROMPT_INTERPOLATION_CROSSOVER_POINT != 0.5:
+                    if progress_in_idx <= iter_per_prompt/2:
+                        progress_in_first_half = progress_in_idx/(iter_per_prompt/2)
+                        first_segment_scale = (1-progress_in_first_half) + progress_in_first_half*PROMPT_INTERPOLATION_CROSSOVER_POINT # scale first segment from 1 to crossover
+                        second_segment_scale = progress_in_first_half*PROMPT_INTERPOLATION_CROSSOVER_POINT # scale second segment from 0 to crossover
+                    else:
+                        progress_in_second_half = (progress_in_idx-iter_per_prompt/2)/(iter_per_prompt/2)
+                        first_segment_scale = (1-progress_in_second_half)*PROMPT_INTERPOLATION_CROSSOVER_POINT # scale first segment from crossover to 0
+                        second_segment_scale = (1-progress_in_second_half)*PROMPT_INTERPOLATION_CROSSOVER_POINT + progress_in_second_half # scale second segment from crossover to 1
+                else:
+                    first_segment_scale = (iter_per_prompt-progress_in_idx)/iter_per_prompt
+                    second_segment_scale = progress_in_idx/iter_per_prompt
+                first_segment = process_prompt_weights(prompts[prompt_idx], first_segment_scale)
+                second_segment = process_prompt_weights(prompts[prompt_idx+1], second_segment_scale)
+                # switching the segment with the higher magnitude to the front has not been found to make a difference thus far.
+                return f"{first_segment}{second_segment}" #if progress_in_idx <= iter_per_prompt/2 else f"{second_segment}{first_segment}"
 
         correction_target = None
         # first frame is the initial image, if it exists.
@@ -1488,11 +1784,37 @@ class QuickGenerator():
                 next_prompt = index_prompt(i)
                 cycle_bar.set_description(next_prompt if len(next_prompt) <= 64 else f'{next_prompt[:28]} (...) {next_prompt[-28:]}')
                 out, SUPPLEMENTARY, _ = self.one_generation(next_prompt, init_image, save_images=save_individual)
+                # when using a fixed seed for img2img cycling, advance it by one.
+                self.seed = self.seed if self.seed is None or text2img else self.seed + 1
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                next_frame = out[0]
+                selected_idx=0
+                if self.display_with_cv2 and not text2img and len(out) > 1:
+                    tqdm.write("Select next image to continue the sequence")
+                    @dataclass
+                    class ClickContainer():
+                        click_x=-1
+                        click_y=-1
+                    container = ClickContainer()
+                    cv2.waitKey(1)
+                    def callback_handler(event,x,y,flags,param):
+                        if event == cv2.EVENT_LBUTTONUP:
+                            container.click_x,container.click_y = x,y
+                    cv2.setMouseCallback(CV2_TITLE, callback_handler)
+                    while cv2.getWindowProperty(CV2_TITLE, cv2.WND_PROP_VISIBLE):
+                        cv2.waitKey(1)
+                        if -1 not in [container.click_x,container.click_y]:
+                            break
+                    selected_col = math.trunc(container.click_x / (self.width+GRID_IMAGE_SEPARATION))
+                    selected_row = math.trunc(container.click_y / (self.height+GRID_IMAGE_SEPARATION))
+                    (_xpos, _ypos, window_width, window_height) = cv2.getWindowImageRect(CV2_TITLE)
+                    selected_idx = int(selected_col + selected_row*round(window_width/(self.width+1),0))
+                    selected_idx = selected_idx if selected_idx in range(len(out)) else 0
+                    tqdm.write(f"Selected: index {selected_idx} in [0,{len(out)-1}]")
+
+                next_frame = out[selected_idx]
                 frames.append(next_frame.copy())
                 if not text2img:
                     # skip processing image for next cycle if it will not be used.
@@ -1505,9 +1827,21 @@ class QuickGenerator():
         # if images are not saved on every step, save the final image separately
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
-        full_image, full_metadata, metadata_items = save_output(in_prompt, out, argdict, (not save_individual), final_latent, False)
-        animation_files_basepath = save_animations([frames])
+        full_image, full_metadata, metadata_items = save_output(in_prompt, out, argdict, (not save_individual) and save_final, final_latent, False)
+        if save_final:
+            animation_files_basepath = save_animations([frames])
+        return out,SUPPLEMENTARY, (full_image, full_metadata, metadata_items)
 
+def choose_int(upper_bound:int):
+    if upper_bound <= 1:
+        return 0
+    else:
+        try:
+            val = int(input(f"Select: [0-{upper_bound-1}] > "))
+            assert val in range(upper_bound)
+            return val
+        except:
+            return 0
 
 # unpack object from potential (nested) single-element list(s)
 def unpack_encapsulated_lists(x):
@@ -1515,22 +1849,26 @@ def unpack_encapsulated_lists(x):
         x = x[0]
     return x
 
+# TODO: Remake this function at some point
 # create a string from a list, while removing duplicate string items in a row. Returns "[]" for empty lists. n>1 recursively re-applies the function.
-def collapse_representation(item_list, keep_lowest_level=False, n=1):
+def collapse_representation(item_list,keep_lowest_level=False,n=1):
+    return str(do_collapse_representation(item_list,keep_lowest_level,n))
+def do_collapse_representation(item_list, keep_lowest_level=False, n=1):
     if n <= 0:
-        return str(item_list)
+        return item_list
     item_list = unpack_encapsulated_lists(item_list)
     collapsed = []
     if isinstance(item_list, list) and ((not keep_lowest_level) or (all([isinstance(x,list) for x in item_list]))):
         for item in item_list:
             # drop sequential repetitions: only append the next item if it differs from the last item to be added
+            item = do_collapse_representation(item,keep_lowest_level,n-1)
             if len(collapsed) == 0 or collapsed[-1] != item:
                 collapsed.append(item)
     else:
-        return collapse_representation(item_list, keep_lowest_level, n-1)
+        return item_list
     # unpack a second time, turning a potential list of only a single item into the item itself
     collapsed = unpack_encapsulated_lists(collapsed)
-    return collapse_representation(collapsed, keep_lowest_level, n-1)
+    return collapsed
 
 if __name__ == "__main__":
     main()

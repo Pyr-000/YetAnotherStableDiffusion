@@ -72,7 +72,8 @@ As manually accepting the license on the huggingface webpage should no longer be
 
 #
 # Usage & Features
-- Features include text-to-image, image-to-image (including cycling), and options for precision/devices to control generation speed and memory usage.
+- Features include text-to-image, image-to-image (including cycling), and options for precision/devices to control generation speed and memory usage. StableDiffusion is supported for both version 1.x and version 2.x, including custom models.
+  - Advanced prompt manipulation options including mixing, concatenation, custom in-prompt weights and (per-token) CLIP-skip settings are available.
   - Additional memory optimisation options include (automatic) sequential batching, attention slicing and CPU offloading (see: [Optimisation settings](#device-performace-and-optimization-settings))
 - Animating prompt interpolations is possible for both image-to-image cycling and text-to-image (`-cfi`, see: [Additional Flags](#additional-flags)).
 - `prompts`, `seeds`, and other relevant arguments will be stored in PNG metadata by default.
@@ -81,16 +82,26 @@ As manually accepting the license on the huggingface webpage should no longer be
 - The NSFW check is enabled by default, but will only print a warning message and attach a metadata label, leaving the output images untouched. It can also be fully disabled via a commandline flag (see: [Additional Flags](#additional-flags))
 - Cycling through iterations of image-to-image comes with a mitigation for keeping the color scheme unchanged, preventing effects such as 'magenta shifting'. (`-icc`, see: [Image to image cycling](#image-to-image-cycling))
 - "Textual Inversion Concepts", custom prompt embeddings, from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically. `.pt`-style custom embeddings are also supported in the same way.
+- Prompts with a dynamic length (no token limit) are supported by chunking, then encoding and re-concatenating prompts when required.
+  - It should be noted that supporting prompts with no length limit in this way is not perfect, as the text encoder will not be able to consider information from adjacent prompt chunks for context when encoding. It may sometimes be preferable to manually chunk prompts into self-contained sub-prompts by using the concatenation mixing mode (see usage below, enable via `-mc`, [Additional Flags](#additional-flags))
 - Prompts can be mixed using prompt weights: When prompts are separated by `;;`, their representation within the text encoder space will be averaged. Custom prompt weights can be set by putting a number between the `;;` trailing the prompt. If no value is specified, the default value of 1 will be used as the prompt weight. 
   - Example: `"Painting of a cat ;3; Photograph of a cat ;1;"` Will yield the text representation of `3/4 * "Painting of a cat" + 1/4 "Photograph of a cat"`
   - By default, all negative subprompts will be mixed accoring to their weight, and used in place of the unconditional embedding for classifier free guidance (standard "negative prompts"). In this case, the difference in weights between the positive and negative prompts is not considered, as this is given by the guidance scale (`-cs`).
   - Alternatively, prompts with negative weight values can be directly mixed into the prompt itself, leaving the unconditional embedding untouched (`-mn`, [Additional Flags](#additional-flags)). In this case, negative prompts are not directly 'subtracted'. Instead, the prompt is amplified in its difference from the negative prompts (moving away from the prompt, in the opposite direction of the negative prompt). Relative weight values between positive and negative prompts are considered. This way of applying negative prompts tends to be far more chaotic, but can yield interesting results. In this mode, a loose list of unwanted attributes as a negative prompt will usually perform worse than a description of the desired image together with negative attributes.
+  - When switching to 'concatenation' mixing mode (`-mc`, see: [Additional Flags](#additional-flags)), mixed prompts have their embeddings multiplied by their prompt weight, and are then concatenated into one (longer) prompt. This will make use of dynamic length support where necessary. Additionally, a `+` can be appended to a prompt weight to signify that the end token embedding of the preceding prompt and the start token embedding of the subsequent prompt should be removed, resulting in a 'more direct' concatenation. This is ignored when not running in concatenation mode. (Example: `Painting of a cat;1.25+;Photograph of a cat;0.8;`)
 - Prompts can be specified with an (individual) CLIP-skip setting by appending a trailing `{cls<n>}` for a setting of `n`. This will skip the last *n* layers of CLIP, the text encoder. Increasing this value will reduce the "amount of processing"/"depth of interpretation" performed by the text encoder. A value of `0` is equivalent to specifying no CLIP-skip setting.
+  - **Note:** Other StableDiffusion implementations may refer to disabled CLIP-skipping as 'a CLIP skip of 1', not 'a CLIP skip of 0'. In this case, equivalent CLIP-skip values in this implementation will always be one less.
   - Example: `"Painting of a cat{cls2}"` will encode "Painting of a cat", while skipping the final two layers of the text encoder.
   - When combined with prompt mixing or negative prompts (`;;`, see above), the prompt separator must be specified after the CLIP-skip setting. The skip setting is independent for each sub-prompt.
     - Example: `"Painting of a cat{cls1};3; Photograph of a cat{cls2};1;"`
     - As shown in the example, this can also be used to mix text prompts with themselves under different skip settings, or for interpolating between the same prompt under different skip settings (see: [Cycling](#image-to-image-cycling) and `-cfi` under [Additional Flags](#additional-flags))
   - For some custom models, using a specific CLIP-skip setting by default is recommended. The default value used when none is specified can be set via `-cls` (see: [Additional Flags](#additional-flags)).
+- Custom in-prompt weights are available through a syntax similar to the [lpw_stable_diffusion](https://huggingface.co/docs/diffusers/using-diffusers/custom_pipeline_examples#long-prompt-weighting-stable-diffusion) pipeline:
+  - Prompt sections can be encased by `( :x)`, with `x` being the weight of the prompt section contained within the brackets. `x` accepts any floating point number, and can therefore be used to specify both an increase in weight (`x>1`) or a decrease in weight (`x<1`). Negative values can also be used to create interesting effects, however, this may often fail to provide a 'negative prompt'-style result and can sometimes reduce output quality.
+  - Additionally, this syntax can be used to (optionally) specify various CLIP-skip levels (see above) for individual sections of a prompt. To do this, prompt sections can be encased by `( :x;n)`, with `x` being the section weight (any floating point number) and `n` being the CLIP-skip level of the section (any integer within the available range given by text encoder depth). Local CLIP-skip settings specified this way will temporarily override both the prompt-level CLIP-skip setting (`{cls<n>}`) and the global CLIP-skip setting (`-cls`).
+  - Prompt weights are applied after the prompt encoding itself, and will not cause any (additional) fragmentation or chunking of the prompt. This is also the case for local CLIP-skip settings: The prompt is fully encoded, after which the embeddings for different CLIP-skip settings are interleaved according to the requested level on a per-token-basis/per-embedding-vector-basis.
+  - Example: `"an (oil painting:0.8) of a cat, (displayed in a gallery:1.2;1)"` will decrease the magnitude of the embedding vectors encoding 'oil painting' by 20%, while utilizing the embedding vectors of the prompt with a CLIP-skip of 1 to encode 'displayed in a gallery', and increasing their magnitude by 20%. To only apply a local CLIP-skip without modifying prompt weights, a weight of 1 must be used: `"an oil painting of a cat, (displayed in a gallery:1;1)"`
+  - Stacking multiple weight modifiers by encapsulating them inside eachother is not supported. Instead, individual 'effective' weights of sections must be specified in parallel.
 
 # 
 ## text to image
@@ -103,7 +114,7 @@ python generate.py "a painting of a painter painting a painting"
 - For batch-processing a list of prompts, prompts can be specified from an input file via `-pf`/`--prompts-file`. Each line will be interpreted as one prompt, and prompts will be run sequentially.
 
 ### Image settings
-- The flags `-W`/`--W` and `-H`/`--H` specify image resolution in width and height, respectively. Input values which are not divisible by 64 will be truncated to a multiple of 64 automatically.
+- The flags `-W`/`--W` and `-H`/`--H` specify image resolution in width and height, respectively. Input values which are not divisible by 8 will be truncated to a multiple of 8 automatically.
 ### Diffusion settings
 - `-S`/`--seed` will set the image seed. So long as the image size remains the same, keeping the seed should yield "the same image" under a similar prompt, or "a similar composition" under different prompts.
 - `-s`/`--steps` will set the amount of diffusion steps performed. Higher values can help increase detail, but will be more computationally expensive.
@@ -121,7 +132,7 @@ python generate.py "a painting of a painter painting a painting"
   - `"heun"`: HeunDiscrete
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
-- `-gsc`/`--gs-schedule` sets a schedule for variable guidance scale. This can help with mitigating potential visual artifacts and other issues caused by high guidance scales. By default (None), a static guidance scale with no schedule will be used. The schedule will be scaled across the amount of diffusion steps (`-s`), yielding a multiplier between `0` and `1` for the guidance scale specified via `-cs`.
+- `-gsc`/`--gs-schedule` sets a schedule for variable guidance scale. This can help with mitigating potential visual artifacts and other issues caused by high guidance scales. By default (None), a static guidance scale with no schedule will be used. The schedule will be scaled across the amount of diffusion steps (`-s`), yielding a multiplier (usually between `0` and `1`) for the guidance scale specified via `-cs`.
   - Currently, the following schedules are available: `None`, `"sin"` (1/2-period sine between 0 and π: 0→1→0), `"cos"` (1/4-period cosine between 0 and π/2: 1→0), `"isin"` (inverted sin (1-sin): 1→0→1), `"icos"` (inverted cos (1-cos): 0→1), `"fsin"` (full-period sine between 0 and 2π: 0→1→0→-1→0), `"anneal5"` (2.5 periods of a rectified sine (abs(sin) between 0 and 5π), yielding 5 sequential "bumps" of 0→1→0), `"rand"` (random multiplier between 0 and 1 in each step), `"frand"` (random multiplier between -1 and 1 in each step)
 ### Device, Performace and Optimization settings
 - `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly. See section [Precision](#Precision).
@@ -141,6 +152,10 @@ When either a starting image (`-ii`, see below) or the image cycle flag (`-ic`, 
 ### Image to image cycling
 When applying image-to-image multiple times sequentially (often with a lower strength), the resulting outputs can often be "closer" to the input image, while also achieving a higher "image quality" or "adherence to the prompt". Image-to-image cycling can also be applied without a starting image (the first image in the sequence will be generated via text-to-image) to create interesting effects.
 
+When cycling images in image to image mode, with the batch size set to a value greater than one and cv2 display enabled, `generate.py` will pause for user input after each cycle.
+By clicking on one of the images displayed in the cv2 window, the input image for the next cycle can manually be selected. This could be used to manually guide an 'evolution' of an image via a repeated, selective application of image to image. This behavior is disabled for cycling purely in text to image mode (`-cfi`, see below).
+NOTE: This may be replaced by a better interface in the future. Usability may be affected especially for larger batch sizes, as the display window created by `cv2.imshow` does not support adaptive window sizes or scrolling.
+
 For faster generation cycles, it is recommended to pass the flags `--no-check-nsfw` (you will not receive warnings about potential NSFW content being detected, see: [Additional Flags](#additional-flags)) and `--io-device cuda` (VRAM usage will be increased, see: [Device settings](#device-settings))
 - `-ic`/`--image-cycles` sets the amount of image-to-image cycles that will be performed. An animation (and image grid) will be stored in the `/animated` folder in the output directory. While running, this mode will attempt to display the current image via cv2. This can be disabled by setting the global variable `IMAGE_CYCLE_DISPLAY_CV2=False` near the top of `generate.py`.
   - When multiple prompts are specified via `||` (see: [Multiple Prompts](#multiple-prompts)), an interpolation through the prompt sequence will be performed in the text encoder space.
@@ -150,7 +165,10 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-ir`/`--image-rotate` sets the amount of degrees of (counter-clockwise) rotation applied between image-to-image steps. Disabled with a value of `0` by default.
 - `-it`/`--image-translate` sets the amount of translation applied to the image between image-to-image steps. This requires two values to be specified for the x and y axis translation respectively. Disabled with a value of `None` by default.
 - `-irc`/`--image-rotation-center` sets the position of the rotational axis within the image in pixel coordinates, if rotations are applied. Requires two values for both x and y coordinates, with the origin `0,0` being the top left corner of the image. By default, this automatically selects the center of the image with a value of `None`.
-- `-ics`/`--image-cycle-sharpen` sets the strength of the sharpening filter applied when zooming and/or rotating during image-to-image cycling. This filter is only applied to image inputs before the next cycle, not to stored image outputs. This can help preserve image sharpness, as the resampling applied when zooming or rotating will soften or blur the image. Values greater than `1.0` will increase sharpness, while values between `1.0` and `0.0` will soften the image. Default is `1.2`.
+- `-ics`/`--image-cycle-sharpen` sets the strength of the sharpening filter applied when zooming and/or rotating during image-to-image cycling. This filter is only applied to image inputs before the next cycle, not to stored image outputs.
+  - Values greater than `1.0` will increase sharpness, while values between `1.0` and `0.0` will soften the image. Default is `1.0` with `1.2` being recommended when applying transforms (zoom/rotate).
+  - This can help preserve image sharpness when applying transformations, as the resampling applied when zooming or rotating will soften or blur the image.
+  - Applying a slight softening between cycles can help with increasingly sharpened outputs, and may prevent specific image details from becoming 'stuck'.
 - `-icc`/`--image-color-correction` Enables color correction for image to image cycling: Cumulative density functions of each image channel within the LAB colorspace are respaced to match the density distributions present in the initial (first) image. Prevents 'magenta shifting' (and similar effects) with multiple cycles.
 #
 ## Additional flags
@@ -164,6 +182,9 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-mn`/`--mix-negative-prompts` switches to mixing negative prompts directly into the prompt itself, instead of using them as uncond embeddings. See [Usage & Features](#usage--features)
 - `-dnp`/`--default-negative-prompt` can be used to specify a default negative prompt, which will be utilized whenever no negative prompts is given.
 - `-cls`/`--clip-layer-skip` can be used to specify a default CLIP (text encoder) skip value if none is specified in the prompt. See [Usage & Features](#usage--features)
+- `-rnc`/`--re-encode` can be used to specify a path to an image or folder of images, which will be re-encoded using the VAE of the loaded model. This uses the latents stored in image metadata.
+- `-sel`/`--static-embedding-length` sets a static prompt embedding length, disabling dynamic length functionality. A value of 77 (text encoder length limit) should be used to reproduce results of previous/other implementations.
+- `-mc`/`--mix_concat` switches the prompt mixing mode to concatenate multiple prompt embeddings together instead of calculating a weighted sum. Applied when combining prompts with `;;` or interpolating between prompts. See [Usage & Features](#usage--features)
 
 
 # Precision
@@ -225,7 +246,7 @@ pip install py-cord
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution (overridden to 768x768 for SD2.x). Accepts an optional image attachment for performing image-to-image.
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
-  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <ddim_eta> <eta_seed>`
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <mix_concatenate> <ddim_eta> <eta_seed>`
     - `Width` and `height` are specified either as pixels (for values >64), or as a multiplier of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
     - `scheduler` and `gs_schedule` display available options.
