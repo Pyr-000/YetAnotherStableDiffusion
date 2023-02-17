@@ -193,6 +193,9 @@ def main():
         unet = unet.to(IO_DEVICE)
         vae = vae.to(DIFFUSION_DEVICE)
         enc_path = Path(args.re_encode)
+        if not enc_path.exists():
+            print(f"Selected path does not exist: {enc_path}")
+            exit()
         if enc_path.is_file():
             targets = [enc_path]
         elif enc_path.is_dir():
@@ -205,6 +208,8 @@ def main():
                 meta["filename"] = str(item)
                 meta["re-encode"] = f"{models_local_dir} (local)" if using_local_vae else model_id
                 save_output(p=None, imgs=encoded, argdict=None, data_override=meta)
+            except KeyboardInterrupt:
+                exit()
             except:
                 print_exc()
         exit()
@@ -1234,7 +1239,7 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
         multiple_images = False
         img = imgs
 
-    TIMESTAMP = datetime.today().strftime('%Y%m%d%H%M%S')
+    TIMESTAMP = datetime.today().strftime('%Y%m%d%H%M%S_%f') # microsecond suffix to prevent overwrites when re-encoding individual images of same batch
     metadata = PngInfo()
 
     if data_override is None:
@@ -1267,6 +1272,7 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
         metadata.add_text("prompt", f"{prompts_for_metadata}\n{argdict_str}")
         metadata.add_text("latents", grid_latent_string)
     else:
+        item_metadata_list=[] # placeholder for return
         prompts_for_filename, prompts_for_metadata = cleanup_str(data_override.pop("filename",""))
         argdict = argdict if argdict is not None else data_override
         argdict.pop("latents", None)
@@ -1480,6 +1486,17 @@ def save_animations(images_with_frames):
             print_exc()
     print(f"Saved files with prefix {image_basepath}")
     return image_basepath
+
+def tensor_to_pil_compress_dynamic_range(image:torch.Tensor):
+    image = (getattr(image, "sample", image) / 2 + 0.5)#.clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1)
+    #print([(torch.min(im),torch.max(im))for im in image])
+    image = torch.stack([im - torch.min(im)for im in image])
+    image = torch.stack([im/torch.max(im)for im in image])
+    image = image.clamp(0,1).numpy()
+    images = (image * 255).round().astype("uint8")
+    pil_images = [Image.fromarray(image) for image in images]
+    return pil_images
 
 def tensor_to_pil(image:torch.Tensor):
     image = (getattr(image, "sample", image) / 2 + 0.5).clamp(0, 1)
