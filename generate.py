@@ -254,7 +254,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer
     text_encoder:transfomers_models.clip.modeling_clip.CLIPTextModel
     unet:diffusers_models.unet_2d_condition.UNet2DConditionModel
-    vae:diffusers_models.vae.AutoencoderKL
+    vae:diffusers_models.AutoencoderKL
 
     unet_model_id = model_id
     vae_model_id = model_id
@@ -361,7 +361,7 @@ def generate_segmented(
         tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer,
         text_encoder:transfomers_models.clip.modeling_clip.CLIPTextModel,
         unet:diffusers_models.unet_2d_condition.UNet2DConditionModel,
-        vae:diffusers_models.vae.AutoencoderKL,
+        vae:diffusers_models.AutoencoderKL,
         IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False
     ):
     if not vae.device == torch.device("meta"):
@@ -1048,7 +1048,7 @@ def generate_segmented(
                 if latents.shape[0] > 1:
                     tqdm.write("Decoding as batch ran out of memory. Switching to sequential decode.")
                     try:
-                        return diffusers_models.vae.DecoderOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
+                        return diffusers_models.AutoencoderKL.AutoencoderKLOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
                     except RuntimeError as e:
                         # if attempting sequential decode failed with an OOM error (edge case, should usually occur in recursive decode), move on to direct CPU decode.
                         if 'out of memory' in str(e):
