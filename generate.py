@@ -1053,7 +1053,7 @@ def generate_segmented(
                 if latents.shape[0] > 1:
                     tqdm.write("Decoding as batch ran out of memory. Switching to sequential decode.")
                     try:
-                        return diffusers_models.AutoencoderKL.AutoencoderKLOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
+                        return diffusers_models.vae.DecoderOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
                     except RuntimeError as e:
                         # if attempting sequential decode failed with an OOM error (edge case, should usually occur in recursive decode), move on to direct CPU decode.
                         if 'out of memory' in str(e):
