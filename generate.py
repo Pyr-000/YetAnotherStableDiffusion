@@ -12,7 +12,7 @@ import torch
 from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
-from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.utils import is_accelerate_available
 import argparse
@@ -77,9 +77,9 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
-IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun"] # ipndm not supported
+IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun", "deis"] # ipndm not supported
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
-IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "rand", "frand"]
+IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand"]
 
 # sd2.0 default negative prompt
 DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
@@ -791,6 +791,8 @@ def generate_segmented(
             gs_mult = np.sin(2*np.pi * progress_factor)
         elif gs_schedule == "anneal5": # rectified 2.5x full sine (5 bumps)
             gs_mult = np.abs(np.sin(2*np.pi * progress_factor*2.5))
+        elif gs_schedule == "ianneal5": # 1- (rectified 2.5x full sine (5 bumps))
+            gs_mult = 1 - np.abs(np.sin(2*np.pi * progress_factor*2.5))
         elif gs_schedule == "cos": # quarter-cos (between 0 and pi/2; 1 -> 0)
             gs_mult = np.cos(np.pi/2 * progress_factor)
         elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
@@ -910,6 +912,8 @@ def generate_segmented(
             scheduler = KDPM2AncestralDiscreteScheduler(**scheduler_params)
         elif "heun" == sched_name:
             scheduler = HeunDiscreteScheduler(**scheduler_params)
+        elif "deis" == sched_name:
+            scheduler = DEISMultistepScheduler(**scheduler_params)
 
         else:
             raise ValueError(f"Requested unknown scheduler: {sched_name}")
