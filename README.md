@@ -1,6 +1,7 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
 ## Recent changes to requirements
+- [lora_diffusion](https://github.com/cloneofsimo/lora.git) can be installed to load their compatible LoRA embeddings.
 - Updating `diffusers`, `transformers`, `huggingface-hub` and `accelerate` is recommended.
 - `diffusers` should be updated. `accelerate` can now be used to perform automatic CPU offloading.
 - Now requires `scikit-image` package to perform color correction during image cycling
@@ -16,6 +17,7 @@ When installing with `pip` directly (e.g. for non-conda environments), CUDA tool
 ## Install additional dependencies
 ```shell
 pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate
+pip install git+https://github.com/cloneofsimo/lora.git
 ```
 Most pre-existing StableDiffusion-compatible environments will already have some of these installed.
 #
@@ -102,6 +104,8 @@ As manually accepting the license on the huggingface webpage should no longer be
   - Prompt weights are applied after the prompt encoding itself, and will not cause any (additional) fragmentation or chunking of the prompt. This is also the case for local CLIP-skip settings: The prompt is fully encoded, after which the embeddings for different CLIP-skip settings are interleaved according to the requested level on a per-token-basis/per-embedding-vector-basis.
   - Example: `"an (oil painting:0.8) of a cat, (displayed in a gallery:1.2;1)"` will decrease the magnitude of the embedding vectors encoding 'oil painting' by 20%, while utilizing the embedding vectors of the prompt with a CLIP-skip of 1 to encode 'displayed in a gallery', and increasing their magnitude by 20%. To only apply a local CLIP-skip without modifying prompt weights, a weight of 1 must be used: `"an oil painting of a cat, (displayed in a gallery:1;1)"`
   - Stacking multiple weight modifiers by encapsulating them inside eachother is not supported. Instead, individual 'effective' weights of sections must be specified in parallel.
+- LoRA embeddings are supported (`-lop`,`-low`, see: [Additional Flags](#additional-flags)). This includes native diffusers attn_procs LoRA embeddings, [lora_diffusion](https://github.com/cloneofsimo/lora.git) embeddings and other convertable embeddings (this should include LoRA embeddings made via "sd-scripts").
+  - The LoRA converter is derived from the [haofanwang/diffusers](https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py) conversion script, see [diffusers PR#2403](https://github.com/huggingface/diffusers/pull/2403)
 
 # 
 ## text to image
@@ -186,7 +190,8 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-rnc`/`--re-encode` can be used to specify a path to an image or folder of images, which will be re-encoded using the VAE of the loaded model. This uses the latents stored in image metadata.
 - `-sel`/`--static-embedding-length` sets a static prompt embedding length, disabling dynamic length functionality. A value of 77 (text encoder length limit) should be used to reproduce results of previous/other implementations.
 - `-mc`/`--mix_concat` switches the prompt mixing mode to concatenate multiple prompt embeddings together instead of calculating a weighted sum. Applied when combining prompts with `;;` or interpolating between prompts. See [Usage & Features](#usage--features)
-
+- `-lop`/`--lora-path` can be used to specify a path to a LoRA embedding file (.pt or .safetensors). The script will attempt to load it via diffusers attn_procs, lora_diffusion or the lora converter.
+- `-low`/`--lora-weight` can be used to specify the weight with which LoRA embeddings loaded via `-lop` are applied. Sometimes referred to as 'alpha'.
 
 # Precision
 When switching the precision of either the unet or the latents between full (fp32) and half (fp16), there will be a small difference in outputs.

@@ -91,6 +91,10 @@ CUSTOM_PROMPT_SUBST = {
     "<negative>":"ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft",
 }
 
+# active LoRA, if any. Stored globally for easy access when writing metadata on outputs # pip install git+https://github.com/cloneofsimo/lora.git
+ACTIVE_LORA = None
+ACTIVE_LORA_WEIGHT = 1.0
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(type=str, nargs="?", default=None, help="text prompt for generation. Leave unset to enter prompt loop mode. Multiple prompts can be separated by ||.", dest="prompt")
@@ -137,7 +141,8 @@ def parse_args():
     parser.add_argument("-rnc", "--re-encode", type=str, default=None, help="Re-encode an image or folder using the VAE of the loaded model. Works using latents saved in PNG metadata", dest="re_encode")
     parser.add_argument("-sel", "--static-embedding-length", type=int, default=None, help="Process prompts without dynamic length. A value of 77 should reproduce results of previous/other implementations. Switches from embedding concatenation to mixing.", dest="static_length")
     parser.add_argument("-mc", "--mix_concat", action="store_true", help="When mixing prompts, perform a concatenation of their embeddings instead of calculating a weighted sum.", dest="mix_mode_concat")
-
+    parser.add_argument("-lop", "--lora-path", type=str, default=None, help="Path to a LoRA embedding. Will be loaded via diffusers attn_procs / lora_diffusion / lora converter.", dest="lora_path")
+    parser.add_argument("-low", "--lora-weight", type=float, default=0.8, help="Weight of LoRA embeddings loaded via --lora-path.", dest="lora_weight")
     return parser.parse_args()
 
 def main():
@@ -145,12 +150,15 @@ def main():
     global model_id, models_local_dir
     global OUTPUT_DIR_BASE, OUTPUTS_DIR, INDIVIDUAL_OUTPUTS_DIR, UNPUB_DIR, ANIMATIONS_DIR
     global DEFAULT_NEGATIVE_PROMPT
+    global ACTIVE_LORA, ACTIVE_LORA_WEIGHT
     args = parse_args()
     if args.cpu_offloading:
         args.diffusion_device, args.io_device = OFFLOAD_EXEC_DEVICE, OFFLOAD_EXEC_DEVICE
     DIFFUSION_DEVICE = args.diffusion_device
     IO_DEVICE = args.io_device
     DEFAULT_NEGATIVE_PROMPT = args.default_negative
+    ACTIVE_LORA = args.lora_path
+    ACTIVE_LORA_WEIGHT = args.lora_weight
 
     if args.online_model is not None:
         # set the online model id
@@ -243,8 +251,8 @@ def main():
             except Exception as e:
                 print_exc()
 
-def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False):
-    global using_local_unet, using_local_vae, PROMPT_SUBST, MAX_CLIP_SKIP
+def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False, lora_override:str=None, lora_weight_override:float=None):
+    global using_local_unet, using_local_vae, PROMPT_SUBST, MAX_CLIP_SKIP, ACTIVE_LORA, ACTIVE_LORA_WEIGHT
     # re-set substitution list (re-loading model would otherwise re-add custom embedding substitutions)
     PROMPT_SUBST = CUSTOM_PROMPT_SUBST
     if cpu_offloading:
@@ -308,6 +316,91 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         else:
             V_PREDICTION_MODEL = False
 
+        ACTIVE_LORA = lora_override if lora_override is not None else ACTIVE_LORA
+        ACTIVE_LORA_WEIGHT = lora_weight_override if lora_weight_override is not None else ACTIVE_LORA_WEIGHT
+        # to disable LoRA via override, pass "". No override keeps the current LoRA setting to keep re-loading functionality unchanged
+        if ACTIVE_LORA is not None and ACTIVE_LORA != "":
+            try:
+                # used to pass one 'pipe' object to lora_diffusion.patch_pipe: expects 'pipe' object with properties pipe.unet, pipe.text_encoder, pipe.tokenizer
+                pseudo_pipe_container = lambda **kwargs: type("PseudoPipe", (), kwargs)
+                if not (Path(ACTIVE_LORA).exists() and Path(ACTIVE_LORA).is_file()):
+                    if Path(ACTIVE_LORA+".safetensors").exists() and Path(ACTIVE_LORA+".safetensors").is_file():
+                        ACTIVE_LORA += ".safetensors"
+                    elif Path(ACTIVE_LORA+".pt").exists() and Path(ACTIVE_LORA+".pt").is_file():
+                        ACTIVE_LORA += ".pt"
+                    else:
+                        raise ValueError(f"LoRA path {ACTIVE_LORA} could not be parsed to a valid file.")
+                if not (ACTIVE_LORA.endswith(".pt") or ACTIVE_LORA.endswith(".safetensors")):
+                    raise ValueError(f"LoRA file {ACTIVE_LORA} must have either '.pt' or '.safetensors' extension, specifying the file format.")
+                def patch_wrapper(unet, text_encoder, tokenizer):
+                    global ACTIVE_LORA
+                    try:
+                        path_item = Path(ACTIVE_LORA)
+                        if path_item.suffix == ".safetensors":
+                            from safetensors.torch import load_file
+                            load_data = load_file(path_item)
+                        else:
+                            load_data = torch.load(path_item)
+                    except ImportError as e:
+                        tqdm.write(f"Could not load LoRa due to missing library: {e}")
+                        return
+                    except ValueError as e:
+                        print_exc()
+                        tqdm.write(f"Could not load LoRa file: {e}")
+                        return
+
+                    # first, try loading as a diffusers attn_procs (most specific format)
+                    try:
+                        unet.load_attn_procs(load_data)
+                        tqdm.write(f"{ACTIVE_LORA} loaded as a diffusers attn_proc!")
+                        return
+                    except Exception as e:
+                        # print_exc()
+                        pass
+                    #tqdm.write(f"{ACTIVE_LORA} could not be loaded as diffusers attn_procs")
+
+                    # second, try loading as lora_diffusers
+                    try:
+                        from lora_diffusion import patch_pipe, tune_lora_scale
+                        patch_only_unet = text_encoder is None or tokenizer is None
+                        pseudo_pipe = pseudo_pipe_container(unet=unet,text_encoder=text_encoder,tokenizer=tokenizer)
+                        patch_pipe(pseudo_pipe, ACTIVE_LORA, patch_text=not patch_only_unet, patch_ti=not patch_only_unet)
+                        tune_lora_scale(unet, ACTIVE_LORA_WEIGHT)
+                        if not patch_only_unet:
+                            tune_lora_scale(text_encoder, ACTIVE_LORA_WEIGHT)
+                        tqdm.write(f"{ACTIVE_LORA} loaded via lora_diffusers!")
+                        return
+                    except ImportError:
+                        tqdm.write("Unable to load lora_diffusion. Please install via 'pip install git+https://github.com/cloneofsimo/lora.git' to use lora_diffusion embeddings.")
+                        pass
+                    except Exception as e:
+                        # print_exc()
+                        pass
+                    #tqdm.write(f"{ACTIVE_LORA} could not be loaded via lora_diffusion.")
+
+                    # finally, try to use lora converter to load
+                    try:
+                        load_lora_convert(load_data,unet=unet, text_encoder=text_encoder, merge_strength=ACTIVE_LORA_WEIGHT)
+                        tqdm.write(f"{ACTIVE_LORA} loaded via LoRA converter!")
+                        return
+                    except Exception as e:
+                        #print_exc()
+                        pass
+                    #tqdm.write(f"{ACTIVE_LORA} could not be loaded via LoRa converter.")
+
+                    tqdm.write(f"{ACTIVE_LORA} embedding failed to load using known methods: diffusers attn_proc / lora_diffusion / lora converter")
+                    ACTIVE_LORA = None
+
+            except ValueError as e:
+                print(e)
+                ACTIVE_LORA = None
+                def patch_wrapper(*args, **kwargs):
+                    pass
+        else:
+            ACTIVE_LORA = None
+            def patch_wrapper(*args, **kwargs):
+                pass
+
     if not vae_only:
         # Load the UNet model for generating the latents.
         if half_precision:
@@ -319,6 +412,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
             cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
 
         if unet_only:
+            patch_wrapper(unet,None,None)
             return unet
 
     # Load the autoencoder model which will be used to decode the latents into image space.
@@ -355,12 +449,79 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                 print(f"Loading concept from {item} failed: {e}")
         print("")
 
+    patch_wrapper(unet,text_encoder,tokenizer)
+
     # text encoder should be offloaded after adding custom embeddings to ensure that every embedding is actually on the same device.
     if cpu_offloading:
         cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
 
     return tokenizer, text_encoder, unet, vae, rate_nsfw
+
+# take state dict, apply LoRA to unet and text encoder (at strength)
+def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0.75):
+    # adapted from https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py
+    LORA_PREFIX_TEXT_ENCODER = "lora_te"
+    LORA_PREFIX_UNET = "lora_unet"
+    visited = []
+
+    # directly update weight in diffusers model
+    for key in state_dict:
+        # as we have set the alpha beforehand, so just skip
+        if ".alpha" in key or key in visited:
+            continue
+
+        if "text" in key and LORA_PREFIX_TEXT_ENCODER in key:
+            layer_infos = key.split(".")[0].split(LORA_PREFIX_TEXT_ENCODER + "_")[-1].split("_")
+            curr_layer = text_encoder
+            if text_encoder is None:
+                continue
+        elif LORA_PREFIX_UNET in key:
+            layer_infos = key.split(".")[0].split(LORA_PREFIX_UNET + "_")[-1].split("_")
+            curr_layer = unet
+            if unet is None:
+                continue
+        else:
+            print(f"skipping unknown LoRA key {key}") # -> {state_dict[key]}")
+            continue
+
+        # find the target layer
+        temp_name = layer_infos.pop(0)
+        while len(layer_infos) > -1:
+            try:
+                curr_layer = curr_layer.__getattr__(temp_name)
+                if len(layer_infos) > 0:
+                    temp_name = layer_infos.pop(0)
+                elif len(layer_infos) == 0:
+                    break
+            except Exception:
+                if len(temp_name) > 0:
+                    temp_name += "_" + layer_infos.pop(0)
+                else:
+                    temp_name = layer_infos.pop(0)
+
+        pair_keys = []
+        if "lora_down" in key:
+            pair_keys.append(key.replace("lora_down", "lora_up"))
+            pair_keys.append(key)
+        else:
+            pair_keys.append(key)
+            pair_keys.append(key.replace("lora_up", "lora_down"))
+
+        # update weight
+        if len(state_dict[pair_keys[0]].shape) == 4:
+            weight_up = state_dict[pair_keys[0]].squeeze(3).squeeze(2).to(torch.float32)
+            weight_down = state_dict[pair_keys[1]].squeeze(3).squeeze(2).to(torch.float32)
+            curr_layer.weight.data += merge_strength * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
+        else:
+            weight_up = state_dict[pair_keys[0]].to(torch.float32)
+            weight_down = state_dict[pair_keys[1]].to(torch.float32)
+            curr_layer.weight.data += merge_strength * torch.mm(weight_up, weight_down)
+
+        # update visited list
+        for item in pair_keys:
+            visited.append(item)
+
 
 def generate_segmented(
         tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer,
@@ -841,6 +1002,7 @@ def generate_segmented(
                 "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
                 "static_length" : static_length,
                 "concat" : mix_mode_concat,
+                "LoRA" : ACTIVE_LORA if not isinstance(ACTIVE_LORA,str) or not "." in ACTIVE_LORA else ACTIVE_LORA.rsplit('.',1)[0],
             },
             "latent" : {
                 "final_latent" : None,
@@ -1728,6 +1890,8 @@ class QuickGenerator():
             argdict.pop("encoder_level_negative")
         if argdict["clip_skip_layers"] == "0":
             argdict.pop("clip_skip_layers")
+        if argdict["LoRA"] == None:
+            argdict.pop("LoRA")
         full_image, full_metadata, metadata_items = save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
         if self.animate:
             # init frames by image list

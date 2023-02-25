@@ -13,6 +13,8 @@ models/**/*.zip
 models/**/*.7z
 models/concepts/**/*.bin
 models/concepts/**/*.pt
+lora/*.pt
+lora/*.safetensors
 *.bat
 *.sh
 
