@@ -12,7 +12,7 @@ import torch
 from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
-from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.utils import is_accelerate_available
 import argparse
@@ -77,7 +77,7 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
-IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun", "deis"] # ipndm not supported
+IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun", "deis", "unipc"] # ipndm not supported
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
 IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand"]
 
@@ -1076,6 +1076,8 @@ def generate_segmented(
             scheduler = HeunDiscreteScheduler(**scheduler_params)
         elif "deis" == sched_name:
             scheduler = DEISMultistepScheduler(**scheduler_params)
+        elif "unipc" == sched_name:
+            scheduler = UniPCMultistepScheduler(**scheduler_params)
 
         else:
             raise ValueError(f"Requested unknown scheduler: {sched_name}")

@@ -135,6 +135,7 @@ python generate.py "a painting of a painter painting a painting"
   - `"kdpm2_ancestral"`: KDPM2AncestralDiscrete
   - `"heun"`: HeunDiscrete
   - `"deis"`: DEISMultistepScheduler (lower-order-final for \<15 timesteps)
+  - `"unipc`" : UniPCMultistepScheduler
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
 - `-gsc`/`--gs-schedule` sets a schedule for variable guidance scale. This can help with mitigating potential visual artifacts and other issues caused by high guidance scales. By default (None), a static guidance scale with no schedule will be used. The schedule will be scaled across the amount of diffusion steps (`-s`), yielding a multiplier (usually between `0` and `1`) for the guidance scale specified via `-cs`.
