@@ -1203,15 +1203,21 @@ def generate_segmented(
         SUPPLEMENTARY["io"]["nsfw"] = has_nsfw
         if animate:
             # swap places between UNET and VAE to speed up large batch decode. then swap back.
-            unet.to(IO_DEVICE)
-            vae.to(DIFFUSION_DEVICE)
-            torch.cuda.synchronize()
+            try:
+                unet.to(IO_DEVICE)
+                vae.to(DIFFUSION_DEVICE)
+                torch.cuda.synchronize()
+            except NotImplementedError:
+                pass # when offloaded to cpu, model switching will fail (copy out of meta tensor)
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
                 SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_decode_with_failover(vae,(item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
-            torch.cuda.synchronize()
-            vae.to(IO_DEVICE)
-            unet.to(DIFFUSION_DEVICE)
+            try:
+                torch.cuda.synchronize()
+                vae.to(IO_DEVICE)
+                unet.to(DIFFUSION_DEVICE)
+            except NotImplementedError:
+                pass
         SUPPLEMENTARY["io"]["time"] = time() - START_TIME
 
         return pil_images, SUPPLEMENTARY
