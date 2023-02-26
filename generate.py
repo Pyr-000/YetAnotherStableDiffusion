@@ -1123,6 +1123,7 @@ def generate_segmented(
 
         # denoising loop!
         progress_bar = tqdm([x for x in enumerate(scheduler.timesteps[starting_timestep:])], position=1)
+        unet_sequential_batch = False
         for i, t in progress_bar:
             if animate and not animate_pred_diff:
                 SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
@@ -1133,12 +1134,23 @@ def generate_segmented(
             # predict the noise residual
             with torch.no_grad():
                 cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
-                noise_pred = unet(latent_model_input.to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=text_embeddings.to(device=cast_device, dtype=unet.dtype))["sample"]
+                if not unet_sequential_batch:
+                    try:
+                        noise_pred = unet(latent_model_input.to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=text_embeddings.to(device=cast_device, dtype=unet.dtype))["sample"]
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e):
+                            unet_sequential_batch = True
+                        else:
+                            raise e
+                if unet_sequential_batch:
+                    # re-check the condition. Will now be True if batching failed.
+                    noise_pred = torch.cat([unet(torch.stack([latent_model_input[i]]).to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=torch.stack([text_embeddings[i]]).to(device=cast_device, dtype=unet.dtype))["sample"] for i in range(len(latent_model_input))])
+
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             progress_factor = i/len(scheduler.timesteps[starting_timestep:])
             gs_mult = get_gs_mult(gs_schedule, progress_factor)
-            progress_bar.set_description(f"gs={gs*gs_mult:.3f}")
+            progress_bar.set_description(f"gs={gs*gs_mult:.3f}{';seq_batch' if unet_sequential_batch else ''}")
             noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
 
             if animate and animate_pred_diff:
@@ -1218,6 +1230,12 @@ def generate_segmented(
             return image_out
         except RuntimeError as e:
             if 'out of memory' in str(e):
+                if not vae.use_slicing:
+                    # if VAE slicing is not yet enabled, re-run decode with slicing temporarily enabled. If additional memory reductions are required, they will be applied in the recursive call.
+                    vae.enable_slicing()
+                    results = vae_decode_with_failover(vae, latents)
+                    vae.disable_slicing()
+                    return results
                 if latents.shape[0] > 1:
                     tqdm.write("Decoding as batch ran out of memory. Switching to sequential decode.")
                     try:
@@ -1826,6 +1844,10 @@ class QuickGenerator():
 
             self.attention_slicing = attention_slicing
             self._unet.set_attention_slice(slice_size)
+            if slice_size is not None:
+                self._vae.enable_slicing()
+            else:
+                self._vae.disable_slicing()
 
 
     @torch.no_grad()
@@ -2058,4 +2080,7 @@ def do_collapse_representation(item_list, keep_lowest_level=False, n=1):
     return collapsed
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Cancelled.")
