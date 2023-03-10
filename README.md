@@ -1,8 +1,11 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
 ## Recent changes to requirements
+- Updating `diffusers`, `transformers`, `huggingface-hub` and `accelerate` is generally recommended.
+- controlnet_aux can be installed for additional controlnet preprocessors (pose extraction, M-LSD segmentation, HED edge detection)
+- xformers should be installed to significantly boost efficiency (pre-built xformers should now be available regardless of platform)
+  - NOTE: xformers 0.0.16 **requires** at least pytorch 1.13.1. Installing it with an older version of pytorch may update to a cpu-only version. [Manually updating pytorch](#install-pytorch-skip-when-using-a-pre-existing-stablediffusion-compatible-environment) to 1.13.1 with CUDA support may be required.
 - [lora_diffusion](https://github.com/cloneofsimo/lora.git) can be installed to load their compatible LoRA embeddings.
-- Updating `diffusers`, `transformers`, `huggingface-hub` and `accelerate` is recommended.
 - `diffusers` should be updated. `accelerate` can now be used to perform automatic CPU offloading.
 - Now requires `scikit-image` package to perform color correction during image cycling
 
@@ -16,7 +19,7 @@ When installing with `pip` directly (e.g. for non-conda environments), CUDA tool
 #
 ## Install additional dependencies
 ```shell
-pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate
+pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate xformers controlnet_aux
 pip install git+https://github.com/cloneofsimo/lora.git
 ```
 Most pre-existing StableDiffusion-compatible environments will already have some of these installed.
@@ -76,7 +79,7 @@ As manually accepting the license on the huggingface webpage should no longer be
 # Usage & Features
 - Features include text-to-image, image-to-image (including cycling), and options for precision/devices to control generation speed and memory usage. StableDiffusion is supported for both version 1.x and version 2.x, including custom models.
   - Advanced prompt manipulation options including mixing, concatenation, custom in-prompt weights and (per-token) CLIP-skip settings are available.
-  - Additional memory optimisation options include (automatic) sequential batching, attention slicing and CPU offloading (see: [Optimisation settings](#device-performace-and-optimization-settings))
+  - Additional memory optimisation options include (automatic) sequential batching, the usage of xformers attention by default, attention/vae slicing and CPU offloading (see: [Optimisation settings](#device-performace-and-optimization-settings))
 - Animating prompt interpolations is possible for both image-to-image cycling and text-to-image (`-cfi`, see: [Additional Flags](#additional-flags)).
 - `prompts`, `seeds`, and other relevant arguments will be stored in PNG metadata by default.
 - For every generated output, an image will be saved in `outputs/generated`. When multiple images are batched at once, this singular image will be a grid, with the individual images being saved in `outputs/generated/individual`. Additionally, each generated output will produce a text file in `outputs/generated/unpub` of the same filename, containing the prompt and additional arguments. This can be used for maintaining an external image gallery.
@@ -106,6 +109,8 @@ As manually accepting the license on the huggingface webpage should no longer be
   - Stacking multiple weight modifiers by encapsulating them inside eachother is not supported. Instead, individual 'effective' weights of sections must be specified in parallel.
 - LoRA embeddings are supported (`-lop`,`-low`, see: [Additional Flags](#additional-flags)). This includes native diffusers attn_procs LoRA embeddings, [lora_diffusion](https://github.com/cloneofsimo/lora.git) embeddings and other convertable embeddings (this should include LoRA embeddings made via "sd-scripts").
   - The LoRA converter is derived from the [haofanwang/diffusers](https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py) conversion script, see [diffusers PR#2403](https://github.com/huggingface/diffusers/pull/2403)
+- ControlNets are supported, with included image preprocessors and dynamic (scheduled) ControlNet strength/guidance scale. Refer to the [ControlNet](#controlnet) flags section for details.
+  - If displaying freshly generated images with cv2 is enabled, an additional preview window will be created when preprocessing ControlNet inputs by default. This can be used to inspect the 'correctness' of the preprocessed image.
 
 # 
 ## text to image
@@ -144,7 +149,7 @@ python generate.py "a painting of a painter painting a painting"
 - `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly. See section [Precision](#Precision).
 - `--latents-half` will switch from using full precision (fp32) latents to using half precision (fp16) latents. The difference in memory usage should be insignificant (<1MB). See section [Precision](#Precision).
 - `--diff-device` sets the device used for the UNET and diffusion sampling loop. `"cuda"` by default.
-- `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cpu"` by default. Switching this to `"cuda"` will increase VRAM usage (see the example shown in section [Precision](#Precision)), while only speeding up the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
+- `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cuda"` by default. Switching this to `"cpu"` will decrease VRAM usage (see the example shown in section [Precision](#Precision)), while only slowing down the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
 - `--seq`/`--sequential_samples` will process batch items (if multiple images are to be generated) sequentially, instead of as a single large batch. Reduces VRAM consumption. This flag will activate automatically if generating runs out of memory when more than one image is requested.
 - `-as`/`--attention-slice` sets slice size for UNET attention slicing, reducing memory usage. The value must be a valid divisor of the UNET head count. Set to 1 to maximise memory efficiency. Set to 0 to use the diffusers recommended "auto"-tradeoff between memory reduction and (minimal) speed cost.
 - `-co`/`--cpu-offload` will enable CPU offloading of models through `accelerate`. This should enable compatibility with minimal VRAM at the cost of speed.
@@ -162,7 +167,7 @@ When cycling images in image to image mode, with the batch size set to a value g
 By clicking on one of the images displayed in the cv2 window, the input image for the next cycle can manually be selected. This could be used to manually guide an 'evolution' of an image via a repeated, selective application of image to image. This behavior is disabled for cycling purely in text to image mode (`-cfi`, see below).
 NOTE: This may be replaced by a better interface in the future. Usability may be affected especially for larger batch sizes, as the display window created by `cv2.imshow` does not support adaptive window sizes or scrolling.
 
-For faster generation cycles, it is recommended to pass the flags `--no-check-nsfw` (you will not receive warnings about potential NSFW content being detected, see: [Additional Flags](#additional-flags)) and `--io-device cuda` (VRAM usage will be increased, see: [Device settings](#device-settings))
+For faster generation cycles, it is recommended to pass the flag `--no-check-nsfw` (you will not receive warnings about potential NSFW content being detected, see: [Additional Flags](#additional-flags))
 - `-ic`/`--image-cycles` sets the amount of image-to-image cycles that will be performed. An animation (and image grid) will be stored in the `/animated` folder in the output directory. While running, this mode will attempt to display the current image via cv2. This can be disabled by setting the global variable `IMAGE_CYCLE_DISPLAY_CV2=False` near the top of `generate.py`.
   - When multiple prompts are specified via `||` (see: [Multiple Prompts](#multiple-prompts)), an interpolation through the prompt sequence will be performed in the text encoder space.
     - Unlike in earlier versions of this repository, this now works for interpolating between complex prompts which combine/mix multiple subprompts with their own internal prompt weights (see: `;;` in [Usage & Features](#usage--features))
@@ -178,21 +183,35 @@ For faster generation cycles, it is recommended to pass the flags `--no-check-ns
 - `-icc`/`--image-color-correction` Enables color correction for image to image cycling: Cumulative density functions of each image channel within the LAB colorspace are respaced to match the density distributions present in the initial (first) image. Prevents 'magenta shifting' (and similar effects) with multiple cycles.
 #
 ## Additional flags
-- `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. See: [Automatic model install](#option-a-automatic-model-install-via-huggingface)
-- `-lm`/`--local-model` can be used to specify a directory containing local model files. This directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` file each. See: [Manual model install](#option-b-manual-model-install)
 - `-od`/`--output-dir` sets an override for the base output directory. The directory will be created if it is not already present.
 - `--no-check-nsfw` disables the NSFW check entirely, which slightly speeds up the generation process. By default, `generate.py` will only display a warning and attach an extra tag in image metadata if potential NSFW concepts are detected.
 - `--animate` will store any intermediate (unfinished) latents during the sampling process in CPU memory. After sampling has concluded, an animation (and image grid) will be created in the `/animated` folder in the output directory
-- `-in`/`--interpolate-latents` accepts two image paths for retrieving and interpolating latents from the images. This will only work for images of the same size which have had their latents stored in metadata (`generate.py` does this by default, as it will only increase image size by 50-100kB). While the interpolation occurs in the latent space (after which the VAE is applied to decode individual images), results will usually not differ from crossfading the images in image space directly. Results are saved like in `--animate`.
 - `-cfi`/`--cycle-fresh-image` when combined with image cycles (`-ic`), a new image will be created via text-to-image for each cycle. Can be used to interpolate between prompts purely in text-to-image mode (fixed seed recommended).
+### Specifying models
+- `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. See: [Automatic model install](#option-a-automatic-model-install-via-huggingface)
+- `-lm`/`--local-model` can be used to specify a directory containing local model files. This directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` file each. See: [Manual model install](#option-b-manual-model-install)
+### Re-using stored latents
+- `-in`/`--interpolate-latents` accepts two image paths for retrieving and interpolating latents from the images. This will only work for images of the same size which have had their latents stored in metadata (`generate.py` does this by default, as it will only increase image size by 50-100kB). While the interpolation occurs in the latent space (after which the VAE is applied to decode individual images), results will usually not differ from crossfading the images in image space directly. Results are saved like in `--animate`.
+- `-rnc`/`--re-encode` can be used to specify a path to an image or folder of images, which will be re-encoded using the VAE of the loaded model. This uses the latents stored in image metadata.
+### Prompt manipulation
 - `-mn`/`--mix-negative-prompts` switches to mixing negative prompts directly into the prompt itself, instead of using them as uncond embeddings. See [Usage & Features](#usage--features)
 - `-dnp`/`--default-negative-prompt` can be used to specify a default negative prompt, which will be utilized whenever no negative prompts is given.
 - `-cls`/`--clip-layer-skip` can be used to specify a default CLIP (text encoder) skip value if none is specified in the prompt. See [Usage & Features](#usage--features)
-- `-rnc`/`--re-encode` can be used to specify a path to an image or folder of images, which will be re-encoded using the VAE of the loaded model. This uses the latents stored in image metadata.
 - `-sel`/`--static-embedding-length` sets a static prompt embedding length, disabling dynamic length functionality. A value of 77 (text encoder length limit) should be used to reproduce results of previous/other implementations.
 - `-mc`/`--mix_concat` switches the prompt mixing mode to concatenate multiple prompt embeddings together instead of calculating a weighted sum. Applied when combining prompts with `;;` or interpolating between prompts. See [Usage & Features](#usage--features)
-- `-lop`/`--lora-path` can be used to specify a path to a LoRA embedding file (.pt or .safetensors). The script will attempt to load it via diffusers attn_procs, lora_diffusion or the lora converter.
-- `-low`/`--lora-weight` can be used to specify the weight with which LoRA embeddings loaded via `-lop` are applied. Sometimes referred to as 'alpha'.
+### LoRA
+- `-lop`/`--lora-path` can be used to specify one or more paths to LoRA embedding files (.bin/.pt or .safetensors). The script will attempt to load them via diffusers attn_procs, lora_diffusion or the lora converter.
+- `-low`/`--lora-weight` can be used to specify the weights with which LoRA embeddings loaded via `-lop` are applied. Sometimes referred to as 'alpha'.
+### ControlNet
+- `-com`/`--controlnet-model` can be used to specify a name, path or hub id pointing to a ControlNet model to apply. Available names are `"canny","depth","hed","mlsd","normal","openpose","scribble","seg"`, which resolve to their respective [lllyasviel/sd-controlnet](https://huggingface.co/lllyasviel) model. For examples, refer to the [lllyasviel/ControlNet](https://github.com/lllyasviel/ControlNet) repository. Custom names can be added to the global variable `CONTROLNET_SHORTNAMES` near the top of `generate.py`.
+- `-coi`/`--controlnet-input` specifies a path pointing to an input image for the ControlNet.
+- `-cop`/`--controlnet-preprocessor` can be used to specify a preprocessor for ControlNet inputs, applied to the ControlNet input image. Available options are:
+  - `"canny"`: Applies the Canny edge detector to the image before using it in the ControlNet. Performs a coarse, somewhat textured edge detection. Recommended when feeding regular images into a `"canny"` ControlNet model.
+  - `"detect_hed"`: Applies HED edge detection to the input image. Compared to `"canny"`, this will produce soft and smooth edge detection results. Recommended when feeding regular images into an `"hed"` Control net model. (Requires `controlnet_aux` library)
+  - `"detect_pose"`: Attempts to extract an openpose bone image from the input image. Can be used to perform 'pose-transfer'. Recommended when feeding regular images into an `"openpose"` Control net model. (Requires `controlnet_aux` library)
+  - `"detect_mlsd"`: Attempts to produce an M-LSD wireframe segmentation of the input image. Recommended when feeding regular images into an `"mlsd"` Control net model. (Requires `controlnet_aux` library)
+- `-cost`/`--controlnet-strength` specifies the strength (guidance scale/cond_scale) with which the ControlNet guidance is applied.
+- `-cosc`/`--controlnet-schedule` can be used to specify a schedule for variable ControlNet strength. Default (None) corresponds to no schedule. This shares scheduler options with `-gsc`, see: [Diffusion Settings](#diffusion-settings).
 
 # Precision
 When switching the precision of either the unet or the latents between full (fp32) and half (fp16), there will be a small difference in outputs.

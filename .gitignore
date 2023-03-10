@@ -14,6 +14,7 @@ models/**/*.7z
 models/concepts/**/*.bin
 models/concepts/**/*.pt
 lora/*.pt
+lora/*.bin
 lora/*.safetensors
 *.bat
 *.sh

@@ -13,7 +13,7 @@ from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler
-from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel
 from diffusers.utils import is_accelerate_available
 import argparse
 from datetime import datetime
@@ -43,15 +43,19 @@ using_local_unet, using_local_vae = False,False
 # location of textual inversion concepts (if present). (recursively) search for any .bin files. see see: https://huggingface.co/sd-concepts-library
 concepts_dir = "models/concepts"
 # one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep, hip, ve, ort, mps, xla, lazy, vulkan, meta, hpu
-# devices will be set by argparser if used. 
+# devices will be set by argparser if used.
 DIFFUSION_DEVICE = "cuda"
-IO_DEVICE = "cpu"
+IO_DEVICE = "cuda"
 # execution device when offloading enabled. Required as a global for now.
 OFFLOAD_EXEC_DEVICE = "cuda"
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
+# display preprocessed image via cv2 when utilising controlnet preprocessing
+PREPROCESS_DISPLAY_CV2 = True
 # Window title for cv2 display
 CV2_TITLE="Output"
+# Window title for cv2 display when displaying preprocessing image
+PREPROCESS_CV2_TITLE="ControlNet Input"
 # global flag signifying if a v_prediction model is in use.
 V_PREDICTION_MODEL = False
 # will be read and overridden from the text encoder layer count on model load. Inclusive range limit. 12 for ViT-L/14 (SD1.x) or 23 for ViT-H (SD2.x)
@@ -80,6 +84,11 @@ os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun", "deis", "unipc"] # ipndm not supported
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
 IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand"]
+# preprocessors for controlnet input images
+AUX_PREPROCESSORS = ["detect_pose", "detect_mlsd", "detect_hed"] # , "detect_midas"] # seems to not be in pypi yet, hold until next release
+IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + AUX_PREPROCESSORS
+# short names for specifying controlnet models. will translate requests for name into requests for CONTROLNET_SHORTNAMES[name]
+CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]}
 
 # sd2.0 default negative prompt
 DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
@@ -94,6 +103,7 @@ CUSTOM_PROMPT_SUBST = {
 # active LoRA, if any. Stored globally for easy access when writing metadata on outputs # pip install git+https://github.com/cloneofsimo/lora.git
 ACTIVE_LORA = None
 ACTIVE_LORA_WEIGHT = 1.0
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -141,8 +151,13 @@ def parse_args():
     parser.add_argument("-rnc", "--re-encode", type=str, default=None, help="Re-encode an image or folder using the VAE of the loaded model. Works using latents saved in PNG metadata", dest="re_encode")
     parser.add_argument("-sel", "--static-embedding-length", type=int, default=None, help="Process prompts without dynamic length. A value of 77 should reproduce results of previous/other implementations. Switches from embedding concatenation to mixing.", dest="static_length")
     parser.add_argument("-mc", "--mix_concat", action="store_true", help="When mixing prompts, perform a concatenation of their embeddings instead of calculating a weighted sum.", dest="mix_mode_concat")
-    parser.add_argument("-lop", "--lora-path", type=str, default=None, help="Path to a LoRA embedding. Will be loaded via diffusers attn_procs / lora_diffusion / lora converter.", dest="lora_path")
-    parser.add_argument("-low", "--lora-weight", type=float, default=0.8, help="Weight of LoRA embeddings loaded via --lora-path.", dest="lora_weight")
+    parser.add_argument("-lop", "--lora-path", type=str, default=None, nargs="+", help="Path(s) to LoRA embedding(s). Will be loaded via diffusers attn_procs / lora_diffusion / lora converter.", dest="lora_path")
+    parser.add_argument("-low", "--lora-weight", type=float, default=[0.8], nargs="+", help="Weight(s) of LoRA embedding(s) loaded via --lora-path. Will wrap around if there are less weights than embeddings.", dest="lora_weight")
+    parser.add_argument("-com","--controlnet-model", type=str, default=None, help=f"Set a name, path or hub id pointing to a controlnet model. Known names: {CONTROLNET_SHORTNAMES}", dest="controlnet_model")
+    parser.add_argument("-coi","--controlnet-input", type=str, default=None, help="Set a path pointing to an input image for the controlnet.", dest="controlnet_input")
+    parser.add_argument("-cost", "--controlnet-strength", type=float, default=1.0, help="strength (cond scale) for applying a controlnet", dest="controlnet_strength")
+    parser.add_argument("-cosc","--controlnet-schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for controlnet strength. Default (None) corresponds to no schedule.", dest="controlnet_schedule")
+    parser.add_argument("-cop","--controlnet-preprocessor", type=str, default=None, choices=IMPLEMENTED_CONTROLNET_PREPROCESSORS, help="Set a preprocessor for controlnet inputs.", dest="controlnet_preprocessor")
     return parser.parse_args()
 
 def main():
@@ -222,34 +237,46 @@ def main():
                 print_exc()
         exit()
 
+    controlnet_model = load_controlnet(args.controlnet_model,DIFFUSION_DEVICE,args.cpu_offloading)
+
     generator = QuickGenerator(tokenizer,text_encoder,unet,vae,IO_DEVICE,DIFFUSION_DEVICE,rate_nsfw,args.half_latents)
     generator.configure(
         args.n_samples, args.width, args.height, args.steps, args.guidance_scale, args.seed, args.sched_name, args.ddim_eta, args.eta_seed, args.strength,
         args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule,
         args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
+        controlnet_model, args.controlnet_strength, args.controlnet_preprocessor, args.controlnet_schedule,
     )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
+    controlnet_input = None if args.controlnet_input is None else Image.open(args.controlnet_input).convert("RGB")
 
     if args.img_cycles > 0:
-        generator.perform_image_cycling(args.prompt, args.img_cycles, args.image_cycle_save_individual, True, init_image, args.cycle_fresh, args.cycle_color_correction, None, args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen)
+        generator.perform_image_cycling(args.prompt, args.img_cycles, args.image_cycle_save_individual, True, init_image, args.cycle_fresh, args.cycle_color_correction, None, args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen, controlnet_input=controlnet_input)
         exit()
 
     if args.prompts_file is not None:
         lines = [line.strip() for line in codecs.open(args.prompts_file, "r").readlines()]
         for line in tqdm(lines, position=0, desc="Input prompts"):
-            generator.one_generation(line, init_image)
+            generator.one_generation(line, init_image, controlnet_input=controlnet_input)
     elif args.prompt is not None:
-        generator.one_generation(args.prompt, init_image)
+        generator.one_generation(args.prompt, init_image, controlnet_input=controlnet_input)
     else:
         while True:
             prompt = input("Prompt> ").strip()
             try:
-                generator.one_generation(prompt, init_image)
+                generator.one_generation(prompt, init_image, controlnet_input=controlnet_input)
             except KeyboardInterrupt:
                 pass
             except Exception as e:
                 print_exc()
+
+def recurse_set_xformers(item, max_recursion_depth=16):
+    if hasattr(item, "set_use_memory_efficient_attention_xformers"):
+        item.set_use_memory_efficient_attention_xformers(True,None)
+    recurse_targets = item.__dict__.values() if hasattr(item, "__dict__") else item.values() if isinstance(item, dict) else item if isinstance(item, list) or hasattr(item, "__iter__") else None
+    if max_recursion_depth > 0 and recurse_targets is not None:
+        for x in recurse_targets:
+            recurse_set_xformers(x,max_recursion_depth-1)
 
 def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False, lora_override:str=None, lora_weight_override:float=None):
     global using_local_unet, using_local_vae, PROMPT_SUBST, MAX_CLIP_SKIP, ACTIVE_LORA, ACTIVE_LORA_WEIGHT
@@ -317,79 +344,130 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
             V_PREDICTION_MODEL = False
 
         ACTIVE_LORA = lora_override if lora_override is not None else ACTIVE_LORA
-        ACTIVE_LORA_WEIGHT = lora_weight_override if lora_weight_override is not None else ACTIVE_LORA_WEIGHT
+        ACTIVE_LORA_WEIGHT = lora_weight_override if lora_weight_override is not None else ACTIVE_LORA_WEIGHT if ACTIVE_LORA_WEIGHT is not None else [1.0]
+        ACTIVE_LORA_WEIGHT = [ACTIVE_LORA_WEIGHT] if isinstance(ACTIVE_LORA_WEIGHT, float) else ACTIVE_LORA_WEIGHT
         # to disable LoRA via override, pass "". No override keeps the current LoRA setting to keep re-loading functionality unchanged
-        if ACTIVE_LORA is not None and ACTIVE_LORA != "":
+        if ACTIVE_LORA not in [None, "", []]:
             try:
+                if isinstance(ACTIVE_LORA, str):
+                    ACTIVE_LORA = ACTIVE_LORA.split(";")
+                if isinstance(ACTIVE_LORA_WEIGHT, str):
+                    ACTIVE_LORA_WEIGHT = [try_float(x,1.0) for x in ACTIVE_LORA_WEIGHT.split(";")]
+                if len(ACTIVE_LORA_WEIGHT) < len(ACTIVE_LORA): # if there are less weights than embeddings, extend them to the correct length by wrapping around to the first value
+                    ACTIVE_LORA_WEIGHT *= int(len(ACTIVE_LORA)/len(ACTIVE_LORA_WEIGHT))+1
+                    ACTIVE_LORA_WEIGHT = ACTIVE_LORA_WEIGHT[:len(ACTIVE_LORA)]
                 # used to pass one 'pipe' object to lora_diffusion.patch_pipe: expects 'pipe' object with properties pipe.unet, pipe.text_encoder, pipe.tokenizer
                 pseudo_pipe_container = lambda **kwargs: type("PseudoPipe", (), kwargs)
-                if not (Path(ACTIVE_LORA).exists() and Path(ACTIVE_LORA).is_file()):
-                    if Path(ACTIVE_LORA+".safetensors").exists() and Path(ACTIVE_LORA+".safetensors").is_file():
-                        ACTIVE_LORA += ".safetensors"
-                    elif Path(ACTIVE_LORA+".pt").exists() and Path(ACTIVE_LORA+".pt").is_file():
-                        ACTIVE_LORA += ".pt"
-                    else:
-                        raise ValueError(f"LoRA path {ACTIVE_LORA} could not be parsed to a valid file.")
-                if not (ACTIVE_LORA.endswith(".pt") or ACTIVE_LORA.endswith(".safetensors")):
-                    raise ValueError(f"LoRA file {ACTIVE_LORA} must have either '.pt' or '.safetensors' extension, specifying the file format.")
+                active_lora_paths = []
+                active_lora_weights = []
+                for lora_item, lora_weight in zip(ACTIVE_LORA, ACTIVE_LORA_WEIGHT):
+                    if not (Path(lora_item).exists() and Path(lora_item).is_file()):
+                        if Path(lora_item+".safetensors").exists() and Path(lora_item+".safetensors").is_file():
+                            lora_item += ".safetensors"
+                        elif Path(lora_item+".pt").exists() and Path(lora_item+".pt").is_file():
+                            lora_item += ".pt"
+                        elif Path(lora_item+".bin").exists() and Path(lora_item+".bin").is_file():
+                            lora_item += ".bin"
+                        else:
+                            tqdm.write(ValueError(f"LoRA path {lora_item} could not be parsed to a valid file."))
+                            continue
+                    if not (lora_item.endswith(".pt") or lora_item.endswith(".safetensors") or lora_item.endswith(".bin")):
+                        tqdm.write(ValueError(f"LoRA file {lora_item} should have either '.pt'/'.bin' or '.safetensors' extension, specifying the file format. Assuming .pt for non-safetensors files."))
+                        continue
+                    active_lora_paths.append(lora_item)
+                    active_lora_weights.append(lora_weight)
+                ACTIVE_LORA = active_lora_paths
+                ACTIVE_LORA_WEIGHT = active_lora_weights
                 def patch_wrapper(unet, text_encoder, tokenizer):
-                    global ACTIVE_LORA
+                    global ACTIVE_LORA, ACTIVE_LORA_WEIGHT
+                    loaded_lora = []
+                    loaded_lora_weights = []
+                    for lora, weight in zip(ACTIVE_LORA, ACTIVE_LORA_WEIGHT):
+                        try:
+                            if patch_worker(unet, text_encoder, tokenizer, lora, weight):
+                                loaded_lora.append(lora)
+                                loaded_lora_weights.append(weight)
+                        except Exception as e:
+                            tqdm.write(f"lora {lora} could not be applied: {e}")
+                    ACTIVE_LORA = loaded_lora
+                    ACTIVE_LORA_WEIGHT = loaded_lora_weights
+                def patch_worker(unet, text_encoder, tokenizer, lora_item, item_weight:1.0):
                     try:
-                        path_item = Path(ACTIVE_LORA)
+                        path_item = Path(lora_item)
                         if path_item.suffix == ".safetensors":
-                            from safetensors.torch import load_file
+                            from safetensors.torch import load_file #, safe_open
                             load_data = load_file(path_item)
+                            """with safe_open(path_item, framework="pt") as handle:
+                                if handle.metadata() is not None:
+                                    print(f"metadata for {lora_item}:")
+                                    pprint(handle.metadata())"""
                         else:
                             load_data = torch.load(path_item)
                     except ImportError as e:
                         tqdm.write(f"Could not load LoRa due to missing library: {e}")
-                        return
+                        return False
                     except ValueError as e:
                         print_exc()
                         tqdm.write(f"Could not load LoRa file: {e}")
-                        return
+                        return False
+
+                    encoder_is_sd1 = text_encoder.get_input_embeddings().weight.data.shape[1] == 768
 
                     # first, try loading as a diffusers attn_procs (most specific format)
                     try:
+                        sd1_len_keys = [k for k in load_data.keys() if len(getattr(load_data[k], "shape", [])) >=2 and 768 == load_data[k].shape[1]]
+                        is_sd1 = all([("transformer_blocks.0.attn2.processor.to_" in x and "_lora.down.weight" in x) for x in sd1_len_keys]) and len(sd1_len_keys) >= 32
+                        if is_sd1 != encoder_is_sd1: # crude version check, maybe replace with something better
+                            print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
+                            return False
                         unet.load_attn_procs(load_data)
-                        tqdm.write(f"{ACTIVE_LORA} loaded as a diffusers attn_proc!")
-                        return
+                        tqdm.write(f"{lora_item} loaded as a diffusers attn_proc!")
+                        return True
                     except Exception as e:
                         # print_exc()
                         pass
-                    #tqdm.write(f"{ACTIVE_LORA} could not be loaded as diffusers attn_procs")
+                    #tqdm.write(f"{lora_item} could not be loaded as diffusers attn_procs")
 
                     # second, try loading as lora_diffusers
                     try:
+                        if not ["<s1>"] in load_data.keys():
+                            raise ValueError(f"embedding is not lora_diffusers.")
+                        elif load_data["<s1>"].shape[0] == 768 != encoder_is_sd1: # crude version check, maybe replace with something better
+                            print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
+                            return False
                         from lora_diffusion import patch_pipe, tune_lora_scale
                         patch_only_unet = text_encoder is None or tokenizer is None
                         pseudo_pipe = pseudo_pipe_container(unet=unet,text_encoder=text_encoder,tokenizer=tokenizer)
-                        patch_pipe(pseudo_pipe, ACTIVE_LORA, patch_text=not patch_only_unet, patch_ti=not patch_only_unet)
-                        tune_lora_scale(unet, ACTIVE_LORA_WEIGHT)
+                        patch_pipe(pseudo_pipe, lora_item, patch_text=not patch_only_unet, patch_ti=not patch_only_unet)
+                        tune_lora_scale(unet, item_weight)
                         if not patch_only_unet:
-                            tune_lora_scale(text_encoder, ACTIVE_LORA_WEIGHT)
-                        tqdm.write(f"{ACTIVE_LORA} loaded via lora_diffusers!")
-                        return
+                            tune_lora_scale(text_encoder, item_weight)
+                        tqdm.write(f"{lora_item} loaded via lora_diffusers!")
+                        return True
                     except ImportError:
                         tqdm.write("Unable to load lora_diffusion. Please install via 'pip install git+https://github.com/cloneofsimo/lora.git' to use lora_diffusion embeddings.")
                         pass
                     except Exception as e:
                         # print_exc()
                         pass
-                    #tqdm.write(f"{ACTIVE_LORA} could not be loaded via lora_diffusion.")
+                    #tqdm.write(f"{lora_item} could not be loaded via lora_diffusion.")
 
                     # finally, try to use lora converter to load
                     try:
-                        load_lora_convert(load_data,unet=unet, text_encoder=text_encoder, merge_strength=ACTIVE_LORA_WEIGHT)
-                        tqdm.write(f"{ACTIVE_LORA} loaded via LoRA converter!")
-                        return
+                        sd1_len_keys = [k for k in load_data.keys() if len(getattr(load_data[k], "shape", [])) >=2 and 768 == load_data[k].shape[1] and "lora_down.weight" in k]
+                        if len(sd1_len_keys) >= 92 != encoder_is_sd1: # crude version check, maybe replace with something better
+                            print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
+                            return False
+                        load_lora_convert(load_data,unet=unet, text_encoder=text_encoder, merge_strength=item_weight)
+                        tqdm.write(f"{lora_item} loaded via LoRA converter!")
+                        return True
                     except Exception as e:
                         #print_exc()
                         pass
-                    #tqdm.write(f"{ACTIVE_LORA} could not be loaded via LoRa converter.")
+                    #tqdm.write(f"{lora_item} could not be loaded via LoRa converter.")
 
-                    tqdm.write(f"{ACTIVE_LORA} embedding failed to load using known methods: diffusers attn_proc / lora_diffusion / lora converter")
-                    ACTIVE_LORA = None
+                    tqdm.write(f"{lora_item} embedding failed to load using known methods: diffusers attn_proc / lora_diffusion / lora converter")
+                    return False
 
             except ValueError as e:
                 print(e)
@@ -413,6 +491,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
 
         if unet_only:
             patch_wrapper(unet,None,None)
+            recurse_set_xformers(unet)
             return unet
 
     # Load the autoencoder model which will be used to decode the latents into image space.
@@ -421,6 +500,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     else:
         vae = AutoencoderKL.from_pretrained(vae_model_id, subfolder="vae", use_auth_token=use_auth_token_vae)
     if vae_only:
+        recurse_set_xformers(vae)
         return vae
 
     # Load the tokenizer and text encoder to tokenize and encode the text.
@@ -456,6 +536,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
 
+    recurse_set_xformers([tokenizer, text_encoder, unet, vae, rate_nsfw])
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
 # take state dict, apply LoRA to unet and text encoder (at strength)
@@ -522,6 +603,46 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
         for item in pair_keys:
             visited.append(item)
 
+def try_int(s:str, default:int=None):
+    try:
+        return int(s)
+    except ValueError:
+        return default
+def try_float(s:str, default:float=None):
+    try:
+        return float(s)
+    except ValueError:
+        return default
+
+def load_controlnet(source:str,device="cpu",cpu_offload=False):
+    if source in [None, ""]:
+        return None
+    source = CONTROLNET_SHORTNAMES.get(source, source)
+    try:
+        controlnet = ControlNetModel.from_pretrained(source, torch_dtype=torch.float16).to(device)
+        if cpu_offload:
+            cpu_offload(controlnet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        recurse_set_xformers(controlnet)
+        setattr(controlnet, "_MODEL_NAME", source)
+    except Exception as e:
+        print_exc()
+        print(f"failed to load controlnet: {e}")
+    return controlnet
+
+def controlnet_preprocess(image:Image, width:int, height:int, preprocessor:str=None):
+    image = image.resize((width,height), resample=Image.Resampling.LANCZOS)
+    image = image.convert("RGB")
+    if preprocessor == "canny":
+        image = Image.fromarray(cv2.Canny(np.array(image),100,200)).convert("RGB")
+    elif preprocessor in AUX_PREPROCESSORS:
+        processed = controlnet_aux_extractor(preprocessor,image)
+        image = image if processed is None else processed
+    if PREPROCESS_DISPLAY_CV2:
+        show_image(image, PREPROCESS_CV2_TITLE)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    return image
 
 def generate_segmented(
         tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer,
@@ -532,25 +653,25 @@ def generate_segmented(
     ):
     if not vae.device == torch.device("meta"):
         vae.to(IO_DEVICE)
+        vae_compute_device = IO_DEVICE
+    else:
+        vae_compute_device = OFFLOAD_EXEC_DEVICE
     if not text_encoder.device == torch.device("meta"):
         text_encoder.to(IO_DEVICE)
     if not unet.device == torch.device("meta"):
         unet.to(UNET_DEVICE)
+        unet_compute_device = UNET_DEVICE
+    else:
+        unet_compute_device = OFFLOAD_EXEC_DEVICE
+
+    # xformers attention will fail to function on CPU.
+    unet.set_use_memory_efficient_attention_xformers(unet_compute_device=="cuda",None)
+    vae.set_use_memory_efficient_attention_xformers(vae_compute_device=="cuda",None)
+
     UNET_DEVICE = UNET_DEVICE if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
     IO_DEVICE = IO_DEVICE if IO_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
     #if UNET_DEVICE == "meta" and unet.dtype == torch.float16:
     #    half_precision_latents = True
-
-    def try_int(s:str, default:int=None):
-        try:
-            return int(s)
-        except ValueError:
-            return default
-    def try_float(s:str, default:float=None):
-        try:
-            return float(s)
-        except ValueError:
-            return default
 
     def process_prompt_segmentation(prompt, default_skip=0):
         segment_weights = []
@@ -870,7 +991,7 @@ def generate_segmented(
                             multiplier = abs(multiplier)
                             encodings_sum_negative, multiplier_sum_negative = add_encoding(encodings_sum_negative, next_encoding, multiplier_sum_negative, multiplier, concat_direct_from_prev, concat_direct_to_next)
                         else:
-                            encodings_sum_positive, multiplier_sum_positive = add_encoding(encodings_sum_positive, next_encoding, multiplier_sum_positive, multiplier, concat_direct_from_prev, concat_direct_to_next)                                
+                            encodings_sum_positive, multiplier_sum_positive = add_encoding(encodings_sum_positive, next_encoding, multiplier_sum_positive, multiplier, concat_direct_from_prev, concat_direct_to_next)
 
                         # in case of direct concatenation, write flag for the next cycle.
                         concat_direct_from_prev = concat_direct_to_next
@@ -966,13 +1087,14 @@ def generate_segmented(
             # Could add a warning here.
             pass
         return gs_mult
-            
+
 
     @torch.no_grad()
     def generate_segmented_exec(
             prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False,
             animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
             encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
+            controlnet:ControlNetModel=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
         ):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
@@ -1002,13 +1124,18 @@ def generate_segmented(
                 "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
                 "static_length" : static_length,
                 "concat" : mix_mode_concat,
-                "LoRA" : ACTIVE_LORA if not isinstance(ACTIVE_LORA,str) or not "." in ACTIVE_LORA else ACTIVE_LORA.rsplit('.',1)[0],
+                "LoRA" : None if ACTIVE_LORA is None else f"{ACTIVE_LORA}: {ACTIVE_LORA_WEIGHT}",
+                "controlnet": None if None in [controlnet, controlnet_input] else f"{getattr(controlnet, '_MODEL_NAME', 'unlabeled')}: {controlnet_strength}",
+                "controlnet_scheduler": controlnet_strength_scheduler,
             },
             "latent" : {
                 "final_latent" : None,
                 "latent_sequence" : [],
             },
         }
+        if isinstance(ACTIVE_LORA,list) and isinstance(ACTIVE_LORA_WEIGHT,list) and len(ACTIVE_LORA)==len(ACTIVE_LORA_WEIGHT):
+            try: SUPPLEMENTARY["io"]["LoRA"] = [f"{lora.rsplit('.',1)[0]}: {weight}" for lora,weight in zip(ACTIVE_LORA,ACTIVE_LORA_WEIGHT)]
+            except Exception as e: tqdm.write(f"Failed to create IOData LoRA info from {ACTIVE_LORA} with weights {ACTIVE_LORA_WEIGHT}")
 
         # truncate incorrect input dimensions to a multiple of 64
         if isinstance(prompt, str):
@@ -1121,6 +1248,16 @@ def generate_segmented(
         if hasattr(scheduler, "init_noise_sigma"):
             latents *= scheduler.init_noise_sigma
 
+        if controlnet_input is not None:
+            controlnet_input = controlnet_preprocess(controlnet_input, width, height, controlnet_preprocessor)
+            controlnet_input = torch.cat([controlnet_input]*len(latents)*2)
+            if controlnet is None:
+                tqdm.write("Warning! Controlnet input provided, but no controlnet found!")
+                controlnet_input = None
+        elif controlnet is not None:
+            tqdm.write("Warning! Controlnet provided, but no controlnet input found!")
+            controlnet_input = None
+
         # denoising loop!
         progress_bar = tqdm([x for x in enumerate(scheduler.timesteps[starting_timestep:])], position=1)
         unet_sequential_batch = False
@@ -1131,12 +1268,22 @@ def generate_segmented(
             latent_model_input = torch.cat([latents] * 2)
             if hasattr(scheduler, "scale_model_input"):
                 latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+            progress_factor = i/len(scheduler.timesteps[starting_timestep:])
             # predict the noise residual
             with torch.no_grad():
                 cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
+                cast_unet_args = {"device":cast_device, "dtype":unet.dtype}
+                down_block_residuals, mid_block_residual, incompatible = apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args)
+                if incompatible:
+                    tqdm.write(f"Dimension mismatch between controlnet and diffusion UNET! Versions may be mismatched between SD1.x and SD2.x! Disabling controlnet for this diffusion.")
+                    controlnet_input = None
+                    SUPPLEMENTARY["io"]["controlnet"] = None
                 if not unet_sequential_batch:
                     try:
-                        noise_pred = unet(latent_model_input.to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=text_embeddings.to(device=cast_device, dtype=unet.dtype))["sample"]
+                        noise_pred = unet(
+                            latent_model_input.to(**cast_unet_args), t.to(**cast_unet_args), encoder_hidden_states=text_embeddings.to(**cast_unet_args),
+                            down_block_additional_residuals=down_block_residuals, mid_block_additional_residual=mid_block_residual,
+                        )["sample"]
                     except RuntimeError as e:
                         if 'out of memory' in str(e):
                             unet_sequential_batch = True
@@ -1144,11 +1291,15 @@ def generate_segmented(
                             raise e
                 if unet_sequential_batch:
                     # re-check the condition. Will now be True if batching failed.
-                    noise_pred = torch.cat([unet(torch.stack([latent_model_input[i]]).to(device=cast_device, dtype=unet.dtype), t.to(device=cast_device, dtype=unet.dtype), encoder_hidden_states=torch.stack([text_embeddings[i]]).to(device=cast_device, dtype=unet.dtype))["sample"] for i in range(len(latent_model_input))])
+                    def batch_idx(x, i):
+                        return None if x is None else torch.stack([x[i]])
+                    noise_pred = torch.cat([unet(
+                        batch_idx(latent_model_input,i).to(cast_unet_args), t.to(cast_unet_args), encoder_hidden_states=batch_idx(text_embeddings,i).to(cast_unet_args),
+                        down_block_additional_residuals=batch_idx(down_block_residuals).to(cast_unet_args), mid_block_additional_residual=batch_idx(mid_block_residual).to(cast_unet_args),
+                    )["sample"] for i in range(len(latent_model_input))])
 
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            progress_factor = i/len(scheduler.timesteps[starting_timestep:])
             gs_mult = get_gs_mult(gs_schedule, progress_factor)
             progress_bar.set_description(f"gs={gs*gs_mult:.3f}{';seq_batch' if unet_sequential_batch else ''}")
             noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
@@ -1222,6 +1373,30 @@ def generate_segmented(
 
         return pil_images, SUPPLEMENTARY
 
+    def apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args):
+        incompatible = False
+        if controlnet_input is not None:
+            controlnet_mult = get_gs_mult(controlnet_strength_scheduler, progress_factor)
+            cast_controlnet_args = {"device":controlnet.device, "dtype":torch.float16}
+            try:
+                down_block_residuals, mid_block_residual = controlnet(latent_model_input.to(**cast_controlnet_args),t.to(**cast_controlnet_args),encoder_hidden_states=text_embeddings.to(**cast_controlnet_args),controlnet_cond=controlnet_input.to(**cast_controlnet_args),return_dict=False)
+                down_block_residuals = [down_block_res_sample * controlnet_strength*controlnet_mult for down_block_res_sample in down_block_residuals]
+                mid_block_residual *= controlnet_strength*controlnet_mult
+                down_block_residuals = [d.to(**cast_unet_args) for d in down_block_residuals]
+                mid_block_residual = mid_block_residual.to(**cast_unet_args)
+            except RuntimeError as e:
+                if f"The size of tensor a" in str(e) and "must match the size of tensor b" in str(e):
+                    tqdm.write(str(e))
+                    down_block_residuals=None
+                    mid_block_residual=None
+                    incompatible = True
+                else:
+                    raise e
+        else:
+            down_block_residuals=None
+            mid_block_residual=None
+        return down_block_residuals,mid_block_residual, incompatible
+
     def cleanup_memory():
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
@@ -1284,11 +1459,13 @@ def generate_segmented(
             prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None,
             animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True,
             encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None,mix_mode_concat=False,
+            controlnet=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
         ):
         exec_args = {
             "width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,
             "animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff,
             "encoder_level_negative_prompts":encoder_level_negative_prompts,"clip_skip_layers":clip_skip_layers,"static_length":static_length,"mix_mode_concat":mix_mode_concat,
+            "controlnet":controlnet,"controlnet_input":controlnet_input,"controlnet_strength":controlnet_strength,"controlnet_preprocessor":controlnet_preprocessor,"controlnet_strength_scheduler":controlnet_strength_scheduler,
         }
         if not sequential:
             try:
@@ -1490,7 +1667,7 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
             global NOT_SAVED_WARNING_PRINTED
             NOT_SAVED_WARNING_PRINTED = True
             tqdm.write("perform_save set to False, results not saved to local disk.")
-    
+
     return img, metadata, item_metadata_list
 
 # cleanup string for use in a filename, extract string from list/tuple
@@ -1505,9 +1682,9 @@ def cleanup_str(input):
         new_string = new_string.replace("__","_")
     return new_string[:64], s
 
-def show_image(img):
+def show_image(img, title=None):
     try:
-        cv2.imshow(CV2_TITLE, cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR))
+        cv2.imshow(CV2_TITLE if title is None else title, cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR))
         cv2.waitKey(5)
     except:
         pass
@@ -1596,7 +1773,7 @@ def process_cycle_image(img:Image, rotation:int=0, rotation_center:tuple=None, t
 
     if perform_histogram_correction and correction_target is not None:
         img = Image.fromarray(cv2.cvtColor(exposure.match_histograms(cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2LAB), correction_target, channel_axis=2), cv2.COLOR_LAB2RGB).astype("uint8")).convert("RGB")
-    
+
     return img
 
 # write latent tensor to string for PNG metadata saving
@@ -1760,6 +1937,10 @@ class QuickGenerator():
             "clip_skip_layers":0,
             "static_length":None,
             "mix_mode_concat":False,
+            "controlnet":None,
+            "controlnet_strength":1.0,
+            "controlnet_preprocessor":None,
+            "controlnet_strength_scheduler":None,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -1793,11 +1974,18 @@ class QuickGenerator():
             encoder_level_negative_prompts:bool=placeholder,
             clip_skip_layers:int=placeholder,
             static_length:int=placeholder,
-            mix_mode_concat:bool=placeholder
+            mix_mode_concat:bool=placeholder,
+            controlnet:ControlNetModel=placeholder,
+            controlnet_strength:float=placeholder,
+            controlnet_preprocessor:str=placeholder,
+            controlnet_strength_scheduler:str=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
-        unmodified_options = ["guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat"]
+        unmodified_options = [
+            "guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat",
+            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler",
+        ]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
                 setattr(self, option, settings[option])
@@ -1857,7 +2045,7 @@ class QuickGenerator():
 
 
     @torch.no_grad()
-    def one_generation(self, prompt:str=None, init_image:Image=None, save_images:bool=True):
+    def one_generation(self, prompt:str=None, init_image:Image=None, save_images:bool=True, controlnet_input:Image=None):
         # keep this conversion instead of only having a default value of "" to permit None as an input
         prompt = prompt if prompt is not None else ""
         prompts = [x.strip() for x in prompt.split("||")]*self.sample_count
@@ -1892,6 +2080,11 @@ class QuickGenerator():
             clip_skip_layers=self.clip_skip_layers,
             static_length=self.static_length,
             mix_mode_concat=self.mix_mode_concat,
+            controlnet=self.controlnet,
+            controlnet_strength=self.controlnet_strength,
+            controlnet_preprocessor=self.controlnet_preprocessor,
+            controlnet_input=controlnet_input,
+            controlnet_strength_scheduler=self.controlnet_strength_scheduler,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -1901,7 +2094,7 @@ class QuickGenerator():
         argdict["remaining_token_count"] = collapse_representation(argdict["remaining_token_count"], n=3)
         argdict["weights"] = collapse_representation(argdict.pop("weights"), n=3)
         argdict["clip_skip_layers"] = collapse_representation(argdict.pop("clip_skip_layers"),n=3)
-        # argdict["tokens"] = collapse_representation(argdict.pop("tokens"),n=3)
+        argdict["tokens"] = collapse_representation(argdict.pop("tokens"),n=3)
         if argdict["width"] == 512:
             argdict.pop("width")
         if argdict["height"] == 512:
@@ -1939,7 +2132,7 @@ class QuickGenerator():
     def perform_image_cycling(self,
             in_prompt:str="", img_cycles:int=100, save_individual:bool=False, save_final:bool=True,
             init_image:Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image=None,
-            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.0,
+            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.0, controlnet_input:Image=None,
         ):
         # sequence prompts across all iterations
         prompts = [p.strip() for p in in_prompt.split("||")]
@@ -1998,7 +2191,7 @@ class QuickGenerator():
                 init_image = init_image if not text2img else None
                 next_prompt = index_prompt(i)
                 cycle_bar.set_description(next_prompt if len(next_prompt) <= 64 else f'{next_prompt[:28]} (...) {next_prompt[-28:]}')
-                out, SUPPLEMENTARY, _ = self.one_generation(next_prompt, init_image, save_images=save_individual)
+                out, SUPPLEMENTARY, _ = self.one_generation(next_prompt, init_image, save_images=save_individual, controlnet_input=controlnet_input)
                 # when using a fixed seed for img2img cycling, advance it by one.
                 self.seed = self.seed if self.seed is None or text2img else self.seed + 1
                 if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
@@ -2046,6 +2239,23 @@ class QuickGenerator():
         if save_final:
             animation_files_basepath = save_animations([frames])
         return out,SUPPLEMENTARY, (full_image, full_metadata, metadata_items)
+
+def controlnet_aux_extractor(detector_model, *args, **kwargs):
+    try:
+        import controlnet_aux as ca
+    except ImportError:
+        print(f"unable to import detector for {detector_model} from 'controlnet_aux'. Please install it via 'pip install controlnet_aux'")
+        return None
+    detector_map = {"detect_pose":ca.OpenposeDetector, "detect_mlsd":ca.MLSDdetector, "detect_hed":ca.HEDdetector} # , "detect_midas":ca.MidasDetector} # seems to not be in pypi yet, hold until next release
+    if not detector_model in detector_map:
+        print(f"Unknown aux detector model: {detector_model}!")
+        return None
+    Detector = detector_map[detector_model]
+    model = Detector.from_pretrained("lllyasviel/ControlNet")
+    results = model(*args, **kwargs)
+    del model
+    gc.collect()
+    return results
 
 def choose_int(upper_bound:int):
     if upper_bound <= 1:
