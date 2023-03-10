@@ -418,8 +418,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                         sd1_len_keys = [k for k in load_data.keys() if len(getattr(load_data[k], "shape", [])) >=2 and 768 == load_data[k].shape[1]]
                         is_sd1 = all([("transformer_blocks.0.attn2.processor.to_" in x and "_lora.down.weight" in x) for x in sd1_len_keys]) and len(sd1_len_keys) >= 32
                         if is_sd1 != encoder_is_sd1: # crude version check, maybe replace with something better
-                            print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
-                            return False
+                            raise ValueError(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
                         unet.load_attn_procs(load_data)
                         tqdm.write(f"{lora_item} loaded as a diffusers attn_proc!")
                         return True
@@ -433,8 +432,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                         if not ["<s1>"] in load_data.keys():
                             raise ValueError(f"embedding is not lora_diffusers.")
                         elif load_data["<s1>"].shape[0] == 768 != encoder_is_sd1: # crude version check, maybe replace with something better
-                            print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
-                            return False
+                            raise ValueError(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
                         from lora_diffusion import patch_pipe, tune_lora_scale
                         patch_only_unet = text_encoder is None or tokenizer is None
                         pseudo_pipe = pseudo_pipe_container(unet=unet,text_encoder=text_encoder,tokenizer=tokenizer)
@@ -455,7 +453,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                     # finally, try to use lora converter to load
                     try:
                         sd1_len_keys = [k for k in load_data.keys() if len(getattr(load_data[k], "shape", [])) >=2 and 768 == load_data[k].shape[1] and "lora_down.weight" in k]
-                        if len(sd1_len_keys) >= 92 != encoder_is_sd1: # crude version check, maybe replace with something better
+                        if (len(sd1_len_keys) >= 92) != encoder_is_sd1: # crude version check, maybe replace with something better
                             print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
                             return False
                         load_lora_convert(load_data,unet=unet, text_encoder=text_encoder, merge_strength=item_weight)
