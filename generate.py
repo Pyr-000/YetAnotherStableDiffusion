@@ -635,6 +635,8 @@ def controlnet_preprocess(image:Image, width:int, height:int, preprocessor:str=N
     elif preprocessor in AUX_PREPROCESSORS:
         processed = controlnet_aux_extractor(preprocessor,image)
         image = image if processed is None else processed
+        # controlnet_aux only accepts one value for target resolution. For now, just resize in post.
+        image = image.resize((width,height), resample=Image.Resampling.LANCZOS).convert("RGB")
     if PREPROCESS_DISPLAY_CV2:
         show_image(image, PREPROCESS_CV2_TITLE)
     image = np.array(image).astype(np.float32) / 255.0
