@@ -1443,16 +1443,19 @@ def generate_segmented(
             latents = latents.to(device="cpu")
             image_out = vae.decode(latents)
             vae = vae.to(device=prev_device)
+            return image_out
         except NotImplementedError as e:
-            if "Cannot copy out of meta tensor" in str(e):
-                # vae is offloaded through accelerate. use a temporary stand-in vae.
-                new_vae = load_models(vae_only=True)
-                new_vae = new_vae.to(device="cpu")
-                latents = latents.to(device="cpu")
-                image_out = new_vae.decode(latents)
-                del new_vae
-                cleanup_memory()
-        return image_out
+            if not ("Cannot copy out of meta tensor" in str(e) or "No operator found" in str(e)):
+                tqdm.write(f"VAE decode failed due to unknown implementation issue: {e}. Attempting decode with stand-in VAE")
+            # vae is offloaded through accelerate, or XFormers attention is enabled. use a temporary stand-in vae.
+            new_vae = load_models(vae_only=True)
+            new_vae.set_use_memory_efficient_attention_xformers(False,None)
+            new_vae = new_vae.to(device="cpu")
+            latents = latents.to(device="cpu")
+            image_out = new_vae.decode(latents)
+            del new_vae
+            cleanup_memory()
+            return image_out
 
     @torch.no_grad()
     def generate_segmented_wrapper(
