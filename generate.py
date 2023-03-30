@@ -369,10 +369,10 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                         elif Path(lora_item+".bin").exists() and Path(lora_item+".bin").is_file():
                             lora_item += ".bin"
                         else:
-                            tqdm.write(ValueError(f"LoRA path {lora_item} could not be parsed to a valid file."))
+                            tqdm.write(str(ValueError(f"LoRA path {lora_item} could not be parsed to a valid file.")))
                             continue
                     if not (lora_item.endswith(".pt") or lora_item.endswith(".safetensors") or lora_item.endswith(".bin")):
-                        tqdm.write(ValueError(f"LoRA file {lora_item} should have either '.pt'/'.bin' or '.safetensors' extension, specifying the file format. Assuming .pt for non-safetensors files."))
+                        tqdm.write(str(ValueError(f"LoRA file {lora_item} should have either '.pt'/'.bin' or '.safetensors' extension, specifying the file format. Assuming .pt for non-safetensors files.")))
                         continue
                     active_lora_paths.append(lora_item)
                     active_lora_weights.append(lora_weight)
@@ -604,12 +604,12 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
 def try_int(s:str, default:int=None):
     try:
         return int(s)
-    except ValueError:
+    except Exception:
         return default
 def try_float(s:str, default:float=None):
     try:
         return float(s)
-    except ValueError:
+    except Exception:
         return default
 
 def load_controlnet(source:str,device="cpu",cpu_offload=False):
