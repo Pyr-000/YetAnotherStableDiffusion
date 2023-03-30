@@ -1510,15 +1510,17 @@ def generate_segmented(
                     eta_seeds.append(new_supplementary['io']['eta_seed'])
                     if SUPPLEMENTARY is None:
                         SUPPLEMENTARY = new_supplementary
+                        SUPPLEMENTARY['io']['text_readback'] = [SUPPLEMENTARY['io']['text_readback']]
+                        SUPPLEMENTARY['io']['weights'] = [SUPPLEMENTARY['io']['weights']]
                     else:
                         if save_latents:
                             # reassemble stack tensor of final latents
                             SUPPLEMENTARY['latent']['final_latent'] = torch.stack([x for x in SUPPLEMENTARY['latent']['final_latent']] + [new_supplementary['latent']['final_latent'][0]])
                         # reassemble other supplementary return data
-                        SUPPLEMENTARY['io']['text_readback'] += new_supplementary['io']['text_readback']
+                        SUPPLEMENTARY['io']['text_readback'] += [new_supplementary['io']['text_readback']]
                         SUPPLEMENTARY['io']['remaining_token_count'] += new_supplementary['io']['remaining_token_count']
                         SUPPLEMENTARY['io']['time'] += new_supplementary['io']['time']
-                        SUPPLEMENTARY['io']['weights'] += new_supplementary['io']['weights']
+                        SUPPLEMENTARY['io']['weights'] += [new_supplementary['io']['weights']]
                         SUPPLEMENTARY['io']['nsfw'] = SUPPLEMENTARY['io']['nsfw'] or new_supplementary['io']['nsfw']
                     SUPPLEMENTARY['io']['seed'] = seeds
                     SUPPLEMENTARY['io']['eta_seed'] = eta_seeds
@@ -2124,8 +2126,19 @@ class QuickGenerator():
             argdict.pop("encoder_level_negative")
         if argdict["clip_skip_layers"] == "0":
             argdict.pop("clip_skip_layers")
-        if argdict["LoRA"] == None:
+        if argdict["LoRA"] is None:
             argdict.pop("LoRA")
+        if argdict["controlnet"] is None or argdict["controlnet_scheduler"] is None:
+            argdict.pop("controlnet_scheduler")
+        if argdict["controlnet"] is None:
+            argdict.pop("controlnet")
+        if argdict["static_length"] is None:
+            argdict.pop("static_length")
+            argdict.pop("remaining_token_count")
+        if not argdict["concat"]:
+            argdict.pop("concat")
+        if argdict.get("sequential", False) and len(out) < 2:
+            argdict.pop("sequential")
         full_image, full_metadata, metadata_items = save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
         if self.animate:
             # init frames by image list
