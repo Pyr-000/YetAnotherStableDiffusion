@@ -14,9 +14,11 @@ from traceback import print_exc
 from PIL import Image
 import discord
 from discord.ext import commands, tasks
+from pathlib import Path
 
 import generate
-from generate import load_models, QuickGenerator, IMPLEMENTED_SCHEDULERS, IMPLEMENTED_GS_SCHEDULES
+generate.PREPROCESS_DISPLAY_CV2 = False
+from generate import load_models, QuickGenerator, load_controlnet, image_autogrid, IMPLEMENTED_SCHEDULERS, IMPLEMENTED_GS_SCHEDULES, CONTROLNET_SHORTNAMES, IMPLEMENTED_CONTROLNET_PREPROCESSORS
 from tokens import get_discord_token
 
 # set to True to enable the /reload command.
@@ -26,6 +28,14 @@ PERMIT_RELOAD = False
 permitted_model_ids = {"default_hub":generate.model_id}
 # example: {"local_v1.4":"models/stable-diffusion-v1-4", "local_v1.5":"models/v1.5"}
 permittel_local_model_paths = {"default_local":generate.models_local_dir}
+# available controlnet shortnames
+_controlnet_options_raw = ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]
+# available preprocessors: controlnet name -> relevant preprocessor name
+_controlnet_options_preprocessors = {"canny":"canny","openpose":"detect_pose", "mlsd":"detect_mlsd", "hed":"detect_hed"}
+CONTROLNET_PREPROCESS_PREFIX = "process_"
+controlnet_options = _controlnet_options_raw + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys()]
+# shortnames -> permitted loras (local path only)
+PERMITTED_LORAS = {x.stem:str(x) for x in Path("./lora").glob("*.safetensors")}
 
 UNET_DEVICE = "cuda"
 IO_DEVICE = "cuda"
@@ -35,7 +45,7 @@ COMMAND_PREFIX = "generate"
 # --latents-half flag of generate.py: Memory usage reduction will be negligible (<1MB for 512x512), outputs will be slightly different.
 USE_HALF_LATENTS = False
 # if set to true, requests with an amount > 1 will always be generated sequentially to preserve VRAM. Will slow down generation speed for multiple images.
-RUN_ALL_IMAGES_INDIVIDUAL = False
+RUN_ALL_IMAGES_INDIVIDUAL = True
 # if set to False, images are not checked for potential NSFW content. This disables flagging them as spoilers and speeds up generation slightly.
 FLAG_POTENTIAL_NSFW = True
 # -as flag of generate.py: None to disable. Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings
@@ -44,7 +54,11 @@ ATTENTION_SLICING = 1
 CPU_OFFLOAD = False
 # setting to skip last n CLIP (text encoder) layers. Recommended for some custom models.
 CLIP_SKIP_LAYERS = 0
-
+# limit images per message, can be set to 1 to circumvent discord tile-compacting multiple images from the same message. Values above 10 are ignored, as a limit of 10 images per message is set by discord.
+IMAGES_PER_MESSAGE = 10
+# input images grid: background settings ()
+INPUT_IMAGES_BACKGROUND_COLOR = "green"
+INPUT_IMAGES_SEPARATION = 4
 
 def flatten_sublist(input_item):
     if not isinstance(input_item, list):
@@ -63,9 +77,7 @@ class command_task():
         self.response:str="no response was returned"
 
 class prompt_task():
-    def __init__(
-        self,
-        ctx:discord.commands.context.ApplicationContext,prompt:str, init_img:Image=None, generator_config:dict={}):
+    def __init__(self,ctx:discord.commands.context.ApplicationContext,prompt:str, init_img:Image=None, generator_config:dict={}, controlnet:str=None, controlnet_input:Image=None,):
         self.ctx = ctx
         self.prompt = prompt
         self.init_img = init_img
@@ -74,6 +86,14 @@ class prompt_task():
         self.generator_config["attention_slicing"] = ATTENTION_SLICING
         self.generator_config["clip_skip_layers"] = CLIP_SKIP_LAYERS
         self.generator_config["display_with_cv2"] = False
+        if controlnet is not None and controlnet.startswith(CONTROLNET_PREPROCESS_PREFIX):
+            controlnet = controlnet[len(CONTROLNET_PREPROCESS_PREFIX):] # remove the prefix
+            controlnet_preprocessor = _controlnet_options_preprocessors.get(controlnet,None) # acquire the relevant preprocessor name, if valid.
+        else:
+            controlnet_preprocessor = None
+        self.controlnet_model_name = controlnet if controlnet in CONTROLNET_SHORTNAMES else None
+        self.generator_config["controlnet_preprocessor"] = controlnet_preprocessor if controlnet_preprocessor in IMPLEMENTED_CONTROLNET_PREPROCESSORS else None
+        self.controlnet_input = controlnet_input
 
         self.datas = None
         self.response = None
@@ -88,13 +108,20 @@ class prompt_task():
             size_add = 0 if not generate.V_PREDICTION_MODEL else 256
             self.generator_config["width"] += size_add
             self.generator_config["height"] += size_add
-        generator.configure(**self.generator_config)
+        controlnet_model = load_controlnet(self.controlnet_model_name,UNET_DEVICE,CPU_OFFLOAD)
+        generator.configure(**self.generator_config, controlnet=controlnet_model)
         # run generator
         out,SUPPLEMENTARY,save_return_data = generator.one_generation(
             prompt=self.prompt,
             init_image=self.init_img,
-            save_images=SAVE_OUTPUTS_TO_DISK
+            save_images=SAVE_OUTPUTS_TO_DISK,
+            controlnet_input=self.controlnet_input,
         )
+        try: # clean up temporary controlnet model
+            setattr(generator, "controlnet", None)
+            del controlnet_model
+        except Exception:
+            pass
         # set response data on self
         self.create_response(out, SUPPLEMENTARY, save_return_data)
 
@@ -104,9 +131,20 @@ class prompt_task():
         self.filename = f"{'SPOILER_' if nsfw else 'img_'}generated"
         self.datas = []
 
+        processed_controlnet_input = SUPPLEMENTARY["io"].pop("processed_controlnet_input")
+        input_images = []
         if self.init_img is not None:
+            input_images.append(self.init_img)
+        if self.controlnet_model_name is not None and self.controlnet_input is not None:
+            input_images.append(self.controlnet_input)
+            if self.generator_config["controlnet_preprocessor"] is not None:
+                # if the image was preprocessed, also append the processing result.
+                input_images.append(processed_controlnet_input)
+        input_images = [x.resize((self.generator_config["width"],self.generator_config["height"]), resample=Image.Resampling.LANCZOS) for x in input_images]
+        input_image = None if len(input_images) < 1 else image_autogrid(input_images, fill_color=INPUT_IMAGES_BACKGROUND_COLOR, separation=INPUT_IMAGES_SEPARATION, frame_grid=True)
+        if input_image is not None:
             init_image_data = BytesIO()
-            self.init_img.save(init_image_data, "PNG")
+            input_image.save(init_image_data, "PNG")
             init_image_data.seek(0)
             self.datas.append(init_image_data)
         image_data = BytesIO()
@@ -129,7 +167,7 @@ class prompt_task():
         argdict["time"] = round(argdict["time"], 2)
         argdict.pop("attention", None)
 
-        text_readback = argdict["text_readback"]
+        text_readback = argdict.pop("text_readback")
         self.response = f"{text_readback} ```{argdict}```"
 
 task_queue = []
@@ -144,6 +182,8 @@ def main():
     global CPU_OFFLOAD
     global ATTENTION_SLICING
     global CLIP_SKIP_LAYERS
+    global IMAGES_PER_MESSAGE
+    IMAGES_PER_MESSAGE = max(min(IMAGES_PER_MESSAGE, 10),1)
     precision_target_half = DEFAULT_HALF_PRECISION
     generator = load_generator()
     print("loaded models!")
@@ -179,7 +219,7 @@ def main():
                     CPU_OFFLOAD = bool(task.command["offload"])
                     CLIP_SKIP_LAYERS = int(task.command["clip_skip_layers"])
                     del generator
-                    generator = load_generator()
+                    generator = load_generator(lora_override=task.command.get("loras",None), lora_weight_override=task.command.get("lora_weights",None))
                     task.response = f"Re-loaded generator using model {model_target}. CPU offloading is {'enabled' if CPU_OFFLOAD else 'disabled'}"
                 elif task.type == "default_negative":
                     generate.DEFAULT_NEGATIVE_PROMPT = task.command
@@ -204,12 +244,12 @@ def main():
                     task.response = f"Something went horribly wrong: {e}"
                 completed_tasks.append(task)
 
-def load_generator():
+def load_generator(lora_override=None,lora_weight_override=None):
     cleanup_devices = [IO_DEVICE,UNET_DEVICE]
     if CPU_OFFLOAD:
         cleanup_devices.append(generate.OFFLOAD_EXEC_DEVICE)
     QuickGenerator.cleanup(cleanup_devices)
-    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(precision_target_half, cpu_offloading=CPU_OFFLOAD)
+    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(precision_target_half, cpu_offloading=CPU_OFFLOAD, lora_override=lora_override, lora_weight_override=lora_weight_override)
     if not FLAG_POTENTIAL_NSFW:
         del rate_nsfw
         rate_nsfw = lambda x: False
@@ -250,16 +290,28 @@ model_names = list(permittel_local_model_paths.keys()) + list(permitted_model_id
 @discord.option("offload",bool,description="Enable CPU offloading, slowing down generation but allowing significantly larger generations",required=False,default=False)
 @discord.option("attention_slice",int,choices=[discord.OptionChoice(name=str(x), value=x) for x in [-1,0,1]],description="Set attention slicing: -1 -> None, 0 -> recommended, 1 -> max",required=False,default=1)
 @discord.option("clip_skip_layers",int,description="Skip last n layers of CLIP text encoder. Recommended for some custom models",required=False,default=0)
-async def square(ctx, model:str, offload:bool, attention_slice:int, clip_skip_layers:int):
+@discord.option("lora_1",str,description="First LoRA to load",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in PERMITTED_LORAS.keys()])
+@discord.option("lora_2",str,description="Second LoRA to load",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in PERMITTED_LORAS.keys()])
+@discord.option("lora_3",str,description="Third LoRA to load",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in PERMITTED_LORAS.keys()])
+@discord.option("lora_1_weight",float,description="Weight (alpha) of the first LoRA",required=False,default=0.5)
+@discord.option("lora_2_weight",float,description="Weight (alpha) of the second LoRA",required=False,default=0.5)
+@discord.option("lora_3_weight",float,description="Weight (alpha) of the third LoRA",required=False,default=0.5)
+async def reload(ctx, model:str, offload:bool, attention_slice:int, clip_skip_layers:int, lora_1:str, lora_2:str, lora_3:str, lora_1_weight:float, lora_2_weight:float, lora_3_weight:float,):
+    loras = []
+    lora_weights = []
+    for lora_name, lora_weight in [[lora_1,lora_1_weight],[lora_2,lora_2_weight],[lora_3,lora_3_weight]]:
+        if lora_name is not None:
+            loras.append(PERMITTED_LORAS[lora_name])
+            lora_weights.append(lora_weight)
     if not (model in permitted_model_ids or model in permittel_local_model_paths):
         await ctx.send_response(f"Requested model is not available: {model}",delete_after=60)
     else:
         await ctx.send_response(f"Acknowledged. Your task is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.")
-        task_queue.append(command_task(ctx,type="reload",command={"model":model,"offload":offload,"attention_slice":attention_slice,"clip_skip_layers":clip_skip_layers,}))
+        task_queue.append(command_task(ctx,type="reload",command={"model":model,"offload":offload,"attention_slice":attention_slice,"clip_skip_layers":clip_skip_layers,"loras":loras,"lora_weights":lora_weights}))
 
 @bot.slash_command(name="default_negative", description="Set default negative prompt (used if none specified)")
 @discord.option("negative_prompt",str,description="Default negative prompt, used if none is specified. Leave empty to reset.",required=False, default="")
-async def square(ctx, negative_prompt:str):
+async def default_negative(ctx, negative_prompt:str):
     await ctx.send_response(f"Acknowledged. Your task is number {len(task_queue)+ (1 if currently_generating else 0)} in queue.")
     task_queue.append(command_task(ctx,type="default_negative",command=negative_prompt))
 
@@ -300,9 +352,15 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("mix_concatenate",bool,description="When mixing prompts, concatenate the embeddings instead of computing their weighted sum.",required=False,default=False)
 @discord.option("eta",float,description="Higher 'eta' -> more random noise during sampling. Ignored unless scheduler=ddim",required=False,default=0.0)
 @discord.option("eta_seed",str,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default="-1")
+@discord.option("controlnet",str,description="Controlnet model for closer control over the generated image",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in controlnet_options if opt is not None]+[discord.OptionChoice(name="None",value="None")])
+@discord.option("controlnet_input",discord.Attachment,description="Input image for the controlnet",required=False,default=None)
+@discord.option("controlnet_strength",float,description="Strength (scale) of controlnet guidance",required=False,default=1.0)
+@discord.option("controlnet_schedule",str,description="Variable guidance scale schedule for controlnets. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
+
 async def advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
+    controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
 ):
     reply = run_advanced(**locals())
     await ctx.send_response(reply)
@@ -310,6 +368,7 @@ async def advanced(
 def run_advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
+    controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
 ):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
@@ -338,6 +397,8 @@ def run_advanced(
     static_length = None if static_length < 3 else static_length
 
     init_img, additional_text = get_init_image_from_attachment(init_image)
+    controlnet_input, more_add_text = get_init_image_from_attachment(controlnet_input)
+    additional_text = ("" if additional_text is None else additional_text) + ("" if more_add_text is None else more_add_text)
 
     # keyword args of QuickGenerator.configure(). Unspecified args will remain as the default.
     generator_config = {
@@ -354,9 +415,11 @@ def run_advanced(
         "gs_scheduler":gs_schedule,
         "static_length":static_length,
         "mix_mode_concat":mix_concatenate,
+        "controlnet_strength":controlnet_strength,
+        "controlnet_strength_scheduler":controlnet_schedule,
     }
 
-    task_queue.append(prompt_task(ctx, prompt=prompt, init_img=init_img, generator_config=generator_config))
+    task_queue.append(prompt_task(ctx, prompt=prompt, init_img=init_img, generator_config=generator_config, controlnet=controlnet, controlnet_input=controlnet_input))
     return f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue. {additional_text}".strip()
 
 def get_init_image_from_attachment(attachment):
@@ -398,9 +461,9 @@ async def poll():
                     next_file = files.pop(0)
                     next_size = next_file.fp.getbuffer().nbytes
                     # file size limit seems to be applied to the sum of all files, instead of to each file individually. Keeping to <=10 files within the limit (individually) can still cause HTTP413
-                    if (next_size + chunk_size > (8388608 -512)) or (len(chunk) >= 10):
+                    if (next_size + chunk_size > (8388608 -512)) or (len(chunk) >= IMAGES_PER_MESSAGE):
                         # if too much data would be present, send accumulated data and start a new chunk.
-                        await (task.ctx.edit if i==0 else task.ctx.send_followup)(content=f"{task.response}" if i==0 else f"[{i}]", files=chunk)
+                        await (task.ctx.edit if i==0 else task.ctx.send_followup)(content=f"{task.response}"[:1999] if i==0 else f"[{i}]", files=chunk)
                         sleep(0.2)
                         chunk = [next_file]
                         chunk_size = next_size
@@ -409,11 +472,11 @@ async def poll():
                         chunk.append(next_file)
                         chunk_size += next_size
                 if len(chunk) > 0:
-                    await (task.ctx.edit if i==0 else task.ctx.send_followup)(content=f"{task.response}" if i==0 else f"[{i}]", files=chunk)
+                    await (task.ctx.edit if i==0 else task.ctx.send_followup)(content=f"{task.response}"[:1999] if i==0 else f"[{i}]", files=chunk)
             else:
-                await task.ctx.edit(content=f"{task.response}", files=None, delete_after=60)
+                await task.ctx.edit(content=f"{task.response}"[:1999], files=None, delete_after=60)
         elif isinstance(task, command_task):
-            await task.ctx.edit(content=f"{task.response}")
+            await task.ctx.edit(content=f"{task.response}"[:1999])
         else:
             print(f"WARNING: unknown task type found in completed_tasks queue: {type(task)}")
         del task

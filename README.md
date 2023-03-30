@@ -250,6 +250,8 @@ Visualization of the difference between outputs in this example (highlighting of
   - `CPU_OFFLOAD` see: `-co` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
   - `PERMIT_RELOAD` can be set to `True` to allow users to switch the current model, toggle CPU offloading and set attention slicing via the `/reload` command.
     - If set to `True`, `permittel_local_model_paths` specifies a whitelist of local model names with their respective model paths (see: [Manual model install](#option-b-manual-model-install)), while `permitted_model_ids` specifies a whitelist of names with respective huggingface hub model ids (see: [Automatic model install](#option-a-automatic-model-install-via-huggingface))
+  - `PERMITTED_LORAS` specifies a whitelist of LoRA embeddings which can optionally be loaded when reloading. By default, this will be any `lora/*.safetensors` file.
+  - `INPUT_IMAGES_BACKGROUND_COLOR` can be used to set a the frame highlighting color of input images (used to visually separate inputs from outputs)
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.
 - The bot utilizes the automatic switching to image-to-image present in `generate.py`. When a valid image attachment is present, it will be used as the input for image-to-image.
 - In case of an error, the bot should respond with an error message, and should continue to function.
@@ -272,13 +274,15 @@ pip install py-cord
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution (overridden to 768x768 for SD2.x). Accepts an optional image attachment for performing image-to-image.
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
-  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <mix_concatenate> <ddim_eta> <eta_seed>`
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <mix_concatenate> <ddim_eta> <eta_seed> <controlnet> <controlnet_input> <controlnet_strength> <controlnet_schedule>`
     - `Width` and `height` are specified either as pixels (for values >64), or as a multiplier of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
-    - `scheduler` and `gs_schedule` display available options.
+    - `scheduler`, `gs_schedule`, `controlnet` and `controlnet_schedule` display available options.
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
-  - `/reload <model name> <enable cpu offload> <attention slicing> <default CLIP skip>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
+    - By default, available ControlNets will include the default options available for `-com` ([ControlNet](#controlnet)), as well as variants with the prefix `process_`, which apply the respective preprocessor (`-cop`, [ControlNet](#controlnet)) of the ControlNet model.
+  - `/reload <model name> <enable cpu offload> <attention slicing> <default CLIP skip> <lora1> <lora2> <lora3> <lora1_weight> <lora2_weight> <lora3_weight>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
+    -  Up to three of any available LoRA models can be loaded with a respective weight/alpha. If being able to load more than three LoRA embeddings is required, the command parameters can easily be extended.
   - `/default_negative <negative prompt>` can be used to set a default negative prompt (see: `-dnp`, [Additional flags](#additional-flags)). If <negative_prompt> is not specified, the default negative prompt will be reset.
 - All commands come with a short documentation of their available parameters.
 

@@ -644,12 +644,13 @@ def controlnet_preprocess(image:Image, width:int, height:int, preprocessor:str=N
         image = image if processed is None else processed
         # controlnet_aux only accepts one value for target resolution. For now, just resize in post.
         image = image.resize((width,height), resample=Image.Resampling.LANCZOS).convert("RGB")
+    processed_PIL = image
     if PREPROCESS_DISPLAY_CV2:
         show_image(image, PREPROCESS_CV2_TITLE)
     image = np.array(image).astype(np.float32) / 255.0
     image = image[None].transpose(0, 3, 1, 2)
     image = torch.from_numpy(image)
-    return image
+    return image, processed_PIL
 
 def generate_segmented(
         tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer,
@@ -1134,6 +1135,7 @@ def generate_segmented(
                 "LoRA" : None if ACTIVE_LORA is None else f"{ACTIVE_LORA}: {ACTIVE_LORA_WEIGHT}",
                 "controlnet": None if None in [controlnet, controlnet_input] else f"{getattr(controlnet, '_MODEL_NAME', 'unlabeled')}: {controlnet_strength}",
                 "controlnet_scheduler": controlnet_strength_scheduler,
+                "processed_controlnet_input": None,
             },
             "latent" : {
                 "final_latent" : None,
@@ -1256,7 +1258,8 @@ def generate_segmented(
             latents *= scheduler.init_noise_sigma
 
         if controlnet_input is not None:
-            controlnet_input = controlnet_preprocess(controlnet_input, width, height, controlnet_preprocessor)
+            controlnet_input, preprocessed_image = controlnet_preprocess(controlnet_input, width, height, controlnet_preprocessor)
+            SUPPLEMENTARY["io"]["processed_controlnet_input"] = preprocessed_image
             controlnet_input = torch.cat([controlnet_input]*len(latents)*2)
             if controlnet is None:
                 tqdm.write("Warning! Controlnet input provided, but no controlnet found!")
@@ -1610,6 +1613,7 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 @torch.no_grad()
 def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False, data_override:dict=None):
+    argdict = {k:v for k,v in argdict.items() if not k in ["processed_controlnet_input"]}
     if isinstance(imgs, list):
         if len(imgs) > 1:
             multiple_images = True
@@ -1704,7 +1708,13 @@ def show_image(img, title=None):
 
 # function to create one image containing all input images in a grid.
 # currently not intended for images of differing sizes.
-def image_autogrid(imgs, fixed_rows=None) -> Image:
+def image_autogrid(imgs, fixed_rows=None, fill_color=None, separation=None, frame_grid=False) -> Image:
+    try:
+        assert fill_color is not None
+        fill_color = ImageColor.getrgb(fill_color)
+    except Exception:
+        fill_color = GRID_IMAGE_BACKGROUND_COLOR
+    separation = try_int(separation, GRID_IMAGE_SEPARATION)
     if fixed_rows is not None:
         rows = fixed_rows
         cols = math.ceil(len(imgs)/fixed_rows)
@@ -1722,12 +1732,13 @@ def image_autogrid(imgs, fixed_rows=None) -> Image:
     # get grid item size from first image
     w, h = imgs[0].size
     # add separation to size between images as 'padding'
-    w += GRID_IMAGE_SEPARATION
-    h += GRID_IMAGE_SEPARATION
+    w += separation * (1 if not frame_grid else 2)
+    h += separation * (1 if not frame_grid else 2)
     # remove one image separation size from the overall size (no added padding after the final row/col)
-    grid = Image.new('RGB', size=(cols*w-GRID_IMAGE_SEPARATION, rows*h-GRID_IMAGE_SEPARATION), color=GRID_IMAGE_BACKGROUND_COLOR)
+    grid = Image.new('RGB', size=(cols*w-(separation if not frame_grid else 0), rows*h-(separation if not frame_grid else 0)), color=fill_color)
+    start_offset = 0 if not frame_grid else separation
     for i, img in enumerate(imgs):
-        grid.paste(img, box=(i%cols*w, i//cols*h))
+        grid.paste(img, box=(start_offset+i%cols*w, start_offset+i//cols*h))
     return grid
 
 @torch.no_grad()
