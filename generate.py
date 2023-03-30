@@ -588,7 +588,23 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
             pair_keys.append(key.replace("lora_up", "lora_down"))
 
         # update weight
-        if len(state_dict[pair_keys[0]].shape) == 4:
+        if "conv" in key:
+            lora_conv_up = torch.nn.Conv2d(curr_layer.in_channels, state_dict[pair_keys[0]].shape[1], curr_layer.kernel_size, curr_layer.stride, curr_layer.padding, bias=False)
+            lora_conv_down = torch.nn.Conv2d(state_dict[pair_keys[1]].shape[0], curr_layer.out_channels, 1, 1, bias=False)
+            lora_conv_up.weight.data = state_dict[pair_keys[0]]
+            lora_conv_down.weight.data = state_dict[pair_keys[1]]
+            setattr(curr_layer,"lora_conv_up", lora_conv_up)
+            setattr(curr_layer,"lora_conv_down", lora_conv_down)
+            # apply default conv forward, then add lora conv forward results, at merge strength
+            curr_layer:torch.nn.Conv2d
+            def hook(module, input, output):
+                # input will be a tuple of "only the positional arguments given to the module", which should only be the input tensor itself.
+                if isinstance(input, tuple) and len(input) == 1:
+                    input = input[0]
+                return output + module.lora_conv_up(module.lora_conv_down(input)) * merge_strength
+            curr_layer.register_forward_hook(hook)
+
+        elif len(state_dict[pair_keys[0]].shape) == 4:
             weight_up = state_dict[pair_keys[0]].squeeze(3).squeeze(2).to(torch.float32)
             weight_down = state_dict[pair_keys[1]].squeeze(3).squeeze(2).to(torch.float32)
             curr_layer.weight.data += merge_strength * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
@@ -600,6 +616,8 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
         # update visited list
         for item in pair_keys:
             visited.append(item)
+        #except Exception as e:
+            # print(f"LoRA converter {e} | {key} | {curr_layer.weight.data.shape} | {state_dict[pair_keys[0]].shape} | {state_dict[pair_keys[1]].shape}")
 
 def try_int(s:str, default:int=None):
     try:
