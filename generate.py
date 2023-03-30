@@ -612,14 +612,21 @@ def try_float(s:str, default:float=None):
     except Exception:
         return default
 
-def load_controlnet(source:str,device="cpu",cpu_offload=False):
+def load_controlnet(source:str,device="cpu",cpu_offloading=False):
     if source in [None, ""]:
         return None
     source = CONTROLNET_SHORTNAMES.get(source, source)
+    controlnet = None
     try:
         controlnet = ControlNetModel.from_pretrained(source, torch_dtype=torch.float16).to(device)
-        if cpu_offload:
-            cpu_offload(controlnet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        if cpu_offloading:
+            if not is_accelerate_available():
+                print("accelerate library is not installed! Unable to utilise CPU offloading!")
+                cpu_offloading=False
+            else:
+                # NOTE: this only offloads parameters, but not buffers by default.
+                from accelerate import cpu_offload
+                cpu_offload(controlnet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         recurse_set_xformers(controlnet)
         setattr(controlnet, "_MODEL_NAME", source)
     except Exception as e:
@@ -1294,8 +1301,9 @@ def generate_segmented(
                     def batch_idx(x, i):
                         return None if x is None else torch.stack([x[i]])
                     noise_pred = torch.cat([unet(
-                        batch_idx(latent_model_input,i).to(cast_unet_args), t.to(cast_unet_args), encoder_hidden_states=batch_idx(text_embeddings,i).to(cast_unet_args),
-                        down_block_additional_residuals=batch_idx(down_block_residuals).to(cast_unet_args), mid_block_additional_residual=batch_idx(mid_block_residual).to(cast_unet_args),
+                        batch_idx(latent_model_input,i).to(**cast_unet_args), t.to(**cast_unet_args), encoder_hidden_states=batch_idx(text_embeddings,i).to(**cast_unet_args),
+                        down_block_additional_residuals=None if down_block_residuals is None else batch_idx(down_block_residuals,i).to(**cast_unet_args),
+                        mid_block_additional_residual=None if mid_block_residual is None else mid_block_residual.to(**cast_unet_args),
                     )["sample"] for i in range(len(latent_model_input))])
 
             # perform guidance
