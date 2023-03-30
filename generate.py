@@ -601,7 +601,8 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
                 # input will be a tuple of "only the positional arguments given to the module", which should only be the input tensor itself.
                 if isinstance(input, tuple) and len(input) == 1:
                     input = input[0]
-                return output + module.lora_conv_up(module.lora_conv_down(input)) * merge_strength
+                lora_dtype = lora_conv_up.weight.data.dtype
+                return (output.to(lora_dtype) + module.lora_conv_up(module.lora_conv_down(input.to(lora_dtype))) * merge_strength).to(input.dtype)
             curr_layer.register_forward_hook(hook)
 
         elif len(state_dict[pair_keys[0]].shape) == 4:
