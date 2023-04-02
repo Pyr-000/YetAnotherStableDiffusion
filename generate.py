@@ -1632,7 +1632,7 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
 # can be called with perform_save=False to generate output image (grid_image when multiple inputs are given) and metadata
 @torch.no_grad()
 def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False, data_override:dict=None):
-    argdict = {k:v for k,v in argdict.items() if not k in ["processed_controlnet_input"]}
+    argdict = None if argdict is None else {k:v for k,v in argdict.items() if not k in ["processed_controlnet_input"]}
     if isinstance(imgs, list):
         if len(imgs) > 1:
             multiple_images = True
