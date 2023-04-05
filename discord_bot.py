@@ -18,6 +18,7 @@ from pathlib import Path
 
 import generate
 generate.PREPROCESS_DISPLAY_CV2 = False
+generate.SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
 from generate import load_models, QuickGenerator, load_controlnet, image_autogrid, IMPLEMENTED_SCHEDULERS, IMPLEMENTED_GS_SCHEDULES, CONTROLNET_SHORTNAMES, IMPLEMENTED_CONTROLNET_PREPROCESSORS
 from tokens import get_discord_token
 
@@ -46,8 +47,15 @@ COMMAND_PREFIX = "generate"
 USE_HALF_LATENTS = False
 # if set to true, requests with an amount > 1 will always be generated sequentially to preserve VRAM. Will slow down generation speed for multiple images.
 RUN_ALL_IMAGES_INDIVIDUAL = True
-# if set to False, images are not checked for potential NSFW content. This disables flagging them as spoilers and speeds up generation slightly.
+# if set to False, images are not checked for potential NSFW content. THIS SHOULD NOT BE USED unless additional content checking is employed downstream. Instead, set the appropriate processing level for your use-case.
 FLAG_POTENTIAL_NSFW = True
+# minimum safety processing level. See documentation of the '-spl' flag of generate.py
+SAFETY_PROCESSING_LEVEL_NSFW_CHANNEL = 2
+SAFETY_PROCESSING_LEVEL_SFW_CHANNEL = 5
+# can be set to True to permit usage of the bot in SFW channels, with the selected safety processing level applied.
+# ENABLE AT YOUR OWN RISK! This will require additional moderation and content screening. False negatives can occur in the safety checker, which can cause potentially NSFW content to be sent in SFW channels.
+PERMIT_SFW_CHANNEL_USAGE = False
+assert not PERMIT_SFW_CHANNEL_USAGE or (FLAG_POTENTIAL_NSFW and SAFETY_PROCESSING_LEVEL_SFW_CHANNEL >= 3)
 # -as flag of generate.py: None to disable. Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings
 ATTENTION_SLICING = 1
 # -co flag of generate.py: CPU offloading via accelerate. Should enable compatibility with minimal VRAM at the cost of speed.
@@ -371,7 +379,12 @@ def run_advanced(
     controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
 ):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
-        return "Refusing, as channel is not marked as NSFW. While images are sent as spoilers if potential NSFW content is detected, there is no NSFW filter in effect."
+        if not PERMIT_SFW_CHANNEL_USAGE:
+            return "Refusing, as channel is not marked as NSFW and usage in SFW channels is disabled!"
+        else:
+            safety_processing_level = SAFETY_PROCESSING_LEVEL_SFW_CHANNEL
+    else:
+        safety_processing_level = SAFETY_PROCESSING_LEVEL_NSFW_CHANNEL
     global task_queue
 
     # process value limits
@@ -417,6 +430,7 @@ def run_advanced(
         "mix_mode_concat":mix_concatenate,
         "controlnet_strength":controlnet_strength,
         "controlnet_strength_scheduler":controlnet_schedule,
+        "safety_processing_level":safety_processing_level,
     }
 
     task_queue.append(prompt_task(ctx, prompt=prompt, init_img=init_img, generator_config=generator_config, controlnet=controlnet, controlnet_input=controlnet_input))

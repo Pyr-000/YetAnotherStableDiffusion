@@ -11,7 +11,7 @@ import torch
 # from torch import autocast
 from transformers import models as transfomers_models
 from diffusers import models as diffusers_models
-from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor
+from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, CLIPSegProcessor, CLIPSegForImageSegmentation
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel
 from diffusers.utils import is_accelerate_available
@@ -70,6 +70,10 @@ GRID_IMAGE_SEPARATION = 1
 # background color of grid images. Accepts any color definition understood by 'PIL.ImageColor', including hex (#rrggbb) and common HTML color names ("darkslategray"). Will be visible both between images (separation) and in empty grid spots (e.g. 8 images on a 3x3 grid)
 GRID_IMAGE_BACKGROUND_COLOR = "#2A2B2E"
 assert ImageColor.getrgb(GRID_IMAGE_BACKGROUND_COLOR) # check requested color for validity before running the script.
+# the non-refined rd64 model variant produces less precise results, but this may yield slightly more reliable behavior with the current thresholding method
+SAFETY_PROCESSOR_CLIPSEG_MODEL = "CIDAS/clipseg-rd64-refined" # "CIDAS/clipseg-rd64" # "CIDAS/clipseg-rd16"
+# debug option, displays blur heatmaps via cv2 when the safety processor applies masked blur.
+SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
 
 OUTPUT_DIR_BASE = "outputs"
 OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
@@ -127,7 +131,8 @@ def parse_args():
     parser.add_argument("--animate", action="store_true", help="save animation of generation process. Very slow unless --io_device is set to \"cuda\"", dest="animate")
     parser.add_argument("-in", "--interpolate", nargs=2, type=str, help="Two image paths for generating an interpolation animation", default=None, dest='interpolation_targets')
     parser.add_argument("-inx", "--interpolate_extend", type=float, help="Interpolate beyond the specified images in the latent space by the given factor. Disabled with 0. Unlikely to provide useful results.", default=0, dest='interpolation_extend')
-    parser.add_argument("--no-check-nsfw", action="store_true", help="NSFW check will only print a warning and add a metadata label if enabled. This flag disables NSFW check entirely to speed up generation.", dest="no_check")
+    parser.add_argument("--no-check-nsfw", action="store_true", help="Disable NSFW check entirely, slightly speeding up generation.", dest="no_check")
+    parser.add_argument("-spl", "--safety-processing-level", type=int, default=3, help="Set level of content safety processing. 7/6 functions like the diffusers pipeline default, 5/4/3 applies a local blur, 2/1 does not process images outside of special labels.", dest="safety_processing_level")
     parser.add_argument("-pf", "--prompts-file", type=str, help="Path of file containing prompts. One line per prompt.", default=None, dest='prompts_file')
     parser.add_argument("-ic", "--image-cycles", type=int, help="Repetition count when using image2image. Will interpolate between multiple prompts when || is used.", default=0, dest='img_cycles')
     parser.add_argument("-cni", "--cycle-no-save-individual", action="store_false", help="Disables saving of individual images in image cycle mode.", dest="image_cycle_save_individual")
@@ -245,6 +250,7 @@ def main():
         args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule,
         args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
         controlnet_model, args.controlnet_strength, args.controlnet_preprocessor, args.controlnet_schedule,
+        args.safety_processing_level
     )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
@@ -515,7 +521,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     print(f"Encoder hidden layer count (max CLIP skip): {MAX_CLIP_SKIP}")
 
     #rate_nsfw = get_safety_checker(cpu_offloading=cpu_offloading)
-    rate_nsfw = get_safety_checker(cpu_offloading=False)
+    rate_nsfw = SafetyChecker(cpu_offloading=False)
     concepts_path = Path(concepts_dir)
     available_concepts = [f for f in concepts_path.rglob("*.bin")] + [f for f in concepts_path.rglob("*.pt")]
     if len(available_concepts) > 0:
@@ -919,6 +925,21 @@ def generate_segmented(
             for i in range(1,uncond.shape[1]-1):
                 uncond[:,i] = uncond[:,0] if i%2==0 else uncond[:,-1]
             return uncond
+        elif prompt == "<safety_concepts>": # could be used as negative prompt?
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
+            embeddings = globals().get("_safety_embeddings", None)
+            if embeddings is None or not "concepts" in embeddings:
+                return uncond
+            else:
+                # place between startoftext and endoftext vectors of uncond, rebuild batch dim
+                return torch.stack([torch.stack([uncond[0][0]] + [x for x in embeddings["concepts"].clone().to(uncond.device, uncond.dtype)] + [uncond[0][1]])])
+        elif prompt == "<safety_special>": # could be used as negative prompt?
+            uncond, _ = perform_text_encode("", **run_encode_kwargs)
+            embeddings = globals().get("_safety_embeddings", None)
+            if embeddings is None or not "special" in embeddings:
+                return uncond
+            else:
+                return torch.stack([torch.stack([uncond[0][0]] + [x for x in embeddings["special"].clone().to(uncond.device, uncond.dtype)] + [uncond[0][1]])])
         return None
 
     def apply_pad_tensor_to_embedding(in_tensor:torch.Tensor, pad_source:torch.Tensor, encapsulated=True):
@@ -1385,12 +1406,12 @@ def generate_segmented(
             image = (image.sample / 2 + 0.5).clamp(0, 1)
             #image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
             image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-            if should_rate_nsfw:
-                has_nsfw = rate_nsfw(image)
-            else:
-                has_nsfw = False
             images = (image * 255).round().astype("uint8")
             pil_images = [Image.fromarray(image) for image in images]
+            if should_rate_nsfw:
+                has_nsfw = rate_nsfw(pil_images)
+            else:
+                has_nsfw = False
             return pil_images, has_nsfw
 
         pil_images, has_nsfw = to_pil(image)
@@ -1775,37 +1796,79 @@ def image_autogrid(imgs, fixed_rows=None, fill_color=None, separation=None, fram
 
 @torch.no_grad()
 def get_safety_checker(device="cpu", safety_model_id = "CompVis/stable-diffusion-safety-checker", cpu_offloading=False):
-    if cpu_offloading:
-        if not is_accelerate_available():
-            print("accelerate library is not installed! Unable to utilise CPU offloading!")
-            cpu_offloading=False
-        else:
-            # NOTE: this only offloads parameters, but not buffers by default.
-            from accelerate import cpu_offload
-    safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
-    safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
-    #safety_feature_extractor.to(device)
-    if cpu_offloading:
-        cpu_offload(safety_checker, OFFLOAD_EXEC_DEVICE, offload_buffers=False)
-    else:
-        safety_checker.to(device)
-    def numpy_to_pil(images):
-        if images.ndim == 3:
-            images = images[None, ...]
-        images = (images * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
-        return pil_images
-    def check_safety(x_image_in):
-        x_image = x_image_in.copy()
-        safety_checker_input = safety_feature_extractor(numpy_to_pil(x_image), return_tensors="pt")
-        safety_checker_input.to(device)
-        x_checked_image, has_nsfw_concept = safety_checker(images=x_image, clip_input=safety_checker_input.pixel_values)
-        if True in has_nsfw_concept:
-            tqdm.write("Warning: potential NSFW content detected!")
-        assert x_checked_image.shape[0] == len(has_nsfw_concept)
-        return True in has_nsfw_concept
+    # backwards compatibility
+    return SafetyChecker(device=device, safety_model_id=safety_model_id, cpu_offloading=cpu_offloading)
 
-    return check_safety
+class SafetyChecker():
+    # Reverse maps of (segmentation model) tokenized representations for a given safety checker "bad concept" embedding. Used to inform the segmentation model when applying masked blur processing.
+    # Obtained via CLIP comparison of a large dictionary against given concept embeddings. Resulting concept labels line up with https://github.com/LAION-AI/CLIP-based-NSFW-Detector
+    _safety_checker_idx_concepts = [[6749], [16630], [5937], [272, 279, 266], [11478], [19847], [817, 333], [9554], [13015, 1366], [11478, 2533], [33228, 4750], [569, 30951], [665, 868], [44774], [8626, 44774], [11478, 37637], [1076, 3373]]
+    @torch.no_grad()
+    def __init__(self, device="cpu", safety_model_id = "CompVis/stable-diffusion-safety-checker", cpu_offloading=False):
+        self.device = device
+        if cpu_offloading:
+            if not is_accelerate_available():
+                print("accelerate library is not installed! Unable to utilise CPU offloading!")
+                cpu_offloading=False
+            else:
+                # NOTE: this only offloads parameters, but not buffers by default.
+                from accelerate import cpu_offload
+        self.safety_feature_extractor = AutoFeatureExtractor.from_pretrained(safety_model_id)
+        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(safety_model_id)
+        self.safety_processor = SafetyProcessor()
+        globals()["_safety_embeddings"] = {"concepts":self.safety_checker.concept_embeds.cpu().clone(),"special":self.safety_checker.special_care_embeds.cpu().clone()}
+        #safety_feature_extractor.to(device)
+        if cpu_offloading:
+            cpu_offload(self.safety_checker, OFFLOAD_EXEC_DEVICE, offload_buffers=False)
+        else:
+            self.safety_checker.to(self.device)
+
+    def eval_concept_scores(self, cos_distances, thresholds, adjustment=0.0):
+        results = {"scores":[None]*len(cos_distances), "detected_concepts":[]}
+        for concept_idx in range(len(cos_distances)):
+            concept_cos = cos_distances[concept_idx]
+            concept_threshold = thresholds[concept_idx].item()
+            results["scores"][concept_idx] = round(concept_cos - concept_threshold, 3)
+            if results["scores"][concept_idx] > adjustment:
+                results["detected_concepts"].append(concept_idx)
+        return results
+
+    @torch.no_grad()
+    def process_features(self, images):
+        # adapted from the default safety checker code: Diffusers pipelines/stable_diffusion/safety_checker > StableDiffusionSafetyChecker
+        safety_checker_input = self.safety_feature_extractor(images, return_tensors="pt").to(self.device)
+        cosine_distance = lambda image_embeds, text_embeds: torch.mm(torch.nn.functional.normalize(image_embeds), torch.nn.functional.normalize(text_embeds).t())
+        image_embeds = self.safety_checker.visual_projection(self.safety_checker.vision_model(safety_checker_input.pixel_values)[1])
+        special_cos_dist = cosine_distance(image_embeds, self.safety_checker.special_care_embeds).cpu().float().numpy()
+        cos_dist = cosine_distance(image_embeds, self.safety_checker.concept_embeds).cpu().float().numpy()
+        results_per_image = []
+        for i in range(image_embeds.shape[0]):
+            special_care_results = self.eval_concept_scores(special_cos_dist[i], self.safety_checker.special_care_embeds_weights)
+            nsfw_concepts_adj = 0.0 if len(special_care_results["detected_concepts"]) == 0 else 0.01
+            nsfw_concept_results = self.eval_concept_scores(cos_dist[i], self.safety_checker.concept_embeds_weights, nsfw_concepts_adj)
+            rating_level = (0 if len(nsfw_concept_results["detected_concepts"]) == 0 else 1) * (1 if len(special_care_results["detected_concepts"]) == 0 else 2)
+            results_per_image.append({"special_care":special_care_results,"nsfw_concepts":nsfw_concept_results,"nsfw":rating_level})
+        return results_per_image
+
+    @torch.no_grad()
+    def check_safety(self, images, level_override=None):
+        eval_results = self.process_features(images)
+        assert len(images) == len(eval_results)
+        if any([x["nsfw"]>0 for x in eval_results]):
+            detected_nsfw_concepts = [item["nsfw_concepts"]["detected_concepts"] for item in eval_results]
+            tqdm.write(f"Potential NSFW content detected! ({len([x['nsfw'] for x in eval_results if x['nsfw']>0])} instances, levels {[x['nsfw'] for x in eval_results]}, labels {detected_nsfw_concepts})")
+        for image,result in zip(images, eval_results):
+            # Due to potential detection reliability issues with using CLIPSeg directly on "bad concept" labels, the standard safety checker is first employed to detect label presence.
+            # Then, CLIPSeg is utilised to generate a blur mask for any areas most likely to contain detected labels, regardless of their absolute detection values.
+            flagged_labels = result["nsfw_concepts"]["detected_concepts"]
+            if len(flagged_labels) > 0:
+                detected_labels = [SafetyChecker._safety_checker_idx_concepts[idx] for idx in flagged_labels] # safety_checker_idx_concepts
+                self.safety_processor.process_image(image, result["nsfw"], detected_labels, level_override=level_override)
+        return any([x["nsfw"]>0 for x in eval_results])
+    def __call__(self, *args, **kwargs):
+        # backwards compatiblity, replacing the former get_safety_checker(*) with SafetyChecker(*)
+        return self.check_safety(*args, **kwargs)
+
 
 # return LAB colorspace array for image
 def image_to_correction_target(img):
@@ -1997,6 +2060,7 @@ class QuickGenerator():
             "controlnet_strength":1.0,
             "controlnet_preprocessor":None,
             "controlnet_strength_scheduler":None,
+            "safety_processing_level":3,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -2035,6 +2099,7 @@ class QuickGenerator():
             controlnet_strength:float=placeholder,
             controlnet_preprocessor:str=placeholder,
             controlnet_strength_scheduler:str=placeholder,
+            safety_processing_level:int=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
@@ -2068,6 +2133,12 @@ class QuickGenerator():
                 self.gs_scheduler = gs_scheduler
             else:
                 print(f"unknown gs schedule requested: '{gs_scheduler}' options are {IMPLEMENTED_GS_SCHEDULES}")
+        if not isinstance(safety_processing_level, Placeholder):
+            self.safety_processing_level = safety_processing_level
+            if not isinstance(self._rate_nsfw, SafetyChecker):
+                print(f"WARNING: Safety processing level can not be switched to {safety_processing_level} as requested! No SafetyChecker is loaded, checking may be disabled.")
+            else:
+                self._rate_nsfw.safety_processor.set_processing_level(safety_processing_level)
 
 
         if not isinstance(attention_slicing, Placeholder) and not (attention_slicing==self.attention_slicing):
@@ -2323,6 +2394,142 @@ def controlnet_aux_extractor(detector_model, *args, **kwargs):
     del model
     gc.collect()
     return results
+
+class SafetyCheckerProcessingLevel():
+    def __init__(self, quantile:float=0.9, threshold_range:float=0.66, remove:bool=False):
+        self.quantile = quantile
+        self.threshold_range = threshold_range
+        self.remove = remove
+class SafetyProcessorProcessingLevels():
+    remove = SafetyCheckerProcessingLevel(0.0, 1.0, True) # default safety checker action
+    full_blur = SafetyCheckerProcessingLevel(0.0, 1.0, False) # alternative to 'remove'
+    strong_masked_blur = SafetyCheckerProcessingLevel(0.75, 0.66, False)
+    masked_blur = SafetyCheckerProcessingLevel(0.95, 0.66, False)
+    ignore = SafetyCheckerProcessingLevel(1.0, -1, False)
+    def get_level(level_name:str):
+        return getattr(SafetyProcessorProcessingLevels, level_name, SafetyProcessorProcessingLevels.strong_masked_blur)
+
+class SafetyProcessor():
+    def __init__(self, processing_level:int=3, clipseg_model:str=SAFETY_PROCESSOR_CLIPSEG_MODEL, device=IO_DEVICE):
+        self.clipseg_model = clipseg_model
+        self.device=device
+        self.segmentation_preprocessor = None
+        self.segmentation_model = None
+        self.set_processing_level(processing_level)
+    def set_processing_level(self, level:int=3):
+        self._processing_level = level
+        if level == 0:
+            print("WARNING: Safety processing level set to 0, disabling processing entirely! Setting this is generally NEVER recommended.")
+        elif level <= 2:
+            print("WARNING: Safety processing level set below 3. This will permit any potentially NSFW outputs as long as no special labels are detected!")
+        levels = {
+            0:["ignore", "ignore"],
+            1:["ignore", "masked_blur"],
+            2:["ignore", "strong_masked_blur"],
+            3:["masked_blur", "strong_masked_blur"],
+            4:["masked_blur", "full_blur"],
+            5:["strong_masked_blur", "full_blur"],
+            6:["full_blur", "full_blur"], # alternative to "remove"
+            7:["remove", "remove"], # default behavior of a StableDiffusionPipeline
+            -1:["masked_blur", "masked_blur"], # debug
+            -2:["strong_masked_blur", "strong_masked_blur"], # debug
+        }
+        # if the requested level does not exist, use one of the maximum levels (6)
+        self.processing_by_rating = [SafetyProcessorProcessingLevels.get_level(level_name) for level_name in levels.get(self._processing_level, 6)]
+        # only load the models when they actually get utilised.
+        #if self._processing_level != 0 and None in [self.segmentation_preprocessor, self.segmentation_model]:
+        #    self.load_missing_model()
+    def load_missing_model(self):
+        if self.segmentation_preprocessor is None:
+            self.segmentation_preprocessor = CLIPSegProcessor.from_pretrained(self.clipseg_model)
+        if self.segmentation_model is None:
+            # do not move the model to the device yet - keep it in CPU memory while it remains unused. It will temporarily be moved to the device when processing.
+            self.segmentation_model = CLIPSegForImageSegmentation.from_pretrained(self.clipseg_model)
+
+    def process_image(self, img:Image.Image, nsfw_rating:int, detected_labels:list, full_blur_fallback:bool=False, level_override:int=None):
+        if level_override is not None:
+            # temporarily adjust level, produce an output, and adjust the level back.
+            previous_level = self._processing_level
+            self.set_processing_level(level_override)
+            results = self.process_image(img=img,nsfw_rating=nsfw_rating,detected_labels=detected_labels,full_blur_fallback=full_blur_fallback)
+            self.set_processing_level(previous_level)
+            return results
+        if nsfw_rating == 0:
+            return img
+        processing_level = self.processing_by_rating[nsfw_rating-1] # rating 1 is at index 0, rating 2 at index 1
+
+        if processing_level.threshold_range < 0 or processing_level.quantile > 1:
+            return img
+        elif processing_level.remove:
+            img.paste(GRID_IMAGE_BACKGROUND_COLOR, [0,0,img.size[0],img.size[1]])
+            return img
+        elif processing_level.threshold_range >= 1.0 or processing_level.quantile <= 0 or full_blur_fallback:
+            blurred = cv2.resize(cv2.resize(np.asarray(img), [16,16]), img.size, interpolation=cv2.INTER_AREA)
+            blurred = Image.fromarray(blurred.round().astype("uint8"))
+            img.paste(blurred)
+            return blurred
+        else:
+            if len(detected_labels) == 0:
+                print("WARNING: Safety processor was requested to perform masked blur, but no labels were provided! Performing full blur.")
+                return self.process_image(img=img, nsfw_rating=nsfw_rating, detected_labels=detected_labels, full_blur_fallback=True, level_override=level_override)
+            segment_predictions = self.get_segmentation(img, detected_labels)
+            blurred = self.process_masked_blur(img, segment_predictions, processing_level)
+            img.paste(blurred)
+            return blurred
+
+    @torch.no_grad()
+    def get_segmentation(self, img:Image.Image, prompts:list):
+        try:
+            if None in [self.segmentation_preprocessor, self.segmentation_model]:
+                self.load_missing_model()
+            self.segmentation_model.to(self.device)
+            prediction_maps = []
+            for prompt_item in prompts:
+                # run sequentially to minimize memory requirement on multiple prompts
+                if isinstance(prompt_item, list) and all([isinstance(x, int) for x in prompt_item]):
+                    # if the prompt is a list of int, treat it as a token id list. Place it between the start and end tokens generated by an empty prompt, and re-pack batch dim.
+                    model_inputs = self.segmentation_preprocessor(text=[""], images=[img], return_tensors="pt")
+                    model_inputs["input_ids"] = torch.LongTensor([[model_inputs["input_ids"][0][0], *prompt_item, model_inputs["input_ids"][0][1]]])
+                    model_inputs["attention_mask"] = torch.LongTensor([[1]*len(model_inputs["input_ids"][0])]) # Amended attention mask length
+                else:
+                    # the input data consists of very short, individually batched prompts. Skip padding to max length.
+                    model_inputs = self.segmentation_preprocessor(text=[prompt_item], images=[img], return_tensors="pt") # , padding="max_length")
+                model_inputs = {k:v.to(self.device) for k,v in model_inputs.items()}
+                # apply sigmoid activation
+                raw_prediction = self.segmentation_model(**model_inputs).logits.cpu()
+                prediction_maps.append(torch.sigmoid(raw_prediction))
+            self.segmentation_model.to("cpu")
+            return prediction_maps
+        except RuntimeError as e:
+            if 'out of memory' in str(e) and self.device !="cpu":
+                self.device="cpu"
+                return self.get_segmentation(img,prompts)
+            else:
+                raise e
+    def process_masked_blur(self, img:Image.Image, location_predictions:torch.Tensor, processing_level:SafetyCheckerProcessingLevel):
+        # accumulate every relevant mask
+        mask = None
+        for pred in location_predictions:
+            data = pred.cpu().float().numpy()
+            threshold = np.quantile(data,processing_level.quantile)*processing_level.threshold_range # set threshold: e.g. within 33% (absolute value) of the 98th percentile
+            threshold = min(threshold, 0.18) # set a lower bound of (absolute) confidence for the threshold.
+            new_mask = (data>threshold) * 1.0 # mask any pixels within the threshold
+            mask = new_mask if mask is None else mask+new_mask
+        # cumulatively stack masks. Expand mask borders with a blur, resulting values will be thresholded to 1. (Expansion equivalent to the kernel radius, on unscaled segmentation outputs)
+        mask = cv2.GaussianBlur(mask, (33,33), 5)
+        mask = (mask>0.01) * 1.0
+
+        blursize = (min(round(img.size[0]/24+2), 24), min(round(img.size[1]/24+2), 24)) # global size for pixelation blur of masked areas # (16,16)
+        #mask = cv2.resize(mask, dsize=blursize, interpolation=cv2.INTER_LANCZOS4) # decreasing mask resolution could be used to create more coarse, less detailed mask
+        blur_mask = cv2.resize(mask, dsize=img.size, interpolation=cv2.INTER_AREA) # resize mask to image size, use a smooth/blurry interpolation to achieve some edge roll-off and avoid artifacting
+        blur_mask = cv2.blur(blur_mask, (9,9)) # apply blur after scaling to improve edge roll-off
+        if SAFETY_PROCESSOR_DISPLAY_MASK_CV2:
+            show_image(Image.fromarray((blur_mask*255).round().astype("uint8")), "SafetyProcessor mask")
+        # If something other than local pixelation blur is desired, this image data (blurred_data) should be replaced! (e.g. replacing with a flat color, smooth blur, image noise, etc.)
+        blurred_data = cv2.resize(cv2.resize(np.asarray(img), blursize, interpolation=cv2.INTER_AREA), img.size, interpolation=cv2.INTER_AREA) # apply pixelation blur to source image (global)
+        blur_mask = np.stack([blur_mask]*3, axis=-1) # stack mask to 3 values per pixel
+        resulting = blur_mask*blurred_data + np.asarray(img)*(1-blur_mask) # merge the original and blurred images based on the mask
+        return Image.fromarray(resulting.round().astype("uint8"))
 
 def choose_int(upper_bound:int):
     if upper_bound <= 1:
