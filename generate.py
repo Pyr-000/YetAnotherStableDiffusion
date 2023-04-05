@@ -653,7 +653,7 @@ def load_controlnet(source:str,device="cpu",cpu_offloading=False):
         print(f"failed to load controlnet: {e}")
     return controlnet
 
-def controlnet_preprocess(image:Image, width:int, height:int, preprocessor:str=None):
+def controlnet_preprocess(image:Image.Image, width:int, height:int, preprocessor:str=None):
     image = image.resize((width,height), resample=Image.Resampling.LANCZOS)
     image = image.convert("RGB")
     if preprocessor == "canny":
@@ -751,7 +751,7 @@ def generate_segmented(
         return f" ({prev_weight}{';'+str(prev_skip) if prev_skip>0 else ''}@{segment_text})"
     def prompt_weight_summary_string(token_weights, token_skips, text_input):
         summary = ""
-        if len(token_weights) > 2: # do not run processing on empty prompts.
+        if True: #len(token_weights) > 2: # do not run processing on empty prompts.
             prev_seg=(token_weights[1],token_skips[1])
             prev_seg_count = 1
             for i,seg in enumerate(zip(token_weights,token_skips)):
@@ -864,7 +864,10 @@ def generate_segmented(
         io_data["remaining_token_count"] = [max(remaining, trailing) for (remaining,trailing) in zip(io_data["remaining_token_count"], trailing_char_counts)]
         io_data["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in io_data["text_readback"]]
         #io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist() # unused, as the text encoders of both SD1.x and SD2.x lack a "use_attention_mask" attribute denoting manual attention maps.
-        io_data["weights"] = [prompt_weight_summary_string(token_weights, token_skips, text_input)]
+        try:
+            io_data["weights"] = [prompt_weight_summary_string(token_weights, token_skips, text_input)]
+        except:
+            io_data["weights"] = ""
 
         chunk_count = (len(text_input.input_ids[0]) // tokenizer.model_max_length) + (1 if (len(text_input.input_ids[0])%tokenizer.model_max_length) > 0 else 0)
         text_chunks = torch.chunk(text_input.input_ids[0], chunk_count)
@@ -942,17 +945,19 @@ def generate_segmented(
         b = b if not (a.shape[1] > b.shape[1]) else apply_pad_tensor_to_embedding(b,torch.zeros_like(a))
         return a,b
 
-    def add_encoding_sum(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_from_prev:bool, concat_direct_to_next:bool):
+    def add_encoding_sum(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_to_prev:bool):
         next_encoding *= next_multiplier
         # if the length of the current sum does not match the length of the next encoding, pad the shorter tensor.
         current_sum, next_encoding = equalize_embedding_lengths(current_sum, next_encoding)
         return (next_encoding if current_sum is None else current_sum + next_encoding), current_multiplier+next_multiplier
 
-    def add_encoding_cat(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_from_prev:bool, concat_direct_to_next:bool):
+    def add_encoding_cat(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_to_prev:bool):
         next_encoding *= next_multiplier
-        # Remove startoftext vector if previous item was a direct concat. Remove endoftext if this item is a direct concat
-        next_encoding = next_encoding if not concat_direct_from_prev else next_encoding[:,1:]
-        next_encoding = next_encoding if not concat_direct_to_next else next_encoding[:,:-1]
+        # Remove startoftext and endoftext vectors if this is a direct concat.
+        if concat_direct_to_prev and current_sum is not None:
+            next_encoding = next_encoding[:,1:] # remove startoftext from new embedding
+            current_sum = current_sum[:,:-1] # remove trailing endoftext from prev embedding
+        #next_encoding = next_encoding if not concat_direct_to_next else next_encoding[:,:-1]
         # concat in dim 1 - skip batch dim. Return multiplier as 1 - no division by a scale sum should be performed in concat mode.
         return (next_encoding if current_sum is None else torch.cat([current_sum,next_encoding],dim=1)), 1
 
@@ -995,7 +1000,7 @@ def generate_segmented(
                 multiplier_sum_positive = 0
                 multiplier_sum_negative = 0
                 new_io_data = io_data_template()
-                concat_direct_from_prev = False
+                concat_direct_to_prev = False
                 for i, segment in enumerate(prompt_segments):
                     if i % 2 == 0:
                         next_encoding, next_io_data = perform_text_encode(segment, **perform_encode_kwargs)
@@ -1011,17 +1016,25 @@ def generate_segmented(
                         # add either to positive, or to negative encodings & multipliers
                         is_negative_multiplier = multiplier < 0
                         # in dynamic length mode, concatenate prompts together instead of mixing. Otherwise, add new encodings to respective sum based on their multiplier.
-                        add_encoding = add_encoding_cat if mix_mode_concat else add_encoding_sum
+                        if mix_mode_concat:
+                            add_encoding = add_encoding_cat
+                        else:
+                            if not concat_direct_to_prev:
+                                add_encoding = add_encoding_sum
+                            else:
+                                # if ;+; was passed in sum mode, perform a "normal concatenation" for this embedding join instead of a sum.
+                                concat_direct_to_prev=False # disable direct concat for this concatenation, keep concat_direct_to_next to inform potential upcoming concats (next segment)
+                                add_encoding = add_encoding_cat
                         if drop_zero_weight_encodings and multiplier == 0:
                             pass
                         elif is_negative_multiplier:
                             multiplier = abs(multiplier)
-                            encodings_sum_negative, multiplier_sum_negative = add_encoding(encodings_sum_negative, next_encoding, multiplier_sum_negative, multiplier, concat_direct_from_prev, concat_direct_to_next)
+                            encodings_sum_negative, multiplier_sum_negative = add_encoding(encodings_sum_negative, next_encoding, multiplier_sum_negative, multiplier, concat_direct_to_prev)
                         else:
-                            encodings_sum_positive, multiplier_sum_positive = add_encoding(encodings_sum_positive, next_encoding, multiplier_sum_positive, multiplier, concat_direct_from_prev, concat_direct_to_next)
+                            encodings_sum_positive, multiplier_sum_positive = add_encoding(encodings_sum_positive, next_encoding, multiplier_sum_positive, multiplier, concat_direct_to_prev)
 
                         # in case of direct concatenation, write flag for the next cycle.
-                        concat_direct_from_prev = concat_direct_to_next
+                        concat_direct_to_prev = concat_direct_to_next
 
                 if encoder_level_negative_prompts:
                     # old mixing mode. leaves uncond embeddings untouched, mixes negative prompts directly into the prompt embedding itself.
@@ -1798,7 +1811,7 @@ def get_safety_checker(device="cpu", safety_model_id = "CompVis/stable-diffusion
 def image_to_correction_target(img):
     return cv2.cvtColor(np.asarray(img.copy()), cv2.COLOR_RGB2LAB)
 
-def process_cycle_image(img:Image, rotation:int=0, rotation_center:tuple=None, translation:tuple=(0,0), zoom:int=0, resample_sharpen:float=1.2, width:int=512, height:int=512, perform_histogram_correction:bool=True, correction_target:np.ndarray=None):
+def process_cycle_image(img:Image.Image, rotation:int=0, rotation_center:tuple=None, translation:tuple=(0,0), zoom:int=0, resample_sharpen:float=1.2, width:int=512, height:int=512, perform_histogram_correction:bool=True, correction_target:np.ndarray=None):
     from skimage import exposure
     background = img.copy()
     img = img.convert("RGBA")
@@ -2088,7 +2101,7 @@ class QuickGenerator():
 
 
     @torch.no_grad()
-    def one_generation(self, prompt:str=None, init_image:Image=None, save_images:bool=True, controlnet_input:Image=None):
+    def one_generation(self, prompt:str=None, init_image:Image.Image=None, save_images:bool=True, controlnet_input:Image.Image=None):
         # keep this conversion instead of only having a default value of "" to permit None as an input
         prompt = prompt if prompt is not None else ""
         prompts = [x.strip() for x in prompt.split("||")]*self.sample_count
@@ -2185,8 +2198,8 @@ class QuickGenerator():
     @torch.no_grad()
     def perform_image_cycling(self,
             in_prompt:str="", img_cycles:int=100, save_individual:bool=False, save_final:bool=True,
-            init_image:Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image=None,
-            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.0, controlnet_input:Image=None,
+            init_image:Image.Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image.Image=None,
+            zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.0, controlnet_input:Image.Image=None,
         ):
         # sequence prompts across all iterations
         prompts = [p.strip() for p in in_prompt.split("||")]
