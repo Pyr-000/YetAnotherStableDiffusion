@@ -9,7 +9,7 @@ import random
 from typing import Tuple
 import torch
 # from torch import autocast
-from transformers import models as transfomers_models
+from transformers import models as transformers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, CLIPSegProcessor, CLIPSegForImageSegmentation
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler
@@ -297,8 +297,8 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
             from accelerate import cpu_offload
 
     torch.no_grad() # We don't need gradients where we're going.
-    tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer
-    text_encoder:transfomers_models.clip.modeling_clip.CLIPTextModel
+    tokenizer:transformers_models.clip.tokenization_clip.CLIPTokenizer
+    text_encoder:transformers_models.clip.modeling_clip.CLIPTextModel
     unet:diffusers_models.unet_2d_condition.UNet2DConditionModel
     vae:diffusers_models.AutoencoderKL
 
@@ -678,8 +678,8 @@ def controlnet_preprocess(image:Image.Image, width:int, height:int, preprocessor
     return image, processed_PIL
 
 def generate_segmented(
-        tokenizer:transfomers_models.clip.tokenization_clip.CLIPTokenizer,
-        text_encoder:transfomers_models.clip.modeling_clip.CLIPTextModel,
+        tokenizer:transformers_models.clip.tokenization_clip.CLIPTokenizer,
+        text_encoder:transformers_models.clip.modeling_clip.CLIPTextModel,
         unet:diffusers_models.unet_2d_condition.UNet2DConditionModel,
         vae:diffusers_models.AutoencoderKL,
         IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False
