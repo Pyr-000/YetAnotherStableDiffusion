@@ -97,14 +97,14 @@ CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["c
 # sd2.0 default negative prompt
 DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
 
-# THIS WIL AUTOMATICALLY RESET. DO NOT ADD CUSTOM VALUES HERE. substitutions/shortcuts in prompts. Will be filled with substitions for multi-token custom embeddings.
+# THIS WILL AUTOMATICALLY RESET. DO NOT ADD CUSTOM VALUES HERE. substitutions/shortcuts in prompts. Will be filled with substitions for multi-token custom embeddings.
 PROMPT_SUBST = {}
 # Custom combinations of "shortname":"substitution string", could be added here.
 CUSTOM_PROMPT_SUBST = {
     "<negative>":"ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft",
 }
 
-# active LoRA, if any. Stored globally for easy access when writing metadata on outputs # pip install git+https://github.com/cloneofsimo/lora.git
+# active LoRA, if any. Stored globally for easy access when writing metadata on outputs
 ACTIVE_LORA = None
 ACTIVE_LORA_WEIGHT = 1.0
 
