@@ -1471,7 +1471,7 @@ def generate_segmented(
     def vae_decode_with_failover(vae, latents:torch.Tensor):
         cleanup_memory()
         try:
-            image_out = vae.decode(latents)
+            image_out = vae.decode(latents.to(vae.device))
             return image_out
         except RuntimeError as e:
             if 'out of memory' in str(e):
@@ -1483,13 +1483,17 @@ def generate_segmented(
                     return results
                 if latents.shape[0] > 1:
                     tqdm.write("Decoding as batch ran out of memory. Switching to sequential decode.")
+                    latents = latents.to(device="cpu") # difference should be negligible outside of very large images/batches: Only keep one image latent in GPU memory at once.
                     try:
                         return diffusers_models.vae.DecoderOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
                     except RuntimeError as e:
                         # if attempting sequential decode failed with an OOM error (edge case, should usually occur in recursive decode), move on to direct CPU decode.
                         if 'out of memory' in str(e):
                             pass
+                        else:
+                            tqdm.write(f"WARNING: Encountered decode error! Attempting CPU decode! {e}")
                 if vae.device != "cpu":
+                    tqdm.write("Decode moved to CPU.")
                     return vae_decode_cpu(vae, latents)
                 else:
                     raise RuntimeError(f"VAE decode ran out of memory, with VAE already on CPU: {e}")
@@ -1499,17 +1503,22 @@ def generate_segmented(
 
     @torch.no_grad()
     def vae_decode_cpu(vae, latents:torch.Tensor):
-        tqdm.write("Decode moved to CPU.")
         cleanup_memory()
+        prev_device = vae.device
         try:
-            prev_device = vae.device
             vae = vae.to(device="cpu")
             latents = latents.to(device="cpu")
             image_out = vae.decode(latents)
             vae = vae.to(device=prev_device)
             return image_out
         except NotImplementedError as e:
-            if not ("Cannot copy out of meta tensor" in str(e) or "No operator found" in str(e)):
+            if "No operator found" in str(e):
+                vae.set_use_memory_efficient_attention_xformers(False,None)
+                result = vae_decode_cpu(vae, latents)
+                vae.set_use_memory_efficient_attention_xformers(True,None)
+                vae = vae.to(device=prev_device) # the recursive call will find the VAE already on CPU (error will have occurred during vae.decode), therefore it must be returned to the original device here.
+                return result
+            if not ("Cannot copy out of meta tensor" in str(e)):
                 tqdm.write(f"VAE decode failed due to unknown implementation issue: {e}. Attempting decode with stand-in VAE")
             # vae is offloaded through accelerate, or XFormers attention is enabled. use a temporary stand-in vae.
             new_vae = load_models(vae_only=True)
