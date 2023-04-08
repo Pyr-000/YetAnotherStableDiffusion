@@ -30,9 +30,9 @@ permitted_model_ids = {"default_hub":generate.model_id}
 # example: {"local_v1.4":"models/stable-diffusion-v1-4", "local_v1.5":"models/v1.5"}
 permittel_local_model_paths = {"default_local":generate.models_local_dir}
 # available controlnet shortnames
-_controlnet_options_raw = ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]
+_controlnet_options_raw = ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"] + [f"sd21-{x}" for x in ["canny","depth","hed","openpose","scribble","zoedepth","color"]]
 # available preprocessors: controlnet name -> relevant preprocessor name
-_controlnet_options_preprocessors = {"canny":"canny","openpose":"detect_pose", "mlsd":"detect_mlsd", "hed":"detect_hed"}
+_controlnet_options_preprocessors = {"canny":"canny","openpose":"detect_pose", "mlsd":"detect_mlsd", "hed":"detect_hed", "sd21-canny":"canny","sd21-openpose":"detect_pose", "sd21-hed":"detect_hed"}
 CONTROLNET_PREPROCESS_PREFIX = "process_"
 controlnet_options = _controlnet_options_raw + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys()]
 # shortnames -> permitted loras (local path only)

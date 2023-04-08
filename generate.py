@@ -92,7 +92,7 @@ IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5
 AUX_PREPROCESSORS = ["detect_pose", "detect_mlsd", "detect_hed"] # , "detect_midas"] # seems to not be in pypi yet, hold until next release
 IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + AUX_PREPROCESSORS
 # short names for specifying controlnet models. will translate requests for name into requests for CONTROLNET_SHORTNAMES[name]
-CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]}
+CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]} | {name:f"thibaud/controlnet-{name}-diffusers" for name in [f"sd21-{x}" for x in ["canny","depth","hed","openpose","scribble","zoedepth","color"]]}
 
 # sd2.0 default negative prompt
 DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
