@@ -1383,7 +1383,7 @@ def generate_segmented(
             del noise_pred
 
         # free up some now unused memory before attempting VAE decode!
-        del latent_model_input, scheduler, text_embeddings
+        del latent_model_input, scheduler, text_embeddings, t
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE]:
             torch.cuda.empty_cache()
@@ -1469,29 +1469,31 @@ def generate_segmented(
     # can optionally move the unet out of the way to make space
     @torch.no_grad()
     def vae_decode_with_failover(vae, latents:torch.Tensor):
+        results = vae_decode_with_failover_worker(vae, latents)
+        if results is None: # fully exit the previous context instead of recursively calling to ensure that memory is properly released.
+            return vae_decode_with_failover_worker(vae, latents, True)
+        return results
+    @torch.no_grad()
+    def vae_decode_with_failover_worker(vae, latents:torch.Tensor, minimize_memory=False):
         cleanup_memory()
         try:
-            image_out = vae.decode(latents.to(vae.device))
-            return image_out
+            if minimize_memory:
+                was_slicing, was_tiling = vae.use_slicing, vae.use_tiling
+                vae.enable_slicing() # should take care of potential OOMs caused by large batches
+                vae.enable_tiling() # should take care of potential OOMs caused by large resolution
+            results = vae.decode(latents.to(vae.device))
+            if minimize_memory:
+                if not was_slicing:
+                    vae.disable_slicing()
+                if not was_tiling:
+                    vae.disable_tiling()
+            return results
         except RuntimeError as e:
             if 'out of memory' in str(e):
-                if not vae.use_slicing:
-                    # if VAE slicing is not yet enabled, re-run decode with slicing temporarily enabled. If additional memory reductions are required, they will be applied in the recursive call.
-                    vae.enable_slicing()
-                    results = vae_decode_with_failover(vae, latents)
-                    vae.disable_slicing()
-                    return results
-                if latents.shape[0] > 1:
-                    tqdm.write("Decoding as batch ran out of memory. Switching to sequential decode.")
-                    latents = latents.to(device="cpu") # difference should be negligible outside of very large images/batches: Only keep one image latent in GPU memory at once.
-                    try:
-                        return diffusers_models.vae.DecoderOutput(torch.stack([vae_decode_with_failover(vae, torch.stack([l])).sample[0] for l in tqdm(latents, desc="decoding")]))
-                    except RuntimeError as e:
-                        # if attempting sequential decode failed with an OOM error (edge case, should usually occur in recursive decode), move on to direct CPU decode.
-                        if 'out of memory' in str(e):
-                            pass
-                        else:
-                            tqdm.write(f"WARNING: Encountered decode error! Attempting CPU decode! {e}")
+                if not minimize_memory:
+                    # recursively calling with slicing/tiling enabled after an OOM has occurred does not yield the expected memory reduction. Potential issue with releasing CUDA memory?
+                    # exit local context, prompting the wrapper to call again with tiling and slicing enabled.
+                    return None
                 if vae.device != "cpu":
                     tqdm.write("Decode moved to CPU.")
                     return vae_decode_cpu(vae, latents)
