@@ -356,6 +356,7 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("amount",int,description="Amount of images to batch at once.",required=False,default=1)
 @discord.option("scheduler",str,description="Scheduler for the diffusion sampling loop.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_SCHEDULERS],required=False,default="mdpms")
 @discord.option("gs_schedule",str,description="Variable guidance scale schedule. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
+@discord.option("guidance_rescale",float,description="Strength of prediction distribution correction during sampling (between 0 and 1).",required=False,default=0.66)
 @discord.option("static_length",int,description="Static embedding length. Disables dynamic length mode. 77 to reproduce previous behavior",required=False,default=-1)
 @discord.option("mix_concatenate",bool,description="When mixing prompts, concatenate the embeddings instead of computing their weighted sum.",required=False,default=False)
 @discord.option("eta",float,description="Higher 'eta' -> more random noise during sampling. Ignored unless scheduler=ddim",required=False,default=0.0)
@@ -364,11 +365,15 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("controlnet_input",discord.Attachment,description="Input image for the controlnet",required=False,default=None)
 @discord.option("controlnet_strength",float,description="Strength (scale) of controlnet guidance",required=False,default=1.0)
 @discord.option("controlnet_schedule",str,description="Variable guidance scale schedule for controlnets. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
+@discord.option("second_pass_resize",float,description="Resize factor for performing two-pass generation. Enabled when >1.",required=False,default=1)
+@discord.option("second_pass_steps",int,description="Amount of second pass sampling steps when two-pass generation is selected.",required=False,default=50)
+@discord.option("second_pass_ctrl",bool,description="Use a specified controlnet instead of img2img for the second pass.",required=False,default=False)
 
 async def advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
-    scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
+    scheduler:str="mdpms", gs_schedule:str=None, guidance_rescale:float=0.66, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
     controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
+    second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False,
 ):
     reply = run_advanced(**locals())
     await ctx.send_response(reply)
@@ -377,6 +382,7 @@ def run_advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
     controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
+    guidance_rescale:float=0.66, second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False,
 ):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         if not PERMIT_SFW_CHANNEL_USAGE:
@@ -431,6 +437,10 @@ def run_advanced(
         "controlnet_strength":controlnet_strength,
         "controlnet_strength_scheduler":controlnet_schedule,
         "safety_processing_level":safety_processing_level,
+        "guidance_rescale":guidance_rescale,
+        "second_pass_resize":second_pass_resize,
+        "second_pass_steps":second_pass_steps,
+        "second_pass_use_controlnet":second_pass_ctrl,
     }
 
     task_queue.append(prompt_task(ctx, prompt=prompt, init_img=init_img, generator_config=generator_config, controlnet=controlnet, controlnet_input=controlnet_input))

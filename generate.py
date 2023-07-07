@@ -74,6 +74,8 @@ assert ImageColor.getrgb(GRID_IMAGE_BACKGROUND_COLOR) # check requested color fo
 SAFETY_PROCESSOR_CLIPSEG_MODEL = "CIDAS/clipseg-rd64-refined" # "CIDAS/clipseg-rd64" # "CIDAS/clipseg-rd16"
 # debug option, displays blur heatmaps via cv2 when the safety processor applies masked blur.
 SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
+# Can be used to manually disable xformers memory efficient attention.
+XFORMERS_ENABLED = True
 
 OUTPUT_DIR_BASE = "outputs"
 OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
@@ -136,6 +138,7 @@ def parse_args():
     parser.add_argument("-pf", "--prompts-file", type=str, help="Path of file containing prompts. One line per prompt.", default=None, dest='prompts_file')
     parser.add_argument("-ic", "--image-cycles", type=int, help="Repetition count when using image2image. Will interpolate between multiple prompts when || is used.", default=0, dest='img_cycles')
     parser.add_argument("-cni", "--cycle-no-save-individual", action="store_false", help="Disables saving of individual images in image cycle mode.", dest="image_cycle_save_individual")
+    parser.add_argument("-csi", "--cycle-select-image", action="store_true", help="When cycling with batch sizes >1, manually select one of the outputs as the next input image ('guided evolution')", dest="image_cycle_select")
     parser.add_argument("-iz", "--image-zoom", type=int, help="Amount of zoom (pixels cropped per side) for each subsequent img2img cycle", default=0, dest='img_zoom')
     parser.add_argument("-ir", "--image-rotate", type=int, help="Amount of rotation (counter-clockwise degrees) for each subsequent img2img cycle", default=0, dest='img_rotation')
     parser.add_argument("-it", "--image-translate", type=int, help="Amount of translation (x,y tuple in pixels) for each subsequent img2img cycle", default=None, nargs=2, dest='img_translation')
@@ -163,6 +166,10 @@ def parse_args():
     parser.add_argument("-cost", "--controlnet-strength", type=float, default=1.0, help="strength (cond scale) for applying a controlnet", dest="controlnet_strength")
     parser.add_argument("-cosc","--controlnet-schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for controlnet strength. Default (None) corresponds to no schedule.", dest="controlnet_schedule")
     parser.add_argument("-cop","--controlnet-preprocessor", type=str, default=None, choices=IMPLEMENTED_CONTROLNET_PREPROCESSORS, help="Set a preprocessor for controlnet inputs.", dest="controlnet_preprocessor")
+    parser.add_argument("-gr", "--guidance-rescale", type=float, default=0.66, help="Set the guidance rescale factor 'phi' to improve image exposure distribution. Disable with a value of 0. Authors of arxiv:2305.08891 recommend values between 0.5 and 0.75", dest="guidance_rescale")
+    parser.add_argument("-spr","--second-pass-resize", type=float, default=1, help="Perform a second pass with image size multiplied by this factor. Initially sampling at reduced size can improve consistency and speed with large resolutions. Enabled for values >1.", dest="second_pass_resize")
+    parser.add_argument("-sps","--second-pass-steps", type=int, default=50, help="Number of sampling steps at which the new size is used when starting_resize is specified.", dest="second_pass_steps")
+    parser.add_argument("-spc","--second-pass-controlnet", action="store_true", help="Use the first pass image in the selected controlnet for the second pass (instead of using img2img). For batch sizes >1, only the first image from the first pass will be used (outside of sequential mode).", dest="second_pass_use_controlnet")
     return parser.parse_args()
 
 def main():
@@ -250,14 +257,18 @@ def main():
         args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule,
         args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
         controlnet_model, args.controlnet_strength, args.controlnet_preprocessor, args.controlnet_schedule,
-        args.safety_processing_level
+        args.safety_processing_level, args.guidance_rescale, args.second_pass_resize, args.second_pass_steps, args.second_pass_use_controlnet
     )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
     controlnet_input = None if args.controlnet_input is None else Image.open(args.controlnet_input).convert("RGB")
 
     if args.img_cycles > 0:
-        generator.perform_image_cycling(args.prompt, args.img_cycles, args.image_cycle_save_individual, True, init_image, args.cycle_fresh, args.cycle_color_correction, None, args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen, controlnet_input=controlnet_input)
+        generator.perform_image_cycling(
+            args.prompt, args.img_cycles, args.image_cycle_save_individual, True, init_image, args.cycle_fresh, args.cycle_color_correction, None,
+            args.img_zoom, args.img_rotation, args.img_center, args.img_translation, args.cycle_sharpen,
+            controlnet_input=controlnet_input, select_next_image_in_batch=args.image_cycle_select
+        )
         exit()
 
     if args.prompts_file is not None:
@@ -277,6 +288,8 @@ def main():
                 print_exc()
 
 def recurse_set_xformers(item, max_recursion_depth=16):
+    if not XFORMERS_ENABLED:
+        return
     if hasattr(item, "set_use_memory_efficient_attention_xformers"):
         item.set_use_memory_efficient_attention_xformers(True,None)
     recurse_targets = item.__dict__.values() if hasattr(item, "__dict__") else item.values() if isinstance(item, dict) else item if isinstance(item, list) or hasattr(item, "__iter__") else None
@@ -309,10 +322,13 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     use_auth_token_unet=get_huggingface_token()
     use_auth_token_vae=get_huggingface_token()
 
-    default_local_model_files_per_dir = ["config.json", "diffusion_pytorch_model.bin"]
+    default_local_model_files_per_dir = [["config.json"], ["diffusion_pytorch_model.bin", "diffusion_pytorch_model.safetensors"]]
+    def dir_has_model_files(dirpath, files_groups=None):
+        files_groups = files_groups if files_groups is not None else default_local_model_files_per_dir
+        return all([any([os.path.exists(os.path.join(dirpath, f)) for f in group]) for group in files_groups])
     if models_local_dir is not None and len(models_local_dir) > 0:
         unet_dir = os.path.join(models_local_dir, "unet")
-        if all([os.path.exists(os.path.join(unet_dir, f)) for f in default_local_model_files_per_dir]):
+        if dir_has_model_files(unet_dir):
             use_auth_token_unet=False
             print(f"Using local unet model files! ({models_local_dir})")
             unet_model_id = unet_dir
@@ -320,7 +336,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         else:
             print(f"Using unet '{unet_model_id}' (no local data present at {unet_dir})")
         vae_dir = os.path.join(models_local_dir, "vae")
-        if all([os.path.exists(os.path.join(vae_dir, f)) for f in default_local_model_files_per_dir]):
+        if dir_has_model_files(vae_dir):
             use_auth_token_vae=False
             print(f"Using local vae model files! ({models_local_dir})")
             vae_model_id = vae_dir
@@ -328,7 +344,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         else:
             print(f"Using vae '{vae_model_id}' (no local data present at {vae_dir})")
         text_encoder_dir = os.path.join(models_local_dir, "text_encoder")
-        if all([os.path.exists(os.path.join(text_encoder_dir, f)) for f in ["config.json", "pytorch_model.bin"]]):
+        if dir_has_model_files(text_encoder_dir, [["config.json"], ["pytorch_model.bin", "pytorch_model.safetensors"]]):
             print(f"Using local text encoder! ({models_local_dir})")
             text_encoder_id = text_encoder_dir
         else:
@@ -607,8 +623,9 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
                 # input will be a tuple of "only the positional arguments given to the module", which should only be the input tensor itself.
                 if isinstance(input, tuple) and len(input) == 1:
                     input = input[0]
-                lora_dtype = lora_conv_up.weight.data.dtype
-                return (output.to(lora_dtype) + module.lora_conv_up(module.lora_conv_down(input.to(lora_dtype))) * merge_strength).to(input.dtype)
+                lora_dtype_down = module.lora_conv_up.weight.data.dtype
+                lora_dtype_up = module.lora_conv_down.weight.data.dtype
+                return (output.to(lora_dtype_up) + module.lora_conv_up(module.lora_conv_down(input.to(lora_dtype_down)).to(lora_dtype_up)) * merge_strength).to(input.dtype)
             curr_layer.register_forward_hook(hook)
 
         elif len(state_dict[pair_keys[0]].shape) == 4:
@@ -698,8 +715,8 @@ def generate_segmented(
         unet_compute_device = OFFLOAD_EXEC_DEVICE
 
     # xformers attention will fail to function on CPU.
-    unet.set_use_memory_efficient_attention_xformers(unet_compute_device=="cuda",None)
-    vae.set_use_memory_efficient_attention_xformers(vae_compute_device=="cuda",None)
+    unet.set_use_memory_efficient_attention_xformers(unet_compute_device=="cuda" and XFORMERS_ENABLED,None)
+    vae.set_use_memory_efficient_attention_xformers(vae_compute_device=="cuda" and XFORMERS_ENABLED,None)
 
     UNET_DEVICE = UNET_DEVICE if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
     IO_DEVICE = IO_DEVICE if IO_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
@@ -891,7 +908,7 @@ def generate_segmented(
         # repack batch dimension around the embedding vectors
         text_embeddings = torch.stack([embedding_vectors])
 
-        special_embeddings = get_special_embeddings(prompt, rerun_self_kwargs)
+        special_embeddings = get_special_embeddings(prompt.strip(), rerun_self_kwargs)
         if special_embeddings is not None:
             text_embeddings = special_embeddings
 
@@ -1149,91 +1166,13 @@ def generate_segmented(
             pass
         return gs_mult
 
-
-    @torch.no_grad()
-    def generate_segmented_exec(
-            prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False,
-            animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
-            encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
-            controlnet:ControlNetModel=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
-        ):
-        gc.collect()
-        if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
-            torch.cuda.empty_cache()
-        START_TIME = time()
-
-        SUPPLEMENTARY = {
-            "io" : {
-                "width" : 0,
-                "height" : 0,
-                "steps" : steps,
-                "gs" : gs,
-                "gs_sched" : gs_schedule,
-                "text_readback" : "",
-                "nsfw" : False,
-                "remaining_token_count" : 0,
-                "time" : 0.0,
-                "image_sequence" : [],
-                "seed" : 0,
-                "eta_seed" : 0,
-                "eta" : eta,
-                "sched_name" : None,
-                "weights" : [],
-                "unet_model" : f"{models_local_dir} (local)" if using_local_unet else model_id,
-                "vae_model" : f"{models_local_dir} (local)" if using_local_vae else model_id,
-                "encoder_level_negative" : encoder_level_negative_prompts,
-                "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
-                "static_length" : static_length,
-                "concat" : mix_mode_concat,
-                "LoRA" : None if ACTIVE_LORA is None else f"{ACTIVE_LORA}: {ACTIVE_LORA_WEIGHT}",
-                "controlnet": None if None in [controlnet, controlnet_input] else f"{getattr(controlnet, '_MODEL_NAME', 'unlabeled')}: {controlnet_strength}",
-                "controlnet_scheduler": controlnet_strength_scheduler,
-                "processed_controlnet_input": None,
-            },
-            "latent" : {
-                "final_latent" : None,
-                "latent_sequence" : [],
-            },
-        }
-        if isinstance(ACTIVE_LORA,list) and isinstance(ACTIVE_LORA_WEIGHT,list) and len(ACTIVE_LORA)==len(ACTIVE_LORA_WEIGHT):
-            try: SUPPLEMENTARY["io"]["LoRA"] = [f"{lora.rsplit('.',1)[0]}: {weight}" for lora,weight in zip(ACTIVE_LORA,ACTIVE_LORA_WEIGHT)]
-            except Exception as e: tqdm.write(f"Failed to create IOData LoRA info from {ACTIVE_LORA} with weights {ACTIVE_LORA_WEIGHT}")
-
-        # truncate incorrect input dimensions to a multiple of 64
-        if isinstance(prompt, str):
-            prompt = [prompt]
-        height = int(height/8.0)*8
-        width = int(width/8.0)*8
-        SUPPLEMENTARY["io"]["height"] = height
-        SUPPLEMENTARY["io"]["width"] = width
-        # torch.manual_seed: Value must be within the inclusive range [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff], negative values remapped to positive
-        # 0xffff_ffff_ffff_ffff == 18446744073709551615 theoretical max. In the EXTREMELY unlikely event that something very close to the max value is picked in sequential mode, leave some headroom. (>50k in this case.)
-        seed = seed if seed is not None else random.randint(1, 18446744073709500000)
-        eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709500000)
-        SUPPLEMENTARY["io"]["seed"] = seed
-        SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
-        generator_eta = torch.manual_seed(eta_seed)
-        if not IO_DEVICE == "meta":
-            generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
-        else:
-            generator_unet = torch.Generator("cpu").manual_seed(seed)
-
-        sched_name = sched_name.lower().strip()
-        SUPPLEMENTARY["io"]["sched_name"]=sched_name
-
-        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers, static_length, mix_mode_concat)
-        for key in io_data:
-            SUPPLEMENTARY["io"][key] = io_data[key]
-
-        # schedulers
+    def get_scheduler(sched_name, high_beta=False):
         if high_beta:
             # scheduler default
-            beta_start = 0.0001
-            beta_end = 0.02
+            beta_start, beta_end = 0.0001, 0.02
         else:
             # stablediffusion default
-            beta_start = 0.00085
-            beta_end = 0.012
+            beta_start, beta_end = 0.00085, 0.012
         scheduler_params = {"beta_start":beta_start, "beta_end":beta_end, "beta_schedule":"scaled_linear", "num_train_timesteps":1000}
         if V_PREDICTION_MODEL:
             if not sched_name in V_PREDICTION_SCHEDULERS:
@@ -1270,32 +1209,127 @@ def generate_segmented(
 
         else:
             raise ValueError(f"Requested unknown scheduler: {sched_name}")
-        # set timesteps. Also offset, as pipeline does this
-        accepts_offset = "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if accepts_offset:
-            scheduler_offset=1
-            scheduler.set_timesteps(steps, offset=1)
+        return scheduler
+
+    # see diffusers PR: https://github.com/huggingface/diffusers/commit/12a232efa99d7a8c33f54ae515c5a3d6fc5c8f34
+    def rescale_prediction(noise_pred:torch.Tensor, noise_pred_text:torch.Tensor, rescale_factor:float=0.66) -> torch.Tensor:
+        def get_std(x:torch.Tensor) -> torch.Tensor:
+            return x.std(dim=list(range(1, x.ndim)), keepdim=True)
+        prediction_scale_factor = (get_std(noise_pred_text) / get_std(noise_pred))
+        return noise_pred * (1-rescale_factor) + noise_pred*prediction_scale_factor*rescale_factor
+
+
+    @torch.no_grad()
+    def generate_segmented_exec(
+            prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False,
+            animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
+            encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
+            controlnet:ControlNetModel=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
+            guidance_rescale=0.66, *args, **kwargs
+        ):
+        gc.collect()
+        if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
+            torch.cuda.empty_cache()
+        START_TIME = time()
+
+        SUPPLEMENTARY = {
+            "io" : {
+                "width" : 0,
+                "height" : 0,
+                "steps" : steps,
+                "gs" : gs,
+                "gs_sched" : gs_schedule,
+                "text_readback" : "",
+                "nsfw" : False,
+                "remaining_token_count" : 0,
+                "time" : 0.0,
+                "image_sequence" : [],
+                "seed" : 0,
+                "eta_seed" : 0,
+                "eta" : eta,
+                "sched_name" : None,
+                "weights" : [],
+                "unet_model" : f"{models_local_dir} (local)" if using_local_unet else model_id,
+                "vae_model" : f"{models_local_dir} (local)" if using_local_vae else model_id,
+                "encoder_level_negative" : encoder_level_negative_prompts,
+                "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
+                "static_length" : static_length,
+                "concat" : mix_mode_concat,
+                "LoRA" : None if ACTIVE_LORA is None else f"{ACTIVE_LORA}: {ACTIVE_LORA_WEIGHT}",
+                "controlnet": None if None in [controlnet, controlnet_input] else f"{getattr(controlnet, '_MODEL_NAME', 'unlabeled')}: {controlnet_strength}",
+                "controlnet_scheduler": controlnet_strength_scheduler,
+                "processed_controlnet_input": None,
+                "guidance_rescale": guidance_rescale if guidance_rescale > 0 else None,
+            },
+            "latent" : {
+                "final_latent" : None,
+                "latent_sequence" : [],
+            },
+        }
+        if isinstance(ACTIVE_LORA,list) and isinstance(ACTIVE_LORA_WEIGHT,list) and len(ACTIVE_LORA)==len(ACTIVE_LORA_WEIGHT):
+            try: SUPPLEMENTARY["io"]["LoRA"] = [f"{lora.rsplit('.',1)[0]}: {weight}" for lora,weight in zip(ACTIVE_LORA,ACTIVE_LORA_WEIGHT)]
+            except Exception as e: tqdm.write(f"Failed to create IOData LoRA info from {ACTIVE_LORA} with weights {ACTIVE_LORA_WEIGHT}")
+
+        # truncate incorrect input dimensions to a multiple of 64
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        height = int(height/8.0)*8
+        width = int(width/8.0)*8
+        SUPPLEMENTARY["io"]["height"] = height
+        SUPPLEMENTARY["io"]["width"] = width
+        # torch.manual_seed: Value must be within the inclusive range [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff], negative values remapped to positive
+        # 0xffff_ffff_ffff_ffff == 18446744073709551615 theoretical max. In the EXTREMELY unlikely event that something very close to the max value is picked in sequential mode, leave some headroom. (>50k in this case.)
+        seed = seed if seed is not None else random.randint(1, 18446744073709500000)
+        eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709500000)
+        SUPPLEMENTARY["io"]["seed"] = seed
+        SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
+        generator_eta = torch.manual_seed(eta_seed)
+        if not IO_DEVICE == "meta":
+            generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
         else:
-            scheduler_offset=0
-            scheduler.set_timesteps(steps)
+            generator_unet = torch.Generator("cpu").manual_seed(seed)
+
+        sched_name = sched_name.lower().strip()
+        SUPPLEMENTARY["io"]["sched_name"]=sched_name
+
+        text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers, static_length, mix_mode_concat)
+        for key in io_data:
+            SUPPLEMENTARY["io"][key] = io_data[key]
+
+        scheduler = get_scheduler(sched_name, high_beta)
+        # set timesteps. Also offset, as pipeline does this
+        scheduler_offset = 1 if "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys()) else 0
+        scheduler.set_timesteps(steps, **({"offset":scheduler_offset} if scheduler_offset>0 else {}))
 
         starting_timestep = 0
         # initial noise latents
-        if init_image is None:
-            latents = torch.randn((batch_size, unet.in_channels, height // 8, width // 8), device=IO_DEVICE, generator=generator_unet)
+        if init_image is None or (isinstance(init_image, list) and len(init_image) == 0):
+            latents = torch.randn((batch_size, unet.config.in_channels, height // 8, width // 8), device=IO_DEVICE, generator=generator_unet)
             if half_precision_latents:
                 latents = latents.to(dtype=torch.float16)
             latents = latents.to(UNET_DEVICE)
         else:
             SUPPLEMENTARY["io"]["strength"] = img_strength
-            init_image = init_image.resize((width,height), resample=Image.Resampling.LANCZOS)
-            image_processing = np.array(init_image).astype(np.float32) / 255.0
-            image_processing = image_processing[None].transpose(0, 3, 1, 2)
-            init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
-            init_latents = vae.encode(init_image_tensor.to(IO_DEVICE)).latent_dist.sample()
-            # apply inverse scaling
-            init_latents = 0.18215 * init_latents
-            init_latents = torch.cat([init_latents] * batch_size)
+            if not isinstance(init_image, list):
+                init_images = [init_image]
+            else:
+                init_images = init_image
+            init_latents_list = []
+            for init_image in init_images:
+                if init_image.size != (width,height):
+                    init_image = init_image.resize((width,height), resample=Image.Resampling.LANCZOS)
+                image_processing = np.array(init_image).astype(np.float32) / 255.0
+                image_processing = image_processing[None].transpose(0, 3, 1, 2)
+                init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
+                init_latents = vae_with_failover(vae, init_image_tensor.to(IO_DEVICE), decode=False).latent_dist.sample()
+                # apply inverse scaling
+                init_latents = 0.18215 * init_latents
+                init_latents_list.append(init_latents)
+            # if the init latent batch is smaller than the actual batch size, expand it.
+            if len(init_latents_list) < batch_size:
+                init_latents_list *= (batch_size//len(init_latents_list)) + (1 if (batch_size%len(init_latents_list)) > 0 else 0)
+            # reduce init latent batch to actual batch size if oversized.
+            init_latents = torch.cat(init_latents_list[:batch_size])
             init_timestep = int(steps * img_strength) + scheduler_offset
             init_timestep = min(init_timestep, steps)
             timesteps = scheduler.timesteps[-init_timestep]
@@ -1318,15 +1352,15 @@ def generate_segmented(
                 tqdm.write("Warning! Controlnet input provided, but no controlnet found!")
                 controlnet_input = None
         elif controlnet is not None:
-            tqdm.write("Warning! Controlnet provided, but no controlnet input found!")
-            controlnet_input = None
+            pass # as long as controlnet_input is None, the controlnet won't actually be computed or applied
+            # tqdm.write("Warning! Controlnet provided, but no controlnet input found!")
 
         # denoising loop!
         progress_bar = tqdm([x for x in enumerate(scheduler.timesteps[starting_timestep:])], position=1)
         unet_sequential_batch = False
         for i, t in progress_bar:
             if animate and not animate_pred_diff:
-                SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
+                SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.cpu().clone())
             # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
             latent_model_input = torch.cat([latents] * 2)
             if hasattr(scheduler, "scale_model_input"):
@@ -1367,18 +1401,18 @@ def generate_segmented(
             gs_mult = get_gs_mult(gs_schedule, progress_factor)
             progress_bar.set_description(f"gs={gs*gs_mult:.3f}{';seq_batch' if unet_sequential_batch else ''}")
             noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
+            if isinstance(guidance_rescale, float) and guidance_rescale > 0:
+                noise_pred = rescale_prediction(noise_pred, noise_pred_text, guidance_rescale)
 
             if animate and animate_pred_diff:
-                SUPPLEMENTARY["latent"]["latent_sequence"].append((latents-noise_pred).clone().cpu())
+                animate_latents = ((latents-noise_pred)*(1-(i/len(scheduler.timesteps))**2) + latents*(i/len(scheduler.timesteps))**2).cpu().clone()
+                SUPPLEMENTARY["latent"]["latent_sequence"].append(animate_latents)
             del noise_pred_uncond, noise_pred_text
             # compute the previous noisy sample x_t -> x_t-1
-            if isinstance(scheduler, LMSDiscreteScheduler):
-                #latents = scheduler.step(noise_pred, i, latents)["prev_sample"]
-                latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
-            elif isinstance(scheduler, DDIMScheduler):
-                latents = scheduler.step(noise_pred, t, latents, eta=eta, generator=generator_eta)["prev_sample"]
-            else:
-                latents = scheduler.step(noise_pred, t, latents)["prev_sample"]
+            scheduler_additional_args = {}
+            if isinstance(scheduler, DDIMScheduler):
+                scheduler_additional_args = {"eta":eta, "generator":generator_eta}
+            latents = scheduler.step(noise_pred, t, latents, **scheduler_additional_args)["prev_sample"]
 
             del noise_pred
 
@@ -1397,7 +1431,7 @@ def generate_segmented(
         latents = 1 / 0.18215 * latents
         latents = latents.to(IO_DEVICE)
         latents = latents.to(vae.dtype)
-        image = vae_decode_with_failover(vae, latents)
+        image = vae_with_failover(vae, latents, decode=True)
 
         # latents are decoded and copied (if requested) by now.
         del latents
@@ -1426,7 +1460,7 @@ def generate_segmented(
                 pass # when offloaded to cpu, model switching will fail (copy out of meta tensor)
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
-                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_decode_with_failover(vae,(item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_with_failover(vae,(item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
             try:
                 torch.cuda.synchronize()
                 vae.to(IO_DEVICE)
@@ -1468,20 +1502,20 @@ def generate_segmented(
 
     # can optionally move the unet out of the way to make space
     @torch.no_grad()
-    def vae_decode_with_failover(vae, latents:torch.Tensor):
-        results = vae_decode_with_failover_worker(vae, latents)
+    def vae_with_failover(vae, latents:torch.Tensor, decode=True):
+        results = vae_with_failover_worker(vae, latents, decode=decode)
         if results is None: # fully exit the previous context instead of recursively calling to ensure that memory is properly released.
-            return vae_decode_with_failover_worker(vae, latents, True)
+            return vae_with_failover_worker(vae, latents, True, decode=decode)
         return results
     @torch.no_grad()
-    def vae_decode_with_failover_worker(vae, latents:torch.Tensor, minimize_memory=False):
+    def vae_with_failover_worker(vae, latents:torch.Tensor, minimize_memory=False, decode=True):
         cleanup_memory()
         try:
             if minimize_memory:
                 was_slicing, was_tiling = vae.use_slicing, vae.use_tiling
                 vae.enable_slicing() # should take care of potential OOMs caused by large batches
                 vae.enable_tiling() # should take care of potential OOMs caused by large resolution
-            results = vae.decode(latents.to(vae.device))
+            results = vae.decode(latents.to(vae.device)) if decode else vae.encode(latents.to(vae.device))
             if minimize_memory:
                 if not was_slicing:
                     vae.disable_slicing()
@@ -1495,29 +1529,57 @@ def generate_segmented(
                     # exit local context, prompting the wrapper to call again with tiling and slicing enabled.
                     return None
                 if vae.device != "cpu":
-                    tqdm.write("Decode moved to CPU.")
-                    return vae_decode_cpu(vae, latents)
+                    tqdm.write(f"VAE {'decode' if decode else 'encode'} moved to CPU.")
+                    return vae_code_cpu(vae, latents, decode=decode)
                 else:
-                    raise RuntimeError(f"VAE decode ran out of memory, with VAE already on CPU: {e}")
+                    raise RuntimeError(f"VAE {'decode' if decode else 'encode'} ran out of memory, with VAE already on CPU: {e}")
             else:
                 # there was some RuntimeError, but it wasn't OOM.
                 raise e
 
     @torch.no_grad()
-    def vae_decode_cpu(vae, latents:torch.Tensor):
+    def vae_code_cpu(vae, latents:torch.Tensor, decode=True):
         cleanup_memory()
         prev_device = vae.device
         try:
             vae = vae.to(device="cpu")
             latents = latents.to(device="cpu")
-            image_out = vae.decode(latents)
+            image_out = vae.decode(latents) if decode else vae.encode(latents)
             vae = vae.to(device=prev_device)
             return image_out
         except NotImplementedError as e:
             if "No operator found" in str(e):
                 vae.set_use_memory_efficient_attention_xformers(False,None)
-                result = vae_decode_cpu(vae, latents)
-                vae.set_use_memory_efficient_attention_xformers(True,None)
+                result = vae_code_cpu(vae, latents, decode=decode)
+                vae.set_use_memory_efficient_attention_xformers(True and XFORMERS_ENABLED,None)
+                vae = vae.to(device=prev_device) # the recursive call will find the VAE already on CPU (error will have occurred during vae.decode), therefore it must be returned to the original device here.
+                return result
+            if not ("Cannot copy out of meta tensor" in str(e)):
+                tqdm.write(f"VAE {'decode' if decode else 'encode'} failed due to unknown implementation issue: {e}. Attempting decode with stand-in VAE")
+            # vae is offloaded through accelerate, or XFormers attention is enabled. use a temporary stand-in vae.
+            new_vae = load_models(vae_only=True)
+            new_vae.set_use_memory_efficient_attention_xformers(False,None)
+            new_vae = new_vae.to(device="cpu")
+            latents = latents.to(device="cpu")
+            image_out = new_vae.decode(latents) if decode else new_vae.encode(latents)
+            del new_vae
+            cleanup_memory()
+            return image_out
+
+    @torch.no_grad()
+    def vae_encode_cpu(vae, input):
+        cleanup_memory()
+        prev_device = vae.device
+        try:
+            vae = vae.to(device="cpu")
+            out = vae.decode(input)
+            vae = vae.to(device=prev_device)
+            return out
+        except NotImplementedError as e:
+            if "No operator found" in str(e):
+                vae.set_use_memory_efficient_attention_xformers(False,None)
+                result = vae_encode_cpu(vae, input)
+                vae.set_use_memory_efficient_attention_xformers(True and XFORMERS_ENABLED,None)
                 vae = vae.to(device=prev_device) # the recursive call will find the VAE already on CPU (error will have occurred during vae.decode), therefore it must be returned to the original device here.
                 return result
             if not ("Cannot copy out of meta tensor" in str(e)):
@@ -1526,28 +1588,58 @@ def generate_segmented(
             new_vae = load_models(vae_only=True)
             new_vae.set_use_memory_efficient_attention_xformers(False,None)
             new_vae = new_vae.to(device="cpu")
-            latents = latents.to(device="cpu")
-            image_out = new_vae.decode(latents)
+            out = new_vae.encode(input)
             del new_vae
             cleanup_memory()
-            return image_out
+            return out
+
+    # TODO: Consider upgrading this to use a SD-latent-upscaler-like resize?
+    def generate_two_step_wrapper(second_pass_resize=1, second_pass_steps=0, second_pass_use_controlnet=False, **exec_args):
+        if not all([isinstance(second_pass_steps, int), second_pass_steps>0, isinstance(second_pass_resize, float), second_pass_resize>1]):
+            # if two step generation is not specified, simply pass through.
+            return generate_segmented_exec(**exec_args)
+
+        if second_pass_use_controlnet and (exec_args.get("controlnet",None) is None):
+            tqdm.write("Warning: Second pass was set to use controlnet, but no controlnet was specified! Falling back to img2img.")
+            second_pass_use_controlnet = False
+
+        out, SUPPLEMENTARY = generate_segmented_exec(**exec_args)
+        initial_time = SUPPLEMENTARY['io']['time']
+        initial_sequence = SUPPLEMENTARY["io"].get("image_sequence", [])
+        init_iodata = {f"init_{k}":v for k,v in SUPPLEMENTARY["io"].items() if k in ["width","height","steps"]}
+        # use round here instead of truncated int-conversion: We want to be as close to the original aspect ratio as possible to minimize image distortion
+        second_pass_size = {k:round(v*second_pass_resize/8)*8 for k,v in exec_args.items() if k in ["height", "width"]}
+        out = [x.resize((second_pass_size["width"],second_pass_size["height"]), resample=Image.Resampling.LANCZOS) for x in out]
+        sharp_out = []
+        for img in out:
+            enhancer_sharpen = ImageEnhance.Sharpness(img)
+            img = enhancer_sharpen.enhance(second_pass_resize)
+            sharp_out.append(img)
+        out = sharp_out
+        exec_args = {**exec_args, **second_pass_size, "steps":second_pass_steps}
+        if not second_pass_use_controlnet:
+            exec_args["init_image"] = out
+        else:
+            exec_args["controlnet_input"] = out if isinstance(out, Image.Image) else out[0]
+        out, SUPPLEMENTARY = generate_segmented_exec(**exec_args)
+        SUPPLEMENTARY['io']['time'] += initial_time
+        if len(initial_sequence) > 0 and len(SUPPLEMENTARY["io"].get("image_sequence", [])) > 0:
+            final_size = SUPPLEMENTARY["io"]["image_sequence"][0][0].size # take the size of the first image in the sequence of image batches
+            SUPPLEMENTARY["io"]["image_sequence"] = [[x.resize(final_size, resample=Image.Resampling.LANCZOS) for x in batch_idx] for batch_idx in initial_sequence] + SUPPLEMENTARY["io"]["image_sequence"]
+        elif len(initial_sequence) > 0:
+            # it really should not be possible to reach this case
+            SUPPLEMENTARY["io"]["image_sequence"] = initial_sequence
+        SUPPLEMENTARY["io"] = {**SUPPLEMENTARY["io"], **init_iodata}
+        return out, SUPPLEMENTARY
 
     @torch.no_grad()
-    def generate_segmented_wrapper(
-            prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None,
-            animate=False, init_image=None, img_strength=0.5, save_latents=False, sequential=False, gs_schedule=None, animate_pred_diff=True,
-            encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None,mix_mode_concat=False,
-            controlnet=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
-        ):
-        exec_args = {
-            "width":width,"height":height,"steps":steps,"gs":gs,"seed":seed,"sched_name":sched_name,"eta":eta,"eta_seed":eta_seed,"high_beta":False,
-            "animate":animate,"init_image":init_image,"img_strength":img_strength,"save_latents":save_latents,"gs_schedule":gs_schedule,"animate_pred_diff":animate_pred_diff,
-            "encoder_level_negative_prompts":encoder_level_negative_prompts,"clip_skip_layers":clip_skip_layers,"static_length":static_length,"mix_mode_concat":mix_mode_concat,
-            "controlnet":controlnet,"controlnet_input":controlnet_input,"controlnet_strength":controlnet_strength,"controlnet_preprocessor":controlnet_preprocessor,"controlnet_strength_scheduler":controlnet_strength_scheduler,
-        }
+    def generate_segmented_wrapper(prompt=["art"], save_latents=False, sequential=False, **kwargs):
+        # any additional exec args to be forwarded not captured by **kwargs must be added explicitly
+        additional_exec_args = {"save_latents":save_latents,}
+        exec_args = {**kwargs, **additional_exec_args}
         if not sequential:
             try:
-                return generate_segmented_exec(prompt=prompt, **exec_args)
+                return generate_two_step_wrapper(prompt=prompt,**exec_args)
             except RuntimeError as e:
                 if 'out of memory' in str(e) and len(prompt) > 1:
                     # if an OOM error occurs with batch size >1 in parallel, retry sequentially.
@@ -1570,7 +1662,7 @@ def generate_segmented(
                     # have deterministic seeds in sequential mode: every index after the first will be assigned n+1 as a seed.
                     exec_args["seed"] = exec_args["seed"] if len(seeds) == 0 else seeds[-1] + 1
                     exec_args["eta_seed"] = exec_args["eta_seed"] if len(eta_seeds) == 0 else eta_seeds[-1] + 1
-                    new_out, new_supplementary = generate_segmented_exec(prompt=prompt_item, **exec_args)
+                    new_out, new_supplementary = generate_two_step_wrapper(prompt=prompt_item, **exec_args)
                     # reassemble list of outputs
                     out += new_out
                     seeds.append(new_supplementary['io']['seed'])
@@ -1711,7 +1803,8 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
                 _, item_pm = cleanup_str(p[i])
                 item_prompt_for_metadata = item_pm.replace("\n","\\n")
                 item_metadata = PngInfo()
-                item_metadata.add_text("prompt", f"{item_prompt_for_metadata}\n{argdict_str}")
+                item_metadata.add_text("prompt", str(p[i]))
+                item_metadata.add_text("prompt_data", f"{item_prompt_for_metadata}\n{argdict_str}")
                 item_metadata.add_text("index", str(i))
                 item_metadata.add_text("latents", item_latent_strings[i])
                 filepath_noext = os.path.join(INDIVIDUAL_OUTPUTS_DIR, f"{TIMESTAMP}_{prompts_for_filename}_{i}")
@@ -1719,7 +1812,8 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
                     new_img.save(filepath_noext+".png", pnginfo=item_metadata)
                 item_metadata_list.append(item_metadata)
 
-        metadata.add_text("prompt", f"{prompts_for_metadata}\n{argdict_str}")
+        metadata.add_text("prompt", str(collapse_representation(p)))
+        metadata.add_text("prompt_data", f"{prompts_for_metadata}\n{argdict_str}")
         metadata.add_text("latents", grid_latent_string)
     else:
         item_metadata_list=[] # placeholder for return
@@ -1772,7 +1866,7 @@ def show_image(img, title=None):
 
 # function to create one image containing all input images in a grid.
 # currently not intended for images of differing sizes.
-def image_autogrid(imgs, fixed_rows=None, fill_color=None, separation=None, frame_grid=False) -> Image:
+def image_autogrid(imgs, fixed_rows=None, fill_color=None, separation=None, frame_grid=False) -> Image.Image:
     try:
         assert fill_color is not None
         fill_color = ImageColor.getrgb(fill_color)
@@ -1835,13 +1929,13 @@ class SafetyChecker():
             self.safety_checker.to(self.device)
 
     def eval_concept_scores(self, cos_distances, thresholds, adjustment=0.0):
-        results = {"scores":[None]*len(cos_distances), "detected_concepts":[]}
+        results = {"scores":[None]*len(cos_distances), "detected_concepts":{}}
         for concept_idx in range(len(cos_distances)):
             concept_cos = cos_distances[concept_idx]
             concept_threshold = thresholds[concept_idx].item()
             results["scores"][concept_idx] = round(concept_cos - concept_threshold, 3)
             if results["scores"][concept_idx] > adjustment:
-                results["detected_concepts"].append(concept_idx)
+                results["detected_concepts"][concept_idx]=results["scores"][concept_idx]
         return results
 
     @torch.no_grad()
@@ -1866,8 +1960,9 @@ class SafetyChecker():
         eval_results = self.process_features(images)
         assert len(images) == len(eval_results)
         if any([x["nsfw"]>0 for x in eval_results]):
-            detected_nsfw_concepts = [item["nsfw_concepts"]["detected_concepts"] for item in eval_results]
-            tqdm.write(f"Potential NSFW content detected! ({len([x['nsfw'] for x in eval_results if x['nsfw']>0])} instances, levels {[x['nsfw'] for x in eval_results]}, labels {detected_nsfw_concepts})")
+            detected_nsfw_concepts = [{**item["nsfw_concepts"]["detected_concepts"], **{-1-k:x for k,x in item["special_care"]["detected_concepts"].items()}} for item in eval_results]
+            detected_concepts_repr = [str(item).replace(" ","").replace(":0.",":.") for item in detected_nsfw_concepts]
+            tqdm.write(f"Potential NSFW content detected! ({len([x['nsfw'] for x in eval_results if x['nsfw']>0])} instances, levels {[x['nsfw'] for x in eval_results]}, labels {detected_concepts_repr})")
         for image,result in zip(images, eval_results):
             # Due to potential detection reliability issues with using CLIPSeg directly on "bad concept" labels, the standard safety checker is first employed to detect label presence.
             # Then, CLIPSeg is utilised to generate a blur mask for any areas most likely to contain detected labels, regardless of their absolute detection values.
@@ -1952,15 +2047,21 @@ def load_metadata_from_image(path):
 # interpolate between two latents (if multiple images are contained in a latent, only the first one is used)
 # returns latent sequence, which can be passed into VAE to retrieve image sequence.
 @torch.no_grad()
-def interpolate_latents(latent_a, latent_b, steps=1, overextend=0):
+def interpolate_latents(latent_a, latent_b, steps=1, overextend=0, granular_mode=False):
     _a = latent_a[0]
     _b = latent_b[0]
-    a = _a + (_a-(_a+_b)/2)*overextend
-    b = _b + (_b-(_a+_b)/2)*overextend
-    # split interval [0..1] among step count
-    size_per_step = 1/steps
-    # as range(n) will iterate every item from 0 to n-1, 'a' (starting tensor of interpolation) is included. Attach ending tensor 'b' to the end.
-    return torch.stack([torch.lerp(a,b, torch.full_like(a,size_per_step*step)) for step in tqdm(range(steps), position=0, desc="Interpolating")] + [b])
+    if not granular_mode:
+        a = _a + (_a-(_a+_b)/2)*overextend
+        b = _b + (_b-(_a+_b)/2)*overextend
+        # split interval [0..1] among step count
+        size_per_step = 1/steps
+        # as range(n) will iterate every item from 0 to n-1, 'a' (starting tensor of interpolation) is included. Attach ending tensor 'b' to the end.
+        return torch.stack([torch.lerp(a,b, torch.full_like(a,size_per_step*step)) for step in tqdm(range(steps), position=0, desc="Interpolating")] + [b])
+    else:
+        assert _a.shape == _b.shape
+        thresholds = torch.rand_like(_a) # uniformly distributed in [0,1[.
+        # Each value in the latent tensor will switch from _a to _b when the merge progress is above the random threshold. Could be step/(steps-1), if we were not adding _b to the end.
+        return torch.stack([_a*((thresholds>step/steps)*1.0) + _b*((thresholds<=step/steps)*1.0) for step in tqdm(range(steps), position=0, desc="Interpolating")] + [_b])
 
 # accepts list of list of image. every sublist is one animation.
 def save_animations(images_with_frames):
@@ -1971,7 +2072,9 @@ def save_animations(images_with_frames):
         try:
             initial_image.save(fp=image_basepath+f"{image_index}_a.webp", format='webp', append_images=frames[1:], save_all=True, duration=65, minimize_size=True, loop=1)
             #initial_image.save(fp=image_basepath+f"{image_index}.gif", format='gif', append_images=frames[1:], save_all=True, duration=65) # GIF files take up lots of space.
-            image_autogrid(frames).save(fp=image_basepath+f"{image_index}_grid.webp", format='webp', minimize_size=True)
+            grid = image_autogrid(frames)
+            grid_format = "webp" if all([s <= 16383 for s in grid.size]) else "jpeg" # webp supports a maximum of 16383 in any dimension. Since PIL does not (yet) support AVIF, fall back to JPEG.
+            grid.save(fp=image_basepath+f"{image_index}_grid.{grid_format}", format=grid_format, minimize_size=True)
         except:
             print_exc()
         try:
@@ -2072,6 +2175,10 @@ class QuickGenerator():
             "controlnet_preprocessor":None,
             "controlnet_strength_scheduler":None,
             "safety_processing_level":3,
+            "guidance_rescale":0.66,
+            "second_pass_resize":1,
+            "second_pass_steps":50,
+            "second_pass_use_controlnet":False,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -2111,12 +2218,16 @@ class QuickGenerator():
             controlnet_preprocessor:str=placeholder,
             controlnet_strength_scheduler:str=placeholder,
             safety_processing_level:int=placeholder,
+            guidance_rescale:float=placeholder,
+            second_pass_resize:float=placeholder,
+            second_pass_steps:int=placeholder,
+            second_pass_use_controlnet:bool=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
         unmodified_options = [
             "guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat",
-            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler",
+            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler","guidance_rescale","second_pass_resize","second_pass_steps","second_pass_use_controlnet",
         ]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
@@ -2188,13 +2299,19 @@ class QuickGenerator():
         prompt = prompt if prompt is not None else ""
         prompts = [x.strip() for x in prompt.split("||")]*self.sample_count
 
-        if init_image is not None:
-            init_image = init_image.convert("RGB")
-            if init_image.size != (self.width,self.height):
-                # if lanczos resampling is required, apply a small amount of post-sharpening
-                init_image = init_image.resize((self.width, self.height), resample=Image.Resampling.LANCZOS)
-                enhancer_sharpen = ImageEnhance.Sharpness(init_image)
-                init_image = enhancer_sharpen.enhance(1.15)
+        if init_image not in [None, []]:
+            if not isinstance(init_image, list):
+                init_image = [init_image]
+            prepared_init_image = []
+            for item in init_image:
+                item = item.convert("RGB")
+                if item.size != (self.width,self.height):
+                    # if lanczos resampling is required, apply a small amount of post-sharpening
+                    item = item.resize((self.width, self.height), resample=Image.Resampling.LANCZOS)
+                    enhancer_sharpen = ImageEnhance.Sharpness(item)
+                    item = enhancer_sharpen.enhance(1.15)
+                prepared_init_image.append(item)
+            init_image = prepared_init_image
 
         QuickGenerator.cleanup([self._IO_DEVICE,self._UNET_DEVICE])
         out, SUPPLEMENTARY = self.generate_exec(
@@ -2223,6 +2340,10 @@ class QuickGenerator():
             controlnet_preprocessor=self.controlnet_preprocessor,
             controlnet_input=controlnet_input,
             controlnet_strength_scheduler=self.controlnet_strength_scheduler,
+            guidance_rescale=self.guidance_rescale,
+            second_pass_resize=self.second_pass_resize,
+            second_pass_steps=self.second_pass_steps,
+            second_pass_use_controlnet=self.second_pass_use_controlnet,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -2282,6 +2403,7 @@ class QuickGenerator():
             in_prompt:str="", img_cycles:int=100, save_individual:bool=False, save_final:bool=True,
             init_image:Image.Image=None, text2img:bool=False, color_correct:bool=False, color_target_image:Image.Image=None,
             zoom:int=0,rotate:int=0,center=None,translate=None,sharpen:int=1.0, controlnet_input:Image.Image=None,
+            select_next_image_in_batch:bool=False
         ):
         # sequence prompts across all iterations
         prompts = [p.strip() for p in in_prompt.split("||")]
@@ -2329,7 +2451,7 @@ class QuickGenerator():
 
         correction_target = None
         # first frame is the initial image, if it exists.
-        frames = [] if init_image is None else [init_image.resize((self.width, self.height), resample=Image.Resampling.LANCZOS)]
+        frames = []
         try:
             cycle_bar = tqdm(range(img_cycles), position=0, desc="Image cycle")
             for i in cycle_bar:
@@ -2347,35 +2469,44 @@ class QuickGenerator():
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                selected_idx=0
-                if self.display_with_cv2 and not text2img and len(out) > 1:
-                    tqdm.write("Select next image to continue the sequence")
-                    @dataclass
-                    class ClickContainer():
-                        click_x=-1
-                        click_y=-1
-                    container = ClickContainer()
-                    cv2.waitKey(1)
-                    def callback_handler(event,x,y,flags,param):
-                        if event == cv2.EVENT_LBUTTONUP:
-                            container.click_x,container.click_y = x,y
-                    cv2.setMouseCallback(CV2_TITLE, callback_handler)
-                    while cv2.getWindowProperty(CV2_TITLE, cv2.WND_PROP_VISIBLE):
+                if select_next_image_in_batch:
+                    selected_idx=0
+                    if self.display_with_cv2 and not text2img and len(out) > 1:
+                        tqdm.write("Select next image to continue the sequence")
+                        @dataclass
+                        class ClickContainer():
+                            click_x=-1
+                            click_y=-1
+                        container = ClickContainer()
                         cv2.waitKey(1)
-                        if -1 not in [container.click_x,container.click_y]:
-                            break
-                    selected_col = math.trunc(container.click_x / (self.width+GRID_IMAGE_SEPARATION))
-                    selected_row = math.trunc(container.click_y / (self.height+GRID_IMAGE_SEPARATION))
-                    (_xpos, _ypos, window_width, window_height) = cv2.getWindowImageRect(CV2_TITLE)
-                    selected_idx = int(selected_col + selected_row*round(window_width/(self.width+1),0))
-                    selected_idx = selected_idx if selected_idx in range(len(out)) else 0
-                    tqdm.write(f"Selected: index {selected_idx} in [0,{len(out)-1}]")
-
-                next_frame = out[selected_idx]
-                frames.append(next_frame.copy())
+                        def callback_handler(event,x,y,flags,param):
+                            if event == cv2.EVENT_LBUTTONUP:
+                                container.click_x,container.click_y = x,y
+                        cv2.setMouseCallback(CV2_TITLE, callback_handler)
+                        while cv2.getWindowProperty(CV2_TITLE, cv2.WND_PROP_VISIBLE):
+                            cv2.waitKey(1)
+                            if -1 not in [container.click_x,container.click_y]:
+                                break
+                        selected_col = math.trunc(container.click_x / (self.width+GRID_IMAGE_SEPARATION))
+                        selected_row = math.trunc(container.click_y / (self.height+GRID_IMAGE_SEPARATION))
+                        (_xpos, _ypos, window_width, window_height) = cv2.getWindowImageRect(CV2_TITLE)
+                        selected_idx = int(selected_col + selected_row*round(window_width/(self.width+1),0))
+                        selected_idx = selected_idx if selected_idx in range(len(out)) else 0
+                        tqdm.write(f"Selected: index {selected_idx} in [0,{len(out)-1}]")
+                    next_frame = out[selected_idx]
+                    frames.append(next_frame.copy())
+                else:
+                    next_frame = out
+                    if len(frames) == 0 and init_image is not None:
+                        # init with an autogrid of the correct size: amount of actual copies must match output batch size.
+                        frames = [image_autogrid([init_image.resize((out[0].size), resample=Image.Resampling.LANCZOS)]*len(out))]
+                    frames.append(image_autogrid(out))
                 if not text2img:
                     # skip processing image for next cycle if it will not be used.
-                    init_image = process_cycle_image(next_frame, rotate, center, translate, zoom, sharpen, self.width, self.height, color_correct, correction_target)
+                    if isinstance(next_frame, list):
+                        init_image = [process_cycle_image(item, rotate, center, translate, zoom, sharpen, self.width, self.height, color_correct, correction_target) for item in next_frame]
+                    else:
+                        init_image = process_cycle_image(next_frame, rotate, center, translate, zoom, sharpen, self.width, self.height, color_correct, correction_target)
 
         except KeyboardInterrupt:
             # when an interrupt is received, cancel cycles and attempt to save any already generated images.

@@ -4,13 +4,7 @@ pyproject.toml
 outputs/
 bot_token.py
 poetry.lock
-models/**/config.json
-models/**/diffusion_pytorch_model.bin
-models/**/pytorch_model.bin
-models/**/*.json
-models/**/*.txt
-models/**/*.zip
-models/**/*.7z
+models/**/*.*
 models/concepts/**/*.bin
 models/concepts/**/*.pt
 lora/*.pt
