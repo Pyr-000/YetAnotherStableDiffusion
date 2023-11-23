@@ -30,11 +30,13 @@ permitted_model_ids = {"default_hub":generate.model_id}
 # example: {"local_v1.4":"models/stable-diffusion-v1-4", "local_v1.5":"models/v1.5"}
 permittel_local_model_paths = {"default_local":generate.models_local_dir}
 # available controlnet shortnames
-_controlnet_options_raw = ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"] + [f"sd21-{x}" for x in ["canny","depth","hed","openpose","scribble","zoedepth","color"]]
+_controlnet_options_raw = list(CONTROLNET_SHORTNAMES.keys())
 # available preprocessors: controlnet name -> relevant preprocessor name
 _controlnet_options_preprocessors = {"canny":"canny","openpose":"detect_pose", "mlsd":"detect_mlsd", "hed":"detect_hed", "sd21-canny":"canny","sd21-openpose":"detect_pose", "sd21-hed":"detect_hed"}
 CONTROLNET_PREPROCESS_PREFIX = "process_"
-controlnet_options = _controlnet_options_raw + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys()]
+# split into two, because discord limits us to 25 options per parameter
+controlnet_options_sd1 = [opt for opt in _controlnet_options_raw if not opt.startswith("sd21-")] + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys() if not x.startswith("sd21-")]
+controlnet_options_sd21 = [opt for opt in _controlnet_options_raw if opt.startswith("sd21-")] + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys() if x.startswith("sd21-")]
 # shortnames -> permitted loras (local path only)
 PERMITTED_LORAS = {x.stem:str(x) for x in Path("./lora").glob("*.safetensors")}
 
@@ -361,19 +363,21 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("mix_concatenate",bool,description="When mixing prompts, concatenate the embeddings instead of computing their weighted sum.",required=False,default=False)
 @discord.option("eta",float,description="Higher 'eta' -> more random noise during sampling. Ignored unless scheduler=ddim",required=False,default=0.0)
 @discord.option("eta_seed",str,description="Acts like 'seed', but only applies to the sampling noise for eta > 0.",required=False,default="-1")
-@discord.option("controlnet",str,description="Controlnet model for closer control over the generated image",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in controlnet_options if opt is not None]+[discord.OptionChoice(name="None",value="None")])
+@discord.option("controlnet",str,description="Controlnet model for closer control over the generated image",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in controlnet_options_sd1 if opt is not None]+[discord.OptionChoice(name="None",value="None")])
+@discord.option("controlnet_sd2",str,description="Controlnet model options for SD2.1",required=False,default=None,choices=[discord.OptionChoice(name=opt,value=opt) for opt in controlnet_options_sd21 if opt is not None]+[discord.OptionChoice(name="None",value="None")])
 @discord.option("controlnet_input",discord.Attachment,description="Input image for the controlnet",required=False,default=None)
 @discord.option("controlnet_strength",float,description="Strength (scale) of controlnet guidance",required=False,default=1.0)
 @discord.option("controlnet_schedule",str,description="Variable guidance scale schedule for controlnets. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
 @discord.option("second_pass_resize",float,description="Resize factor for performing two-pass generation. Enabled when >1.",required=False,default=1)
 @discord.option("second_pass_steps",int,description="Amount of second pass sampling steps when two-pass generation is selected.",required=False,default=50)
 @discord.option("second_pass_ctrl",bool,description="Use a specified controlnet instead of img2img for the second pass.",required=False,default=False)
+@discord.option("use_karras_sigmas",bool,description="Use the Karras sigma schedule",required=False,default=True)
 
 async def advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, guidance_rescale:float=0.66, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
-    controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
-    second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False,
+    controlnet:str=None, controlnet_sd2:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
+    second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False, use_karras_sigmas:bool=True,
 ):
     reply = run_advanced(**locals())
     await ctx.send_response(reply)
@@ -381,8 +385,8 @@ async def advanced(
 def run_advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
-    controlnet:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
-    guidance_rescale:float=0.66, second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False,
+    controlnet:str=None, controlnet_sd2:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
+    guidance_rescale:float=0.66, second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False, use_karras_sigmas:bool=True,
 ):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         if not PERMIT_SFW_CHANNEL_USAGE:
@@ -441,8 +445,10 @@ def run_advanced(
         "second_pass_resize":second_pass_resize,
         "second_pass_steps":second_pass_steps,
         "second_pass_use_controlnet":second_pass_ctrl,
+        "use_karras_sigmas":use_karras_sigmas,
     }
 
+    controlnet = controlnet if controlnet is not None else controlnet_sd2
     task_queue.append(prompt_task(ctx, prompt=prompt, init_img=init_img, generator_config=generator_config, controlnet=controlnet, controlnet_input=controlnet_input))
     return f"Processing. Your prompt is number {len(task_queue)+ (1 if currently_generating else 0)} in queue. {additional_text}".strip()
 

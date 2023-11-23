@@ -74,8 +74,12 @@ assert ImageColor.getrgb(GRID_IMAGE_BACKGROUND_COLOR) # check requested color fo
 SAFETY_PROCESSOR_CLIPSEG_MODEL = "CIDAS/clipseg-rd64-refined" # "CIDAS/clipseg-rd64" # "CIDAS/clipseg-rd16"
 # debug option, displays blur heatmaps via cv2 when the safety processor applies masked blur.
 SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
-# Can be used to manually disable xformers memory efficient attention.
+# Switch to using xformers attention if installed. Can be set to False to manually disable xformers attention regardless of availability.
 XFORMERS_ENABLED = True
+try:
+    import xformers
+except ImportError:
+    XFORMERS_ENABLED = False
 
 OUTPUT_DIR_BASE = "outputs"
 OUTPUTS_DIR = f"{OUTPUT_DIR_BASE}/generated"
@@ -87,14 +91,32 @@ os.makedirs(INDIVIDUAL_OUTPUTS_DIR, exist_ok=True)
 os.makedirs(UNPUB_DIR, exist_ok=True)
 os.makedirs(ANIMATIONS_DIR, exist_ok=True)
 
-IMPLEMENTED_SCHEDULERS = ["lms", "pndm", "ddim", "euler", "euler_ancestral", "mdpms", "sdpms", "kdpm2", "kdpm2_ancestral", "heun", "deis", "unipc"] # ipndm not supported
+SCHEDULER_OPTIONS = {
+    "ddim": DDIMScheduler,
+    "lms":LMSDiscreteScheduler,"pndm":PNDMScheduler,
+    "euler": EulerDiscreteScheduler, "euler_ancestral": EulerAncestralDiscreteScheduler,
+    "heun": HeunDiscreteScheduler,
+    "mdpms": DPMSolverMultistepScheduler, "sdpms": DPMSolverSinglestepScheduler,
+    "kdpm2": KDPM2DiscreteScheduler, "kdpm2_ancestral": KDPM2AncestralDiscreteScheduler,
+    "deis": DEISMultistepScheduler,
+    "unipc": UniPCMultistepScheduler
+}
+IMPLEMENTED_SCHEDULERS = list(SCHEDULER_OPTIONS.keys())
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
 IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand"]
 # preprocessors for controlnet input images
 AUX_PREPROCESSORS = ["detect_pose", "detect_mlsd", "detect_hed"] # , "detect_midas"] # seems to not be in pypi yet, hold until next release
 IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + AUX_PREPROCESSORS
 # short names for specifying controlnet models. will translate requests for name into requests for CONTROLNET_SHORTNAMES[name]
-CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]} | {name:f"thibaud/controlnet-{name}-diffusers" for name in [f"sd21-{x}" for x in ["canny","depth","hed","openpose","scribble","zoedepth","color"]]}
+# Controlnet V1 SD1.x
+CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]}
+# SD2.1
+CONTROLNET_SHORTNAMES |= {name:f"thibaud/controlnet-{name}-diffusers" for name in [f"sd21-{x}" for x in ["canny","depth","hed","openpose","scribble","zoedepth","color"]]}
+# Controlnet V1.1 SD1.x 'production ready' - will replace V1 controlnet shortcuts of the same name
+CONTROLNET_SHORTNAMES |= {name:f"lllyasviel/control_v11p_sd15_{name}" for name in ["canny", "mlsd", "normalbae", "seg", "inpaint", "lineart", "openpose", "scribble", "softedge"]}
+# Controlnet V1.1 SD1.x 'experimental' or with alternate prefix
+CONTROLNET_SHORTNAMES |= {"tile":"lllyasviel/control_v11f1e_sd15_tile", "depth":"lllyasviel/control_v11f1p_sd15_depth", "instruct":"lllyasviel/control_v11e_sd15_ip2p", "shuffle":"lllyasviel/control_v11e_sd15_shuffle", "lineart_anime":"lllyasviel/control_v11p_sd15s2_lineart_anime"}
+
 
 # sd2.0 default negative prompt
 DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
@@ -147,9 +169,10 @@ def parse_args():
     parser.add_argument("-icc", "--image-color-correction", action="store_true", help="When cycling images, keep lightness and colorization distribution the same as it was initially (LAB histogram cdf matching). Prevents 'magenta shifting' with multiple cycles.", dest="cycle_color_correction")
     parser.add_argument("-cfi", "--cycle-fresh-image", action="store_true", help="When cycling images (-ic), create a fresh image (use text-to-image) in each cycle. Useful for interpolating prompts (especially with fixed seed)", dest="cycle_fresh")
     parser.add_argument("-cb", "--cuda-benchmark", action="store_true", help="Perform CUDA benchmark. Should improve throughput when computing on CUDA, but may slightly increase VRAM usage.", dest="cuda_benchmark")
-    parser.add_argument("-as", "--attention-slice", type=int, default=None, help="Set UNET attention slicing slice size. 0 for recommended head_count//2, 1 for maximum memory savings", dest="attention_slicing")
+    parser.add_argument("-as", "--attention-slice", type=int, default=None, help="Set UNET attention slicing slice size. Also enables VAE slicing and tiling. 0 for recommended head_count//2, 1 for maximum memory savings", dest="attention_slicing")
     parser.add_argument("-co", "--cpu-offload", action='store_true', help="Set to enable CPU offloading through accelerate. This should enable compatibility with minimal VRAM at the cost of speed.", dest="cpu_offloading")
     parser.add_argument("-gsc","--gs-schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for variable guidance scale. Default (None) corresponds to no schedule.", dest="gs_schedule")
+    parser.add_argument("-ks","--karras-sigmas", type=bool, default=True, help="Set to have the scheduler use 'Karras Sigmas' if available.", dest="karras_sigmas")
     parser.add_argument("-om","--online-model", type=str, default=None, help="Set an online model id for acquisition from huggingface hub.", dest="online_model")
     parser.add_argument("-lm","--local-model", type=str, default=None, help="Set a path to a directory containing local model files (should contain unet and vae dirs, see local install in readme).", dest="local_model")
     parser.add_argument("-od","--output-dir", type=str, default=None, help="Set an override for the base output directory. The directory will be created if not already present.", dest="output_dir")
@@ -257,7 +280,8 @@ def main():
         args.animate, args.sequential_samples, True, True, args.attention_slicing, True, args.gs_schedule,
         args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
         controlnet_model, args.controlnet_strength, args.controlnet_preprocessor, args.controlnet_schedule,
-        args.safety_processing_level, args.guidance_rescale, args.second_pass_resize, args.second_pass_steps, args.second_pass_use_controlnet
+        args.safety_processing_level, args.guidance_rescale, args.second_pass_resize, args.second_pass_steps, args.second_pass_use_controlnet,
+        use_karras_sigmas=args.karras_sigmas,
     )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
@@ -344,7 +368,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         else:
             print(f"Using vae '{vae_model_id}' (no local data present at {vae_dir})")
         text_encoder_dir = os.path.join(models_local_dir, "text_encoder")
-        if dir_has_model_files(text_encoder_dir, [["config.json"], ["pytorch_model.bin", "pytorch_model.safetensors"]]):
+        if dir_has_model_files(text_encoder_dir, [["config.json"], ["pytorch_model.bin", "pytorch_model.safetensors", "model.bin", "model.safetensors"]]):
             print(f"Using local text encoder! ({models_local_dir})")
             text_encoder_id = text_encoder_dir
         else:
@@ -1166,50 +1190,28 @@ def generate_segmented(
             pass
         return gs_mult
 
-    def get_scheduler(sched_name, high_beta=False):
+    def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_name=False):
         if high_beta:
             # scheduler default
             beta_start, beta_end = 0.0001, 0.02
         else:
             # stablediffusion default
             beta_start, beta_end = 0.00085, 0.012
-        scheduler_params = {"beta_start":beta_start, "beta_end":beta_end, "beta_schedule":"scaled_linear", "num_train_timesteps":1000}
+        scheduler_params = {"beta_start":beta_start, "beta_end":beta_end, "beta_schedule":"scaled_linear", "num_train_timesteps":1000, "skip_prk_steps":True, "use_karras_sigmas":use_karras_sigmas}
         if V_PREDICTION_MODEL:
             if not sched_name in V_PREDICTION_SCHEDULERS:
                 tqdm.write(f"WARNING: A v_prediction model is running, but the selected scheduler {sched_name} is not listed as v_prediction enabled. THIS WILL YIELD BAD RESULTS! Switch to one of {V_PREDICTION_SCHEDULERS}")
             else:
                 scheduler_params["prediction_type"] = "v_prediction"
-        if "lms" == sched_name:
-            scheduler = LMSDiscreteScheduler(**scheduler_params)
-        elif "pndm" == sched_name:
-            # "for some models like stable diffusion the prk steps can/should be skipped to produce better results."
-            scheduler = PNDMScheduler(**scheduler_params, skip_prk_steps=True) # <-- pipeline default
-        elif "ddim" == sched_name:
-            scheduler = DDIMScheduler(**scheduler_params)
-        elif "ipndm" == sched_name:
-            scheduler = IPNDMScheduler(**scheduler_params)
-        elif "euler" == sched_name:
-            scheduler = EulerDiscreteScheduler(**scheduler_params)
-        elif "euler_ancestral" == sched_name:
-            scheduler = EulerAncestralDiscreteScheduler(**scheduler_params)
-        elif "mdpms" == sched_name:
-            scheduler = DPMSolverMultistepScheduler(**scheduler_params)
-        elif "sdpms" == sched_name:
-            scheduler = DPMSolverSinglestepScheduler(**scheduler_params)
-        elif "kdpm2" == sched_name:
-            scheduler = KDPM2DiscreteScheduler(**scheduler_params)
-        elif "kdpm2_ancestral" == sched_name:
-            scheduler = KDPM2AncestralDiscreteScheduler(**scheduler_params)
-        elif "heun" == sched_name:
-            scheduler = HeunDiscreteScheduler(**scheduler_params)
-        elif "deis" == sched_name:
-            scheduler = DEISMultistepScheduler(**scheduler_params)
-        elif "unipc" == sched_name:
-            scheduler = UniPCMultistepScheduler(**scheduler_params)
-
+        # pndm: skip_prk_steps=True "for some models like stable diffusion the prk steps can/should be skipped to produce better results." # pndm: skip_prk_steps=True
+        assert sched_name in SCHEDULER_OPTIONS, f"Requested unknown scheduler: {sched_name}"
+        scheduler_class = SCHEDULER_OPTIONS.get(sched_name)
+        available_scheduler_params = {k:v for k,v in scheduler_params.items() if k in scheduler_class._get_init_keys(scheduler_class)}
+        scheduler = scheduler_class(**available_scheduler_params)
+        if not return_name:
+            return scheduler
         else:
-            raise ValueError(f"Requested unknown scheduler: {sched_name}")
-        return scheduler
+            return scheduler, f"{sched_name}{f' (Karras sigmas)' if available_scheduler_params.get('use_karras_sigmas',False) else ''}{f' (high beta)' if high_beta else ''}"
 
     # see diffusers PR: https://github.com/huggingface/diffusers/commit/12a232efa99d7a8c33f54ae515c5a3d6fc5c8f34
     def rescale_prediction(noise_pred:torch.Tensor, noise_pred_text:torch.Tensor, rescale_factor:float=0.66) -> torch.Tensor:
@@ -1225,7 +1227,7 @@ def generate_segmented(
             animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
             encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
             controlnet:ControlNetModel=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
-            guidance_rescale=0.66, *args, **kwargs
+            guidance_rescale=0.66, use_karras_sigmas=False, *args, **kwargs
         ):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
@@ -1290,13 +1292,13 @@ def generate_segmented(
             generator_unet = torch.Generator("cpu").manual_seed(seed)
 
         sched_name = sched_name.lower().strip()
-        SUPPLEMENTARY["io"]["sched_name"]=sched_name
 
         text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers, static_length, mix_mode_concat)
         for key in io_data:
             SUPPLEMENTARY["io"][key] = io_data[key]
 
-        scheduler = get_scheduler(sched_name, high_beta)
+        scheduler, io_sched_name = get_scheduler(sched_name=sched_name, high_beta=high_beta, use_karras_sigmas=use_karras_sigmas, return_name=True)
+        SUPPLEMENTARY["io"]["sched_name"] = io_sched_name
         # set timesteps. Also offset, as pipeline does this
         scheduler_offset = 1 if "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys()) else 0
         scheduler.set_timesteps(steps, **({"offset":scheduler_offset} if scheduler_offset>0 else {}))
@@ -1849,6 +1851,8 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
 def cleanup_str(input):
     if isinstance(input, (list, Tuple)) and len(input) == 1:
         s = str(input[0])
+    elif isinstance(input, (list, Tuple)):
+        s = collapse_representation(input)
     else:
         s = str(input)
     new_string = "".join([char if char.isalnum() else "_" for char in s])
@@ -1978,7 +1982,9 @@ class SafetyChecker():
 
 # return LAB colorspace array for image
 def image_to_correction_target(img):
-    return cv2.cvtColor(np.asarray(img.copy()), cv2.COLOR_RGB2LAB)
+    if isinstance(img,list):
+        img = img[0]
+    return cv2.cvtColor(np.asarray(img.copy().convert("RGB")), cv2.COLOR_RGB2LAB)
 
 def process_cycle_image(img:Image.Image, rotation:int=0, rotation_center:tuple=None, translation:tuple=(0,0), zoom:int=0, resample_sharpen:float=1.2, width:int=512, height:int=512, perform_histogram_correction:bool=True, correction_target:np.ndarray=None):
     from skimage import exposure
@@ -2179,6 +2185,7 @@ class QuickGenerator():
             "second_pass_resize":1,
             "second_pass_steps":50,
             "second_pass_use_controlnet":False,
+            "use_karras_sigmas":False,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -2222,12 +2229,13 @@ class QuickGenerator():
             second_pass_resize:float=placeholder,
             second_pass_steps:int=placeholder,
             second_pass_use_controlnet:bool=placeholder,
+            use_karras_sigmas:bool=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
         unmodified_options = [
             "guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat",
-            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler","guidance_rescale","second_pass_resize","second_pass_steps","second_pass_use_controlnet",
+            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler","guidance_rescale","second_pass_resize","second_pass_steps","second_pass_use_controlnet", "use_karras_sigmas",
         ]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
@@ -2289,8 +2297,10 @@ class QuickGenerator():
             self._unet.set_attention_slice(slice_size)
             if slice_size is not None:
                 self._vae.enable_slicing()
+                self._vae.enable_tiling()
             else:
                 self._vae.disable_slicing()
+                self._vae.disable_tiling()
 
 
     @torch.no_grad()
@@ -2344,6 +2354,7 @@ class QuickGenerator():
             second_pass_resize=self.second_pass_resize,
             second_pass_steps=self.second_pass_steps,
             second_pass_use_controlnet=self.second_pass_use_controlnet,
+            use_karras_sigmas=self.use_karras_sigmas,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -2406,6 +2417,8 @@ class QuickGenerator():
             select_next_image_in_batch:bool=False
         ):
         # sequence prompts across all iterations
+        if in_prompt is None:
+            in_prompt = ""
         prompts = [p.strip() for p in in_prompt.split("||")]
         iter_per_prompt = (img_cycles / (len(prompts)-1)) if text2img and (len(prompts) > 1) else img_cycles / len(prompts)
 

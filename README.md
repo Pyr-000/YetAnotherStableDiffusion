@@ -1,25 +1,26 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
 ## Recent changes to requirements
-- Updating `diffusers`, `transformers`, `huggingface-hub` and `accelerate` is generally recommended.
+- Updating `diffusers`, `transformers`, `huggingface-hub`, `accelerate`, `pytorch` and `xformers` (if installed) is generally recommended.
+- Upgrading Python from older versions to Python 3.9 is now required.
 - controlnet_aux can be installed for additional controlnet preprocessors (pose extraction, M-LSD segmentation, HED edge detection)
-- xformers should be installed to significantly boost efficiency (pre-built xformers should now be available regardless of platform)
-  - NOTE: xformers 0.0.16 **requires** at least pytorch 1.13.1. Installing it with an older version of pytorch may update to a cpu-only version. [Manually updating pytorch](#install-pytorch-skip-when-using-a-pre-existing-stablediffusion-compatible-environment) to 1.13.1 with CUDA support may be required.
+- xformers can optionally be installed to potentially boost efficiency (testing required for Pytorch2.0+, effectiveness may vary depending on hardware)
+  - If xformers is not installed, this implementation should have Diffusers default to [PyTorch2.0 efficient attention](https://huggingface.co/docs/diffusers/optimization/torch2.0). This should perform similarly to xformers efficient attention. Especially without using PyTorch2.0 model compilation (not platform-agnostic), using xformers may still provide slightly better performance.
+  - The latest version of xformers often **requires** a specific (usually the latest) version of pytorch. Installing xformers with an older (or newer) version of pytorch may update pytorch to a cpu-only version. [Manually updating pytorch](#install-pytorch-skip-when-using-a-pre-existing-stablediffusion-compatible-environment) to the correct version with CUDA support may be required.
+  - Depending on the CUDA capability of your hardware, you may need to manually specify the correct index URL when installing. See installation information on the [installation section of the xformers repository](https://github.com/facebookresearch/xformers#installing-xformers).
 - [lora_diffusion](https://github.com/cloneofsimo/lora.git) can be installed to load their compatible LoRA embeddings.
-- `diffusers` should be updated. `accelerate` can now be used to perform automatic CPU offloading.
-- Now requires `scikit-image` package to perform color correction during image cycling
+- The `scikit-image` package is required when performing color correction during image cycling
 
 # Python Installation
+Python version 3.9+ is required. Testing is currently carried out under Python 3.9.
 ## Install `pytorch` (skip when using a pre-existing StableDiffusion-compatible environment)
-Get the correct installation for your hardware at https://pytorch.org/get-started/locally/.
-
-When installing pytorch with CUDA support, the `conda` install command will install cudatoolkit as well.
-
-When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. CUDA toolkit can be found at: https://developer.nvidia.com/cuda-downloads.
+- Get the correct installation for your hardware at https://pytorch.org/get-started/locally/.
+  - When installing pytorch with CUDA support, the `conda` install command will install cudatoolkit as well.
+  - When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. CUDA toolkit can be found at: https://developer.nvidia.com/cuda-downloads.
 #
 ## Install additional dependencies
 ```shell
-pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate xformers controlnet_aux
+pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate controlnet_aux
 pip install git+https://github.com/cloneofsimo/lora.git
 ```
 Most pre-existing StableDiffusion-compatible environments will already have some of these installed.
@@ -49,31 +50,62 @@ In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and
 
 If `scheduler/scheduler_config.json` is not provided, the model will be presumed to not be a v_prediction model (this will cause issues with anything but the _base_ variant of SD2.x).
 If `text_encoder` and `tokenizer` do not provide the required files, the model will be loaded with `openai/clip-vit-large-patch14`, which is used in SD1.x-style models. This is incompatible with SD2.x.
+<details><summary>[Example SD2.1 model directory structure]</summary>
+
+The following files should be present in the model directory. `.bin` files may be substituted with `.safetensors` files. Additional files may be present, especially when the model is acquired via `git clone`.
+```shell
+stable-diffusion-2-1/
+├── scheduler/
+│   └── scheduler_config.json
+├── text_encoder/
+│   ├── config.json
+│   └── pytorch_model.bin
+├── tokenizer/
+│   ├── merges.txt
+│   ├── special_tokens_map.json
+│   ├── tokenizer_config.json
+│   └── vocab.json
+├── unet/
+│   ├── config.json
+│   └── diffusion_pytorch_model.bin
+└── vae/
+    ├── config.json
+    └── diffusion_pytorch_model.bin
+```
+</details>
 
 ### Option A: Automatic model install via huggingface:
-You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4. Manually logging in and accepting the license on the huggingface webpage is no longer required.
-
-Model installation should occur automatically, even without being logged into huggingface hub.
-
-<!--If you have already logged into huggingface-cli on your machine, you can skip the model installation step. Models will be downloaded automatically.
-
-Otherwise, get a valid token with read access for your huggingface account, accessible at https://huggingface.co/settings/tokens. You can then:-->
-As manually accepting the license on the huggingface webpage should no longer be required, you should no longer need to log in. If your online model repository requires access credentials, you can provide them via the following:
-- Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
-- Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
+- You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4.
+- Model installation should occur automatically, even without being logged into huggingface hub. A custom model id can be specified via `-om` (see:[Specifying models](#specifying-models))
+- If your (custom) online model repository requires access credentials, you can provide them via the following:
+  - Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
+  - Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
 
 ### Option B: Manual model install:
-- Navigate to https://huggingface.co/CompVis/stable-diffusion-v1-4/. Note the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) (logging in to accept the license should no longer be required).
+- Navigate to https://huggingface.co/CompVis/stable-diffusion-v1-4/. Note the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)).
 - Head to the `Files and versions` tab, and navigate to `stable-diffusion-v1-4/unet`
   - Download both `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`)
   - place both files in `models/stable-diffusion-v1-4/unet`
 - Repeat for the VAE model: In the `Files and versions` tab, navigate to `stable-diffusion-v1-4/vae`
   - Download both `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`)
   - Place the files in `models/stable-diffusion-v1-4/vae`
-- It is recommended to keep the branch on the default: `main` instead of switching to `fp16`. The fp32 weights are larger (3.44GB instead of 1.72GB), but can be loaded for both full precision (fp32) and half precision (fp16) use. 
+- Consider keeping the branch on the default: `main` instead of switching to `fp16`. The fp32 weights are larger (3.44GB instead of 1.72GB for SD1.4), but can be loaded for both full precision (fp32) and half precision (fp16) use.
 - Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over directly.
   - If required, custom (monolithic) model checkpoints designated for the "standard StableDiffusion" implementation can be converted to separate models for use with diffusers using their provided conversion script: [diffusers/scripts/convert_original_stable_diffusion_to_diffusers.py](https://github.com/huggingface/diffusers/blob/main/scripts/convert_original_stable_diffusion_to_diffusers.py), available from the [huggingface diffusers repository](https://github.com/huggingface/diffusers).
 - Note: The VAE files can instead be replaced by an StabilityAIs improved `ft-EMA` / `ft-MSE` VAEs, which are available under [huggingface.co/stabilityai/sd-vae-ft-mse/tree/main](https://huggingface.co/stabilityai/sd-vae-ft-mse/tree/main)
+<details><summary>[Example SD1.x model directory structure]</summary>
+
+The following files should be present in the model directory. `.bin` files may be substituted with `.safetensors` files. Additional files may be present, especially when the model is acquired via `git clone`.
+```shell
+v1.5/
+├── unet/
+│   ├── config.json
+│   └── diffusion_pytorch_model.bin
+└── vae/
+    ├── config.json
+    └── diffusion_pytorch_model.bin
+```
+</details>
 
 #
 # Usage & Features
@@ -81,13 +113,19 @@ As manually accepting the license on the huggingface webpage should no longer be
   - Advanced prompt manipulation options including mixing, concatenation, custom in-prompt weights and (per-token) CLIP-skip settings are available.
   - Additional memory optimisation options include (automatic) sequential batching, the usage of xformers attention by default, attention/vae slicing and CPU offloading (see: [Optimisation settings](#device-performace-and-optimization-settings))
 - Animating prompt interpolations is possible for both image-to-image cycling and text-to-image (`-cfi`, see: [Additional Flags](#additional-flags)).
-- `prompts`, `seeds`, and other relevant arguments will be stored in PNG metadata by default.
+- Cycling through iterations of image-to-image comes with a mitigation for keeping the color scheme unchanged, preventing effects such as 'magenta shifting'. (`-icc`, see: [Image to image cycling](#image-to-image-cycling))
 - For every generated output, an image will be saved in `outputs/generated`. When multiple images are batched at once, this singular image will be a grid, with the individual images being saved in `outputs/generated/individual`. Additionally, each generated output will produce a text file in `outputs/generated/unpub` of the same filename, containing the prompt and additional arguments. This can be used for maintaining an external image gallery.
   - Optionally, a different output directory can be specified (`-od`, see: [Additional flags](#additional-flags)).
+  - `prompts`, `seeds`, and other relevant arguments will be stored in PNG metadata by default.
 - The NSFW check will (by default) attach a metadata label, and will perform a local blur corresponding to detected category labels. The processing level may be set (or fully disabled, although this is not recommended) via commandline flags (see: [Additional Flags](#additional-flags)). Note that any biases, false negatives, or false positives caused by CLIP can adversely affect processing results.
   - When the processing performs local blurring, the blur mask is generated via [CLIPSeg](https://huggingface.co/blog/clipseg-zero-shot) for any labels detected by the default safety checker. As absolute detection levels of CLIPSeg are likely less reliable than those produced by the safety checker (CLIPSeg is based on a smaller, less accurate CLIP model), and are thus far uncalibrated for safety checking purposes, the blur mask is generated by selecting any areas of high relative intensity for the given labels. If the safety checker detects a label for which CLIPSeg is not able to provide a sufficiently confident segmentation, this will result in more of the image being obscured.
-- Cycling through iterations of image-to-image comes with a mitigation for keeping the color scheme unchanged, preventing effects such as 'magenta shifting'. (`-icc`, see: [Image to image cycling](#image-to-image-cycling))
+### Extensions
 - "Textual Inversion Concepts", custom prompt embeddings, from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically. `.pt`-style custom embeddings are also supported in the same way.
+- LoRA embeddings are supported (`-lop`,`-low`, see: [Additional Flags](#additional-flags)). This includes native diffusers attn_procs LoRA embeddings, ["lora_diffusion"](https://github.com/cloneofsimo/lora.git) embeddings and other convertable embeddings (LoRA embeddings made/compatible with ["sd-scripts"](https://github.com/kohya-ss/sd-scripts), with both 'normal' linear LoRAs and convolutional LoRAs being supported).
+  - The LoRA converter is derived from the [haofanwang/diffusers](https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py) conversion script, see [diffusers PR#2403](https://github.com/huggingface/diffusers/pull/2403)
+- ControlNets are supported, with included image preprocessors and dynamic (scheduled) ControlNet strength/guidance scale. Refer to the [ControlNet](#controlnet) flags section for details.
+  - If displaying freshly generated images with cv2 is enabled, an additional preview window will be created when preprocessing ControlNet inputs by default. This can be used to inspect the 'correctness' of the preprocessed image.
+### Prompt manipulation
 - Prompts with a dynamic length (no token limit) are supported by chunking, then encoding and re-concatenating prompts when required.
   - It should be noted that supporting prompts with no length limit in this way is not perfect, as the text encoder will not be able to consider information from adjacent prompt chunks for context when encoding. It may sometimes be preferable to manually chunk prompts into self-contained sub-prompts by using the concatenation mixing mode (see usage below, enable via `-mc`, [Additional Flags](#additional-flags))
 - Prompts can be mixed using prompt weights: When prompts are separated by `;;`, their representation within the text encoder space will be averaged. Custom prompt weights can be set by putting a number between the `;;` trailing the prompt. If no value is specified, the default value of 1 will be used as the prompt weight. 
@@ -108,10 +146,6 @@ As manually accepting the license on the huggingface webpage should no longer be
   - Prompt weights are applied after the prompt encoding itself, and will not cause any (additional) fragmentation or chunking of the prompt. This is also the case for local CLIP-skip settings: The prompt is fully encoded, after which the embeddings for different CLIP-skip settings are interleaved according to the requested level on a per-token-basis/per-embedding-vector-basis.
   - Example: `"an (oil painting:0.8) of a cat, (displayed in a gallery:1.2;1)"` will decrease the magnitude of the embedding vectors encoding 'oil painting' by 20%, while utilizing the embedding vectors of the prompt with a CLIP-skip of 1 to encode 'displayed in a gallery', and increasing their magnitude by 20%. To only apply a local CLIP-skip without modifying prompt weights, a weight of 1 must be used: `"an oil painting of a cat, (displayed in a gallery:1;1)"`
   - Stacking multiple weight modifiers by encapsulating them inside eachother is not supported. Instead, individual 'effective' weights of sections must be specified in parallel.
-- LoRA embeddings are supported (`-lop`,`-low`, see: [Additional Flags](#additional-flags)). This includes native diffusers attn_procs LoRA embeddings, ["lora_diffusion"](https://github.com/cloneofsimo/lora.git) embeddings and other convertable embeddings (LoRA embeddings made/compatible with ["sd-scripts"](https://github.com/kohya-ss/sd-scripts), with both 'normal' linear LoRAs and convolutional LoRAs being supported).
-  - The LoRA converter is derived from the [haofanwang/diffusers](https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py) conversion script, see [diffusers PR#2403](https://github.com/huggingface/diffusers/pull/2403)
-- ControlNets are supported, with included image preprocessors and dynamic (scheduled) ControlNet strength/guidance scale. Refer to the [ControlNet](#controlnet) flags section for details.
-  - If displaying freshly generated images with cv2 is enabled, an additional preview window will be created when preprocessing ControlNet inputs by default. This can be used to inspect the 'correctness' of the preprocessed image.
 
 # 
 ## text to image
@@ -142,19 +176,22 @@ python generate.py "a painting of a painter painting a painting"
   - `"heun"`: HeunDiscrete
   - `"deis"`: DEISMultistepScheduler (lower-order-final for \<15 timesteps)
   - `"unipc`" : UniPCMultistepScheduler
+- `-ks`/`--karras-sigmas` specifies if the scheduler should use a 'Karras' sigma (σ) schedule if available, leading to progressively smaller sigma steps. `True` by default. This may sometimes be referred to as the "Karras" variant of a scheduler. See: [(arXiv:2206.00364)](https://arxiv.org/abs/2206.00364) (see `Eq. (5)`). The ρ (rho) parameter used should be 7 across all schedulers.
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
 - `-gsc`/`--gs-schedule` sets a schedule for variable guidance scale. This can help with mitigating potential visual artifacts and other issues caused by high guidance scales. By default (None), a static guidance scale with no schedule will be used. The schedule will be scaled across the amount of diffusion steps (`-s`), yielding a multiplier (usually between `0` and `1`) for the guidance scale specified via `-cs`.
-  - Currently, the following schedules are available: `None`, `"sin"` (1/2-period sine between 0 and π: 0→1→0), `"cos"` (1/4-period cosine between 0 and π/2: 1→0), `"isin"` (inverted sin (1-sin): 1→0→1), `"icos"` (inverted cos (1-cos): 0→1), `"fsin"` (full-period sine between 0 and 2π: 0→1→0→-1→0), `"anneal5"` (2.5 periods of a rectified sine (abs(sin) between 0 and 5π), yielding 5 sequential "bumps" of 0→1→0), `"ianneal5"` (inverted anneal5, 5 sequential "bumps" of 1→0→1)) `"rand"` (random multiplier between 0 and 1 in each step), `"frand"` (random multiplier between -1 and 1 in each step)
+  - Currently, the following schedules are available: `None`, `"sin"` (1/2-period sine between 0 and π: 0→1→0), `"cos"` (1/4-period cosine between 0 and π/2: 1→0), `"isin"` (inverted sin (1-sin): 1→0→1), `"icos"` (inverted cos (1-cos): 0→1), `"fsin"` (full-period sine between 0 and 2π: 0→1→0→-1→0), `"anneal5"` (2.5 periods of a rectified sine (abs(sin) between 0 and 5π), yielding 5 sequential "bumps" of 0→1→0), `"ianneal5"` (inverted anneal5, 5 sequential "bumps" of 1→0→1) `"rand"` (random multiplier between 0 and 1 in each step), `"frand"` (random multiplier between -1 and 1 in each step)
 - `-gr`/`--guidance-rescale` sets the guidance rescale factor 'φ' to improve image exposure distribution and (potentially _significantly_ increase adherence to both the prompt and training data). Disable with a value of 0. The authors of [the paper that introduces this correction (arxiv:2305.08891)](https://arxiv.org/abs/2305.08891) (see `(4)` and `5.2`) empirically recommend values between 0.5 and 0.75.
 
 ### Device, Performace and Optimization settings
-- `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly. See section [Precision](#Precision).
-- `--latents-half` will switch from using full precision (fp32) latents to using half precision (fp16) latents. The difference in memory usage should be insignificant (<1MB). See section [Precision](#Precision).
+- `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly.
+- `--latents-half` will switch from using full precision (fp32) latents to using half precision (fp16) latents. The difference in memory usage should be insignificant (<1MB).
 - `--diff-device` sets the device used for the UNET and diffusion sampling loop. `"cuda"` by default.
-- `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cuda"` by default. Switching this to `"cpu"` will decrease VRAM usage (see the example shown in section [Precision](#Precision)), while only slowing down the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
+- `--io-device` sets the device used for anything outside of the diffusion sampling loop. This will be text encoding and image decoding/encoding. `"cuda"` by default. Switching this to `"cpu"` will decrease VRAM usage, while only slowing down the (significantly less time intensive!) encode and decode operations before and after the sampling loop.
 - `--seq`/`--sequential_samples` will process batch items (if multiple images are to be generated) sequentially, instead of as a single large batch. Reduces VRAM consumption. This flag will activate automatically if generating runs out of memory when more than one image is requested.
-- `-as`/`--attention-slice` sets slice size for UNET attention slicing, reducing memory usage. The value must be a valid divisor of the UNET head count. Set to 1 to maximise memory efficiency. Set to 0 to use the diffusers recommended "auto"-tradeoff between memory reduction and (minimal) speed cost.
+- `-as`/`--attention-slice`
+  - sets slice size for UNET attention slicing, reducing memory usage. The value must be a valid divisor of the UNET head count. Set to 1 to maximise memory efficiency. Set to 0 to use the diffusers recommended "auto"-tradeoff between memory reduction and (minimal) speed cost. This may be overridden by xformers attention if available and enabled.
+  - additionally, if attention slicing is specified (with any value), the VAE will be set to always run in sliced and tiled mode, which should keep the memory requirements of VAE decodes constant between different image resolutions and batch sizes.
 - `-co`/`--cpu-offload` will enable CPU offloading of models through `accelerate`. This should enable compatibility with minimal VRAM at the cost of speed.
 - `-cb`/`--cuda-benchmark` will perform CUDNN performance autotuning (CUDA benchmark). This should improve throughput when computing on CUDA, but will have a slight overhead and may slightly increase VRAM usage.
 #
@@ -195,7 +232,7 @@ When applying image-to-image multiple times sequentially (often with a lower str
 ### Two-pass generation
 - `-spr`/`--second-pass-resize` can be used to perform a second pass on image generation, with image size multiplied by this factor. Enabled for values >1. Initially sampling at a reduced size (e.g. a 'native' image size more common in the model training data) can improve consistency/composition, as well as speed with large resolutions. (Speed can improve when less steps at the larger resolution are ultimately performed)
 - `-sps`/`--second-pass-steps` specifies the number of sampling steps used for the second pass (when a second pass is requested via `-spr`).
-- `-spc`/`--second-pass-controlnet` switches the second pass to use the first pass image in a selected controlnet (instead applying image to image). For batch sizes >1, the same (first) image from the first pass will be used as the controlnet input (does not apply when running in sequential mode).
+- `-spc`/`--second-pass-controlnet` switches the second pass to use the first pass image in a selected controlnet (instead of applying image to image). For batch sizes >1, the same (first) image from the first pass will be used as the controlnet input for every batch item (does not apply when running in sequential mode).
 ### Specifying models
 - `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. See: [Automatic model install](#option-a-automatic-model-install-via-huggingface)
 - `-lm`/`--local-model` can be used to specify a directory containing local model files. This directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`) file each. See: [Manual model install](#option-b-manual-model-install)
@@ -223,26 +260,6 @@ When applying image-to-image multiple times sequentially (often with a lower str
   - `"detect_mlsd"`: Attempts to produce an M-LSD wireframe segmentation of the input image. Recommended when feeding regular images into an `"mlsd"` Control net model. (Requires `controlnet_aux` library)
 - `-cost`/`--controlnet-strength` specifies the strength (guidance scale/cond_scale) with which the ControlNet guidance is applied.
 - `-cosc`/`--controlnet-schedule` can be used to specify a schedule for variable ControlNet strength. Default (None) corresponds to no schedule. This shares scheduler options with `-gsc`, see: [Diffusion Settings](#diffusion-settings).
-
-# Precision
-When switching the precision of either the unet or the latents between full (fp32) and half (fp16), there will be a small difference in outputs.
-
-(Measurements were taken under an older, less optimised version of diffusers. Exact values may no longer be accurate.)
-Switching from a half precision UNET to a full precision UNET will significantly increase the amount of memory required: ~9.15GB instead of ~6.45GB (overall usage) in the example shown below.
-Switching from full precision latents to half precision latents should only reduce the memory usage by less than a megabyte.
-
-The following examples all use the prompt "test one two" with a fixed seed of `-S 1`. The results are (in order):
-- half(fp16) UNET and full(fp32) latents [`default`]
-- half(fp16) UNET and half(fp16) latents [`--latents-half`]
-- full(fp32) UNET and full(fp32) latents [`--unet-full`]
-  
-<img src="./examples/fp16_unet_fp32_latents.png" width="30%" height=25%/> <img src="./examples/fp16_unet_fp16_latents.png" width="30%" height=25%/> <img src="./examples/fp32_unet_fp32_latents.png" width="30%" height=25%/>
-
-Visualization of the difference between outputs in this example (highlighting of pixels where the differences are greater than a 1% fuzz threshold):
-- half(fp16) latents compared to full(fp32) latents (with UNET at half(fp16) precision)
-- half(fp16) UNET compared to full(fp32) UNET (with latents at full(fp32) precision)
-
-<img src="./examples/compare_latent_precision.png" width="30%" height=25%/> <img src="./examples/compare_unet_precision.png" width="30%" height=25%/>
 
 #
 # Discord bot
@@ -288,13 +305,14 @@ pip install py-cord
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution (overridden to 768x768 for SD2.x). Accepts an optional image attachment for performing image-to-image.
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
-  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <mix_concatenate> <ddim_eta> <eta_seed> <controlnet> <controlnet_input> <controlnet_strength> <controlnet_schedule>`
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <mix_concatenate> <ddim_eta> <eta_seed> <controlnet> <controlnet_sd2> <controlnet_input> <controlnet_strength> <controlnet_schedule> <second_pass_resize> <second_pass_steps> <second_pass_ctrl> <use_karras_sigmas>`
     - `Width` and `height` are specified either as pixels (for values >64), or as a multiplier of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
     - `scheduler`, `gs_schedule`, `controlnet` and `controlnet_schedule` display available options.
     - Unless a source image is attached, `img2img_strength` is ignored.
     - Steps are limited to `150` by default.
     - By default, available ControlNets will include the default options available for `-com` ([ControlNet](#controlnet)), as well as variants with the prefix `process_`, which apply the respective preprocessor (`-cop`, [ControlNet](#controlnet)) of the ControlNet model.
+      - Controlnet options have been split into separate arguments for SD1.x and SD2.x, as keeping them merged would exceed the 25 option limit of a command parameter set by discord.
   - `/reload <model name> <enable cpu offload> <attention slicing> <default CLIP skip> <lora1> <lora2> <lora3> <lora1_weight> <lora2_weight> <lora3_weight>` if `PERMIT_RELOAD` is changed to True, this can be used to (re-)load the model from a selection of available models (see above).
     -  Up to three of any available LoRA models can be loaded with a respective weight/alpha. If being able to load more than three LoRA embeddings is required, the command parameters can easily be extended.
   - `/default_negative <negative prompt>` can be used to set a default negative prompt (see: `-dnp`, [Additional flags](#additional-flags)). If <negative_prompt> is not specified, the default negative prompt will be reset.

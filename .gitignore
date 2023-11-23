@@ -3,6 +3,7 @@ pyproject.toml
 # repo specific files
 outputs/
 bot_token.py
+tokens.py
 poetry.lock
 models/**/*.*
 models/concepts/**/*.bin
