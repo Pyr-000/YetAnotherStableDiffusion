@@ -372,12 +372,13 @@ async def landscape(ctx, prompt:str, init_image:discord.Attachment=None):
 @discord.option("second_pass_steps",int,description="Amount of second pass sampling steps when two-pass generation is selected.",required=False,default=50)
 @discord.option("second_pass_ctrl",bool,description="Use a specified controlnet instead of img2img for the second pass.",required=False,default=False)
 @discord.option("use_karras_sigmas",bool,description="Use the Karras sigma schedule",required=False,default=True)
+@discord.option("lora_schedule",str,description="Variable strength schedule for loaded LoRA-like models. Default -> constant scale.",choices=[discord.OptionChoice(name=opt,value=opt) for opt in IMPLEMENTED_GS_SCHEDULES if opt is not None]+[discord.OptionChoice(name="None",value="None")],required=False,default=None)
 
 async def advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, guidance_rescale:float=0.66, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
     controlnet:str=None, controlnet_sd2:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
-    second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False, use_karras_sigmas:bool=True,
+    second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False, use_karras_sigmas:bool=True, lora_schedule:str=None,
 ):
     reply = run_advanced(**locals())
     await ctx.send_response(reply)
@@ -386,7 +387,7 @@ def run_advanced(
     ctx:discord.commands.context.ApplicationContext, prompt:str, width:int=0, height:int=0, seed:str="-1", gs:float=9, steps:int=50, strength:float=0.75, init_image:discord.Attachment=None, amount:int=1,
     scheduler:str="mdpms", gs_schedule:str=None, static_length:int=-1, mix_concatenate:bool=False, eta:float=0.0, eta_seed:str="-1",
     controlnet:str=None, controlnet_sd2:str=None, controlnet_input:discord.Attachment=None, controlnet_strength:float=1, controlnet_schedule:str=None,
-    guidance_rescale:float=0.66, second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False, use_karras_sigmas:bool=True,
+    guidance_rescale:float=0.66, second_pass_resize:float=1, second_pass_steps:int=50, second_pass_ctrl:bool=False, use_karras_sigmas:bool=True, lora_schedule:str=None,
 ):
     if hasattr(ctx.channel, "is_nsfw") and not ctx.channel.is_nsfw():
         if not PERMIT_SFW_CHANNEL_USAGE:
@@ -446,6 +447,7 @@ def run_advanced(
         "second_pass_steps":second_pass_steps,
         "second_pass_use_controlnet":second_pass_ctrl,
         "use_karras_sigmas":use_karras_sigmas,
+        "lora_schedule":lora_schedule,
     }
 
     controlnet = controlnet if controlnet is not None else controlnet_sd2

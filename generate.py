@@ -74,8 +74,14 @@ assert ImageColor.getrgb(GRID_IMAGE_BACKGROUND_COLOR) # check requested color fo
 SAFETY_PROCESSOR_CLIPSEG_MODEL = "CIDAS/clipseg-rd64-refined" # "CIDAS/clipseg-rd64" # "CIDAS/clipseg-rd16"
 # debug option, displays blur heatmaps via cv2 when the safety processor applies masked blur.
 SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
+# increase to boost safety checker thresholds with an extra margin.
+SAFETY_LEVEL_GAIN = 1.0
 # Switch to using xformers attention if installed. Can be set to False to manually disable xformers attention regardless of availability.
 XFORMERS_ENABLED = True
+# When using (differential) progress animation, boost the variance of earlier steps to be in-line with expectations. Early animation steps will look more oversaturated and "noisy" instead of undersaturated and "diffuse"
+ANIMATE_BOOST_VARIANCE = False
+# Compression factor of the sigmoid function when using threshold schedules (gs/controlnet/lora: th2, th5, th7). Values between 20 and 100 recommended. Lower values smooth out the transition, while higher values make the threshold more direct.
+SIGMOID_GS_MULT_COMPRESSION = 50
 try:
     import xformers
 except ImportError:
@@ -103,7 +109,7 @@ SCHEDULER_OPTIONS = {
 }
 IMPLEMENTED_SCHEDULERS = list(SCHEDULER_OPTIONS.keys())
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
-IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand"]
+IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand", "buzz", "th2", "th5", "th7", "ith2", "ith5", "ith7"]
 # preprocessors for controlnet input images
 AUX_PREPROCESSORS = ["detect_pose", "detect_mlsd", "detect_hed"] # , "detect_midas"] # seems to not be in pypi yet, hold until next release
 IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + AUX_PREPROCESSORS
@@ -132,6 +138,9 @@ CUSTOM_PROMPT_SUBST = {
 ACTIVE_LORA = None
 ACTIVE_LORA_WEIGHT = 1.0
 
+# experimental. Not applicable for true LoRAs, as they are directly applied to the weights (applicable for e.g. LoCon models)
+LORA_DROPOUT = 0.0
+LORA_TEXT_ENCODER_FACTOR = 1
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -184,6 +193,7 @@ def parse_args():
     parser.add_argument("-mc", "--mix_concat", action="store_true", help="When mixing prompts, perform a concatenation of their embeddings instead of calculating a weighted sum.", dest="mix_mode_concat")
     parser.add_argument("-lop", "--lora-path", type=str, default=None, nargs="+", help="Path(s) to LoRA embedding(s). Will be loaded via diffusers attn_procs / lora_diffusion / lora converter.", dest="lora_path")
     parser.add_argument("-low", "--lora-weight", type=float, default=[0.8], nargs="+", help="Weight(s) of LoRA embedding(s) loaded via --lora-path. Will wrap around if there are less weights than embeddings.", dest="lora_weight")
+    parser.add_argument("-losc", "--lora-schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for strength of LoRA-like models (basic LoRAs are not affected). Default (None) corresponds to no schedule.", dest="lora_schedule")
     parser.add_argument("-com","--controlnet-model", type=str, default=None, help=f"Set a name, path or hub id pointing to a controlnet model. Known names: {CONTROLNET_SHORTNAMES}", dest="controlnet_model")
     parser.add_argument("-coi","--controlnet-input", type=str, default=None, help="Set a path pointing to an input image for the controlnet.", dest="controlnet_input")
     parser.add_argument("-cost", "--controlnet-strength", type=float, default=1.0, help="strength (cond scale) for applying a controlnet", dest="controlnet_strength")
@@ -234,7 +244,7 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     # load up models
-    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(half_precision=args.half, cpu_offloading=args.cpu_offloading)
+    tokenizer, text_encoder, unet, vae, rate_nsfw = load_models(half_precision=args.half, cpu_offloading=args.cpu_offloading, lora_dropout=LORA_DROPOUT)
     if args.no_check:
         rate_nsfw = lambda x: False
     # create generate function using the loaded models
@@ -281,7 +291,7 @@ def main():
         args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
         controlnet_model, args.controlnet_strength, args.controlnet_preprocessor, args.controlnet_schedule,
         args.safety_processing_level, args.guidance_rescale, args.second_pass_resize, args.second_pass_steps, args.second_pass_use_controlnet,
-        use_karras_sigmas=args.karras_sigmas,
+        use_karras_sigmas=args.karras_sigmas, lora_schedule=args.lora_schedule
     )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
@@ -321,7 +331,7 @@ def recurse_set_xformers(item, max_recursion_depth=16):
         for x in recurse_targets:
             recurse_set_xformers(x,max_recursion_depth-1)
 
-def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False, lora_override:str=None, lora_weight_override:float=None):
+def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae_only=False, lora_override:str=None, lora_weight_override:float=None, lora_dropout:float=0.0):
     global using_local_unet, using_local_vae, PROMPT_SUBST, MAX_CLIP_SKIP, ACTIVE_LORA, ACTIVE_LORA_WEIGHT
     # re-set substitution list (re-loading model would otherwise re-add custom embedding substitutions)
     PROMPT_SUBST = CUSTOM_PROMPT_SUBST
@@ -499,14 +509,14 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                     # finally, try to use lora converter to load
                     try:
                         sd1_len_keys = [k for k in load_data.keys() if len(getattr(load_data[k], "shape", [])) >=2 and 768 == load_data[k].shape[1] and "lora_down.weight" in k]
-                        if (len(sd1_len_keys) >= 92) != encoder_is_sd1: # crude version check, maybe replace with something better
-                            print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
-                            return False
-                        load_lora_convert(load_data,unet=unet, text_encoder=text_encoder, merge_strength=item_weight)
+                        #if (len(sd1_len_keys) >= 92) != encoder_is_sd1: # crude version check, maybe replace with something better
+                        #    print(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
+                        #    return False
+                        load_lora_convert(load_data,unet=unet, text_encoder=text_encoder, merge_strength=item_weight, merge_strength_text_encoder=item_weight*LORA_TEXT_ENCODER_FACTOR, lora_dropout=lora_dropout)
                         tqdm.write(f"{lora_item} loaded via LoRA converter!")
                         return True
                     except Exception as e:
-                        #print_exc()
+                        print_exc()
                         pass
                     #tqdm.write(f"{lora_item} could not be loaded via LoRa converter.")
 
@@ -583,12 +593,41 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     recurse_set_xformers([tokenizer, text_encoder, unet, vae, rate_nsfw])
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
+# LoRA forward hook input processing: attempt to extract the actual input tensor for the block forward from the input tuple.
+def hook_acquire_input(input):
+    if isinstance(input, tuple) and len(input) == 1:
+        input = input[0]
+    elif isinstance(input, tuple) and len(input) > 1:
+        tensor_input = [x for x in input if isinstance(x,torch.Tensor)]
+        extra_input = [x for x in input if not isinstance(x,torch.Tensor)]
+        if len(tensor_input) !=1 :
+            raise ValueError(f"Convolutional LoRA block received {len(tensor_input)} tensors. This should be 1. Unsupported format?")
+        input = tensor_input[0]
+        if len(extra_input) == 1 and isinstance(extra_input, float) and extra_input[0] != 1.0 and not globals().get("_PRINTED_LORA_CONV_FLOAT_INPUT_INFO", False):
+            print(f"Convolutional LoRA block receiving extra float input {extra_input[0]} != 1.0 - Possible alpha value? This input will will be ignored.")
+            global _PRINTED_LORA_CONV_FLOAT_INPUT_INFO
+            _PRINTED_LORA_CONV_FLOAT_INPUT_INFO = True
+        elif len(extra_input) > 1 and not globals().get("_PRINTED_LORA_CONV_EXTRA_INPUT_INFO", False):
+            print(f"Convolutional LoRA block receiving extra input(s) of type(s) {[type(x) for x in extra_input]}. Unsupported format?")
+            global _PRINTED_LORA_CONV_EXTRA_INPUT_INFO
+            _PRINTED_LORA_CONV_EXTRA_INPUT_INFO = True
+    elif not isinstance(input, torch.Tensor):
+        raise ValueError(f"Convolutional LoRA block received input of type {type(tensor_input)}. Expected tuple of one tensor.")
+    return input
+
 # take state dict, apply LoRA to unet and text encoder (at strength)
-def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0.75):
+def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:float=0.75, merge_strength_text_encoder:float=None, lora_dropout:float=0.0):
     # adapted from https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py
     LORA_PREFIX_TEXT_ENCODER = "lora_te"
     LORA_PREFIX_UNET = "lora_unet"
+    lora_dropout = max(0, lora_dropout)
+    lora_dropout = min(1, lora_dropout)
+    dropout = torch.nn.Dropout(p=lora_dropout)
+    merge_strength_text_encoder = merge_strength_text_encoder if merge_strength_text_encoder is not None else merge_strength
     visited = []
+    unparsed_keys = 0
+    parsed_keys = 0
+    null_keys = 0
 
     # directly update weight in diffusers model
     for key in state_dict:
@@ -599,15 +638,28 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
         if "text" in key and LORA_PREFIX_TEXT_ENCODER in key:
             layer_infos = key.split(".")[0].split(LORA_PREFIX_TEXT_ENCODER + "_")[-1].split("_")
             curr_layer = text_encoder
+            curr_model = text_encoder
+            _merge_strength = merge_strength_text_encoder
             if text_encoder is None:
+                unparsed_keys += 1
                 continue
         elif LORA_PREFIX_UNET in key:
             layer_infos = key.split(".")[0].split(LORA_PREFIX_UNET + "_")[-1].split("_")
             curr_layer = unet
+            curr_model = unet
+            _merge_strength = merge_strength
             if unet is None:
+                unparsed_keys += 1
                 continue
         else:
             print(f"skipping unknown LoRA key {key}") # -> {state_dict[key]}")
+            unparsed_keys += 1
+            continue
+
+        # there's not much we can do to apply a zero-dim tensor.
+        if state_dict[key].dim() == 0:
+            unparsed_keys += 1
+            null_keys += 1
             continue
 
         # find the target layer
@@ -625,6 +677,91 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
                 else:
                     temp_name = layer_infos.pop(0)
 
+        if not ("lora_up" in key or "lora_down" in key):
+            if state_dict[key].shape == (1,) and state_dict[key][0] in (0.0,):
+                unparsed_keys += 1
+                null_keys += 1
+                if not globals().get("_PRINTED_LORA_NULL_KEY_INFO", False):
+                    print("'zero' item found in LoRA state dict (single element tensor with 0 value). Treating as null and ignoring.")
+                    global _PRINTED_LORA_NULL_KEY_INFO
+                    _PRINTED_LORA_NULL_KEY_INFO = True
+                continue
+            elif state_dict[key].squeeze().dim() == 1:
+                if isinstance(curr_layer, torch.nn.Linear):
+                    #curr_in_width = curr_layer.weight.data.shape[1]
+                    #curr_out_width = curr_layer.weight.data.shape[0]
+                    curr_in_width = curr_layer.in_features
+                    curr_out_width = curr_layer.out_features
+                elif isinstance(curr_layer, torch.nn.Conv2d):
+                    curr_in_width = curr_layer.in_channels
+                    curr_out_width = curr_layer.out_channels
+                else:
+                    print(f"LoRA Key {key} -> {state_dict[key].shape} (presumed to be bias data) directed at a layer which is neither Linear nor Conv2d: {type(curr_layer)}. Unable to parse.")
+                    unparsed_keys += 1
+                    continue
+                bias_width = state_dict[key].squeeze().shape[0]
+                # attempt to find the .on_input key of the same key name root. If it is present, place the bias at the input.
+                on_input = any([isinstance(k,str) and k.endswith(".on_input") and k.startswith(key.rsplit(".",1)[0]) for k in state_dict.keys()])
+                on_output = any([isinstance(k,str) and k.endswith(".on_output") and k.startswith(key.rsplit(".",1)[0]) for k in state_dict.keys()])
+                # for some reason, indicator keys seem to be swapped. For layers with non-equal input and output widths, the on_input key is set, but the weights only match the output width.
+                # on layers with equal input and output widths, this will fail to be caught. As swapping them moves us from width mismatches on a lot of layers to all widths matching, we will consider this correct.
+                temp = on_input
+                on_input = on_output
+                on_output = temp
+                if bias_width not in (curr_in_width, curr_out_width):
+                    unparsed_keys += 1
+                    print(f"LoRA Key {key} -> {type(state_dict[key]) if not isinstance(state_dict[key], torch.Tensor) else state_dict[key].shape} (presumed to be multiplicative bias) matches neither the input width, nor the output with of the current layer ({curr_in_width} -> {curr_out_width}). Unable to parse.")
+                    if on_input or on_output:
+                        print(f"State dict indicates that the LoRA key was intended for the layer {'input and output (?!)' if on_input and on_output else 'input' if on_input else 'output'}")
+                    continue
+                    """elif curr_in_width == curr_out_width:
+                    unparsed_keys += 1
+                    # If the key name contains a placement clue, this check may be amended.
+                    print(f"LoRA Key {key} -> {type(state_dict[key]) if not isinstance(state_dict[key], torch.Tensor) else state_dict[key].shape} (presumed to be multiplicative bias) matches both the input and output width of the current layer. Unable to parse.")
+                    continue"""
+                else:
+                    if on_input or on_output:
+                        if on_input and not curr_in_width==bias_width:
+                            print(f"LoRA Key {key} is targeted at the input of {curr_layer}, but channel widths do not match! ({bias_width} != {curr_in_width})")
+                            on_input = False
+                        if on_output and not curr_out_width==bias_width:
+                            print(f"LoRA Key {key} is targeted at the output of {curr_layer}, but channel widths do not match! ({bias_width} != {curr_out_width})")
+                            on_output = False
+                    elif not curr_in_width == curr_out_width:
+                        # if the bias only matches one of either the input or output of the target module in width, place it there.
+                        on_input = curr_in_width == bias_width
+
+                    # Intended application of the bias data is derived from the LyCORIS IA3 model forward: https://github.com/KohakuBlueleaf/LyCORIS/blob/9366cdb3e2a1d649530ec1173701db33382b9845/lycoris/modules/ia3.py#L60
+                    bias_data = state_dict[key].to(dtype=curr_layer.weight.dtype)
+                    bias_module = torch.nn.Module()
+                    setattr(bias_module, "weight", torch.nn.Parameter(bias_data))
+                    for name, apply in (('input', on_input), ('output', on_output)):
+                        if apply:
+                            attr_name = f"lora_bias_{name}"
+                            setattr(curr_layer, attr_name, bias_module)
+                    if on_input:
+                        def pre_hook(module, input):
+                            input = hook_acquire_input(input)
+                            model_lora_strength = getattr(curr_model, "lora_strength", 1.0)
+                            return input + dropout(input.to(module.lora_bias_input.weight.dtype) * module.lora_bias_input.weight * _merge_strength*model_lora_strength).to(input.dtype)
+                        curr_layer.register_forward_pre_hook(pre_hook)
+                    if on_output:
+                        def hook(module, input, output):
+                            model_lora_strength = getattr(curr_model, "lora_strength", 1.0)
+                            return output + dropout(output.to(module.lora_bias_output.weight.dtype) * module.lora_bias_output.weight * _merge_strength*model_lora_strength).to(output.dtype)
+                        curr_layer.register_forward_hook(hook)
+                    # check if we actually applied the weights
+                    if on_input or on_output:
+                        parsed_keys += 1
+                    else:
+                        unparsed_keys += 1
+                    continue
+
+            else:
+                unparsed_keys += 1
+                print(f"LoRA Key {key} -> {type(state_dict[key]) if not isinstance(state_dict[key], torch.Tensor) else state_dict[key].shape} does not follow a known state dict convention. Unable to parse.")
+                continue
+
         pair_keys = []
         if "lora_down" in key:
             pair_keys.append(key.replace("lora_down", "lora_up"))
@@ -634,7 +771,7 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
             pair_keys.append(key.replace("lora_up", "lora_down"))
 
         # update weight
-        if "conv" in key:
+        if "conv" in key and isinstance(curr_layer,torch.nn.Conv2d):
             lora_conv_up = torch.nn.Conv2d(curr_layer.in_channels, state_dict[pair_keys[0]].shape[1], curr_layer.kernel_size, curr_layer.stride, curr_layer.padding, bias=False)
             lora_conv_down = torch.nn.Conv2d(state_dict[pair_keys[1]].shape[0], curr_layer.out_channels, 1, 1, bias=False)
             lora_conv_up.weight.data = state_dict[pair_keys[0]]
@@ -642,30 +779,41 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength=0
             setattr(curr_layer,"lora_conv_up", lora_conv_up)
             setattr(curr_layer,"lora_conv_down", lora_conv_down)
             # apply default conv forward, then add lora conv forward results, at merge strength
-            curr_layer:torch.nn.Conv2d
             def hook(module, input, output):
                 # input will be a tuple of "only the positional arguments given to the module", which should only be the input tensor itself.
-                if isinstance(input, tuple) and len(input) == 1:
-                    input = input[0]
+                input = hook_acquire_input(input)
                 lora_dtype_down = module.lora_conv_up.weight.data.dtype
                 lora_dtype_up = module.lora_conv_down.weight.data.dtype
-                return (output.to(lora_dtype_up) + module.lora_conv_up(module.lora_conv_down(input.to(lora_dtype_down)).to(lora_dtype_up)) * merge_strength).to(input.dtype)
+                model_lora_strength = getattr(curr_model, "lora_strength", 1.0)
+                return (output.to(lora_dtype_up) + dropout(module.lora_conv_up(module.lora_conv_down(input.to(lora_dtype_down)).to(lora_dtype_up)) * _merge_strength*model_lora_strength).to(input.dtype))
             curr_layer.register_forward_hook(hook)
+            parsed_keys += len(pair_keys)
 
         elif len(state_dict[pair_keys[0]].shape) == 4:
             weight_up = state_dict[pair_keys[0]].squeeze(3).squeeze(2).to(torch.float32)
             weight_down = state_dict[pair_keys[1]].squeeze(3).squeeze(2).to(torch.float32)
-            curr_layer.weight.data += merge_strength * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
+            curr_layer.weight.data += _merge_strength * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
+            parsed_keys += len(pair_keys)
         else:
-            weight_up = state_dict[pair_keys[0]].to(torch.float32)
-            weight_down = state_dict[pair_keys[1]].to(torch.float32)
-            curr_layer.weight.data += merge_strength * torch.mm(weight_up, weight_down)
+            try:
+                weight_up = state_dict[pair_keys[0]].to(torch.float32)
+                weight_down = state_dict[pair_keys[1]].to(torch.float32)
+                curr_layer.weight.data += _merge_strength * torch.mm(weight_up, weight_down)
+                parsed_keys += len(pair_keys)
+            except Exception as _:
+                print_exc(chain=False)
+                print(f"LoRA Key {key} -> {type(state_dict[key]) if not isinstance(state_dict[key], torch.Tensor) else state_dict[key].shape} failed to apply. Unable to parse.")
+                unparsed_keys += 1
 
         # update visited list
         for item in pair_keys:
             visited.append(item)
         #except Exception as e:
             # print(f"LoRA converter {e} | {key} | {curr_layer.weight.data.shape} | {state_dict[pair_keys[0]].shape} | {state_dict[pair_keys[1]].shape}")
+    if unparsed_keys > 0:
+        print(f"LoRA loaded {parsed_keys} keys, with {unparsed_keys-null_keys} keys (and {null_keys} null keys) not being applied.")
+        if parsed_keys == 0:
+            raise ValueError("Could not parse and load any keys from the LoRA state dict.")
 
 def try_int(s:str, default:int=None):
     try:
@@ -1163,7 +1311,7 @@ def generate_segmented(
 
         return text_embeddings, batch_size, io_data
 
-    def get_gs_mult(gs_schedule:str, progress_factor:float):
+    def get_gs_mult(gs_schedule:str, progress_factor:float, step_idx:int=None):
         gs_mult = 1
         if gs_schedule is None or gs_schedule == "":
             pass
@@ -1185,6 +1333,20 @@ def generate_segmented(
             gs_mult = np.random.rand()
         elif gs_schedule == "frand": # random multiplier, with negative values
             gs_mult = np.random.rand()*2-1
+        elif gs_schedule == "buzz": # switch back and forth between 0 and 1. Downwards compatibility: If no step is provided, randomly switch between 0 and 1.
+            gs_mult = float(np.random.randint(0,2) if not isinstance(step_idx, int) else step_idx%2)
+        elif gs_schedule == "th2": # threshold at 0.25
+            gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.25)*SIGMOID_GS_MULT_COMPRESSION))
+        elif gs_schedule == "th5": # threshold at 0.5
+            gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.5)*SIGMOID_GS_MULT_COMPRESSION))
+        elif gs_schedule == "th7": # threshold at 0.75
+            gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.75)*SIGMOID_GS_MULT_COMPRESSION))
+        elif gs_schedule == "ith2": # threshold at 0.25
+            gs_mult = 1/(1 + np.exp((-progress_factor+0.25)*SIGMOID_GS_MULT_COMPRESSION))
+        elif gs_schedule == "ith5": # threshold at 0.5
+            gs_mult = 1/(1 + np.exp((-progress_factor+0.5)*SIGMOID_GS_MULT_COMPRESSION))
+        elif gs_schedule == "ith7": # threshold at 0.75
+            gs_mult = 1/(1 + np.exp((-progress_factor+0.75)*SIGMOID_GS_MULT_COMPRESSION))
         else:
             # Could add a warning here.
             pass
@@ -1227,7 +1389,7 @@ def generate_segmented(
             animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
             encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
             controlnet:ControlNetModel=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
-            guidance_rescale=0.66, use_karras_sigmas=False, *args, **kwargs
+            guidance_rescale=0.66, use_karras_sigmas=True, lora_schedule=None, *args, **kwargs
         ):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
@@ -1262,6 +1424,7 @@ def generate_segmented(
                 "controlnet_scheduler": controlnet_strength_scheduler,
                 "processed_controlnet_input": None,
                 "guidance_rescale": guidance_rescale if guidance_rescale > 0 else None,
+                "lora_schedule": lora_schedule,
             },
             "latent" : {
                 "final_latent" : None,
@@ -1368,11 +1531,13 @@ def generate_segmented(
             if hasattr(scheduler, "scale_model_input"):
                 latent_model_input = scheduler.scale_model_input(latent_model_input, t)
             progress_factor = i/len(scheduler.timesteps[starting_timestep:])
+            lora_schedule_mult = 1.0 if lora_schedule in (None, "") else get_gs_mult(lora_schedule, progress_factor, i)
+            setattr(unet, "lora_strength", lora_schedule_mult)
             # predict the noise residual
             with torch.no_grad():
                 cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
                 cast_unet_args = {"device":cast_device, "dtype":unet.dtype}
-                down_block_residuals, mid_block_residual, incompatible = apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args)
+                down_block_residuals, mid_block_residual, incompatible = apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i)
                 if incompatible:
                     tqdm.write(f"Dimension mismatch between controlnet and diffusion UNET! Versions may be mismatched between SD1.x and SD2.x! Disabling controlnet for this diffusion.")
                     controlnet_input = None
@@ -1400,14 +1565,21 @@ def generate_segmented(
 
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            gs_mult = get_gs_mult(gs_schedule, progress_factor)
+            gs_mult = get_gs_mult(gs_schedule, progress_factor, i)
             progress_bar.set_description(f"gs={gs*gs_mult:.3f}{';seq_batch' if unet_sequential_batch else ''}")
             noise_pred = noise_pred_uncond + gs * (noise_pred_text - noise_pred_uncond) * gs_mult
             if isinstance(guidance_rescale, float) and guidance_rescale > 0:
                 noise_pred = rescale_prediction(noise_pred, noise_pred_text, guidance_rescale)
 
             if animate and animate_pred_diff:
-                animate_latents = ((latents-noise_pred)*(1-(i/len(scheduler.timesteps))**2) + latents*(i/len(scheduler.timesteps))**2).cpu().clone()
+                #animate_latents = ((latents-noise_pred)*(1-(i/len(scheduler.timesteps))**2) + latents*(i/len(scheduler.timesteps))**2).cpu().clone()
+                latents_expected_noise_level = t/getattr(scheduler,"config", {"num_train_timesteps":1000})["num_train_timesteps"]
+                animate_latents = ((latents-noise_pred)*(latents_expected_noise_level) + latents*(1-latents_expected_noise_level)).cpu().clone()
+                if ANIMATE_BOOST_VARIANCE:
+                    maxvar = max(float(torch.max(torch.var(noise_pred))),float(torch.max(torch.var(latents))))
+                    anim_var = float(torch.var(animate_latents))
+                    if maxvar > anim_var:
+                        animate_latents *= maxvar/anim_var
                 SUPPLEMENTARY["latent"]["latent_sequence"].append(animate_latents)
             del noise_pred_uncond, noise_pred_text
             # compute the previous noisy sample x_t -> x_t-1
@@ -1463,6 +1635,22 @@ def generate_segmented(
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
                 SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_with_failover(vae,(item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+                # if any safety processing was applied, copy it to the animated output
+                img_blur_masks = [getattr(image_item, "blur_mask", None) for image_item in pil_images]
+                img_removals = [getattr(image_item, "safety_remove", False) for image_item in pil_images]
+                if any(img_removals):
+                    for img_idx, img in enumerate(step_items):
+                        for step_items in SUPPLEMENTARY["io"]["image_sequence"]:
+                            if img_removals[img_idx]:
+                                img.paste(GRID_IMAGE_BACKGROUND_COLOR, [0,0,img.size[0],img.size[1]])
+                try:
+                    if any([x is not None for x in img_blur_masks]) and isinstance(rate_nsfw, SafetyChecker):
+                        SUPPLEMENTARY["io"]["image_sequence"] = [[
+                            img if (img_idx >= len(img_blur_masks)) or (img_blur_masks[img_idx] is None) else rate_nsfw.safety_processor.process_masked_blur(img, None, None, mask_override=img_blur_masks[img_idx]) for img_idx, img in enumerate(step_items)
+                            ]for step_items in SUPPLEMENTARY["io"]["image_sequence"]
+                        ]
+                except Exception:
+                    print_exc()
             try:
                 torch.cuda.synchronize()
                 vae.to(IO_DEVICE)
@@ -1473,10 +1661,10 @@ def generate_segmented(
 
         return pil_images, SUPPLEMENTARY
 
-    def apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args):
+    def apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i=None):
         incompatible = False
         if controlnet_input is not None:
-            controlnet_mult = get_gs_mult(controlnet_strength_scheduler, progress_factor)
+            controlnet_mult = get_gs_mult(controlnet_strength_scheduler, progress_factor, i)
             cast_controlnet_args = {"device":controlnet.device, "dtype":torch.float16}
             try:
                 down_block_residuals, mid_block_residual = controlnet(latent_model_input.to(**cast_controlnet_args),t.to(**cast_controlnet_args),encoder_hidden_states=text_embeddings.to(**cast_controlnet_args),controlnet_cond=controlnet_input.to(**cast_controlnet_args),return_dict=False)
@@ -1937,7 +2125,7 @@ class SafetyChecker():
         for concept_idx in range(len(cos_distances)):
             concept_cos = cos_distances[concept_idx]
             concept_threshold = thresholds[concept_idx].item()
-            results["scores"][concept_idx] = round(concept_cos - concept_threshold, 3)
+            results["scores"][concept_idx] = round(concept_cos*SAFETY_LEVEL_GAIN - concept_threshold, 3)
             if results["scores"][concept_idx] > adjustment:
                 results["detected_concepts"][concept_idx]=results["scores"][concept_idx]
         return results
@@ -2186,6 +2374,7 @@ class QuickGenerator():
             "second_pass_steps":50,
             "second_pass_use_controlnet":False,
             "use_karras_sigmas":False,
+            "lora_schedule":None,
         }
         # pre-set attributes as placeholders, ensuring that there are no missing attributes
         for attribute_name in self.default_config:
@@ -2230,12 +2419,13 @@ class QuickGenerator():
             second_pass_steps:int=placeholder,
             second_pass_use_controlnet:bool=placeholder,
             use_karras_sigmas:bool=placeholder,
+            lora_schedule:str=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
         unmodified_options = [
             "guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat",
-            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler","guidance_rescale","second_pass_resize","second_pass_steps","second_pass_use_controlnet", "use_karras_sigmas",
+            "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler","guidance_rescale","second_pass_resize","second_pass_steps","second_pass_use_controlnet", "use_karras_sigmas", "lora_schedule",
         ]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
@@ -2355,6 +2545,7 @@ class QuickGenerator():
             second_pass_steps=self.second_pass_steps,
             second_pass_use_controlnet=self.second_pass_use_controlnet,
             use_karras_sigmas=self.use_karras_sigmas,
+            lora_schedule=self.lora_schedule,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -2617,11 +2808,13 @@ class SafetyProcessor():
             return img
         elif processing_level.remove:
             img.paste(GRID_IMAGE_BACKGROUND_COLOR, [0,0,img.size[0],img.size[1]])
+            setattr(img, "safety_remove", True)
             return img
         elif processing_level.threshold_range >= 1.0 or processing_level.quantile <= 0 or full_blur_fallback:
             blurred = cv2.resize(cv2.resize(np.asarray(img), [16,16]), img.size, interpolation=cv2.INTER_AREA)
             blurred = Image.fromarray(blurred.round().astype("uint8"))
             img.paste(blurred)
+            setattr(img, "safety_remove", True)
             return blurred
         else:
             if len(detected_labels) == 0:
@@ -2630,6 +2823,8 @@ class SafetyProcessor():
             segment_predictions = self.get_segmentation(img, detected_labels)
             blurred = self.process_masked_blur(img, segment_predictions, processing_level)
             img.paste(blurred)
+            if getattr(blurred, "blur_mask", None) is not None:
+                setattr(img, "blur_mask", blurred.blur_mask)
             return blurred
 
     @torch.no_grad()
@@ -2661,30 +2856,35 @@ class SafetyProcessor():
                 return self.get_segmentation(img,prompts)
             else:
                 raise e
-    def process_masked_blur(self, img:Image.Image, location_predictions:torch.Tensor, processing_level:SafetyCheckerProcessingLevel):
+    def process_masked_blur(self, img:Image.Image, location_predictions:torch.Tensor, processing_level:SafetyCheckerProcessingLevel, mask_override:np.ndarray=None):
         # accumulate every relevant mask
-        mask = None
-        for pred in location_predictions:
-            data = pred.cpu().float().numpy()
-            threshold = np.quantile(data,processing_level.quantile)*processing_level.threshold_range # set threshold: e.g. within 33% (absolute value) of the 98th percentile
-            threshold = min(threshold, 0.18) # set a lower bound of (absolute) confidence for the threshold.
-            new_mask = (data>threshold) * 1.0 # mask any pixels within the threshold
-            mask = new_mask if mask is None else mask+new_mask
-        # cumulatively stack masks. Expand mask borders with a blur, resulting values will be thresholded to 1. (Expansion equivalent to the kernel radius, on unscaled segmentation outputs)
-        mask = cv2.GaussianBlur(mask, (33,33), 5)
-        mask = (mask>0.01) * 1.0
+        if mask_override is not None:
+            blur_mask = mask_override
+        else:
+            mask = None
+            for pred in location_predictions:
+                data = pred.cpu().float().numpy()
+                threshold = np.quantile(data,processing_level.quantile)*processing_level.threshold_range # set threshold: e.g. within 33% (absolute value) of the 98th percentile
+                threshold = min(threshold, 0.18) # set a lower bound of (absolute) confidence for the threshold.
+                new_mask = (data>threshold) * 1.0 # mask any pixels within the threshold
+                mask = new_mask if mask is None else mask+new_mask
+            # cumulatively stack masks. Expand mask borders with a blur, resulting values will be thresholded to 1. (Expansion equivalent to the kernel radius, on unscaled segmentation outputs)
+            mask = cv2.GaussianBlur(mask, (33,33), 5)
+            mask = (mask>0.01) * 1.0
+            #mask = cv2.resize(mask, dsize=blursize, interpolation=cv2.INTER_LANCZOS4) # decreasing mask resolution could be used to create more coarse, less detailed mask
+            blur_mask = cv2.resize(mask, dsize=img.size, interpolation=cv2.INTER_AREA) # resize mask to image size, use a smooth/blurry interpolation to achieve some edge roll-off and avoid artifacting
+            blur_mask = cv2.blur(blur_mask, (9,9)) # apply blur after scaling to improve edge roll-off
+            if SAFETY_PROCESSOR_DISPLAY_MASK_CV2:
+                show_image(Image.fromarray((blur_mask*255).round().astype("uint8")), "SafetyProcessor mask")
+            blur_mask = np.stack([blur_mask]*3, axis=-1) # stack mask to 3 values per pixel
 
-        blursize = (min(round(img.size[0]/24+2), 24), min(round(img.size[1]/24+2), 24)) # global size for pixelation blur of masked areas # (16,16)
-        #mask = cv2.resize(mask, dsize=blursize, interpolation=cv2.INTER_LANCZOS4) # decreasing mask resolution could be used to create more coarse, less detailed mask
-        blur_mask = cv2.resize(mask, dsize=img.size, interpolation=cv2.INTER_AREA) # resize mask to image size, use a smooth/blurry interpolation to achieve some edge roll-off and avoid artifacting
-        blur_mask = cv2.blur(blur_mask, (9,9)) # apply blur after scaling to improve edge roll-off
-        if SAFETY_PROCESSOR_DISPLAY_MASK_CV2:
-            show_image(Image.fromarray((blur_mask*255).round().astype("uint8")), "SafetyProcessor mask")
         # If something other than local pixelation blur is desired, this image data (blurred_data) should be replaced! (e.g. replacing with a flat color, smooth blur, image noise, etc.)
+        blursize = (min(round(img.size[0]/24+2), 24), min(round(img.size[1]/24+2), 24)) # global size for pixelation blur of masked areas # (16,16)
         blurred_data = cv2.resize(cv2.resize(np.asarray(img), blursize, interpolation=cv2.INTER_AREA), img.size, interpolation=cv2.INTER_AREA) # apply pixelation blur to source image (global)
-        blur_mask = np.stack([blur_mask]*3, axis=-1) # stack mask to 3 values per pixel
         resulting = blur_mask*blurred_data + np.asarray(img)*(1-blur_mask) # merge the original and blurred images based on the mask
-        return Image.fromarray(resulting.round().astype("uint8"))
+        processed_image = Image.fromarray(resulting.round().astype("uint8"))
+        setattr(processed_image, "blur_mask", blur_mask)
+        return processed_image
 
 def choose_int(upper_bound:int):
     if upper_bound <= 1:
