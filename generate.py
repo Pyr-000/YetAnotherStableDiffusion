@@ -1308,7 +1308,7 @@ def generate_segmented(
             # reduce init latent batch to actual batch size if oversized.
             init_latents = torch.cat(init_latents_list[:batch_size])
             init_timestep = int(steps * img_strength) + scheduler_offset
-            init_timestep = min(init_timestep, steps)
+            init_timestep = max(min(init_timestep, steps), 1)
             timesteps = scheduler.timesteps[-init_timestep]
             timesteps = torch.stack([timesteps] * batch_size).to(dtype=torch.long, device=IO_DEVICE)
             noise = torch.randn(init_latents.shape, generator=generator_unet, device=IO_DEVICE)
@@ -2564,6 +2564,9 @@ class QuickGenerator():
         return out,SUPPLEMENTARY, (full_image, full_metadata, metadata_items)
 
 def perform_text_encode_wrapper(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False):
+    prompt = unpack_encapsulated_lists(prompt) # [prompt] may end up being passed at the crossover point of interpolations
+    if not isinstance(prompt, str):
+        raise ValueError(f"prompt should be str, got {type(prompt)}: {prompt}")
     sdxl_conds = [isinstance(text_encoder, SDXLTextEncoder), isinstance(tokenizer, SDXLTokenizer), getattr(text_encoder, "is_SDXL", False)]
     perform_enc_exec_args = {"prompt":prompt, "clip_skip_layers":clip_skip_layers, "pad_to_length":pad_to_length, "prefer_default_length":prefer_default_length}
     if not any(sdxl_conds):
