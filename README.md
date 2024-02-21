@@ -1,5 +1,6 @@
 # Yet Another StableDiffusion Implementation
 Stable Diffusion script(s) based on huggingface diffusers. Comes with extra configurability and some bonus features, a single script for accessing every functionality, and example code for a discord bot demonstrating how it can be imported in other scripts.
+Extra scripts for model acquisition or conversion (converting from monolithic single-file models to diffusers files) are also included.
 ## Recent changes to requirements
 - Updating `diffusers`, `transformers`, `huggingface-hub`, `accelerate`, `pytorch` and `xformers` (if installed) is generally recommended.
 - Upgrading Python from older versions to Python 3.9 is now required.
@@ -13,21 +14,96 @@ Stable Diffusion script(s) based on huggingface diffusers. Comes with extra conf
 
 # Python Installation
 Python version 3.9+ is required. Testing is currently carried out under Python 3.9.
-## Install `pytorch` (skip when using a pre-existing StableDiffusion-compatible environment)
+### Install `pytorch`
 - Get the correct installation for your hardware at https://pytorch.org/get-started/locally/.
   - When installing pytorch with CUDA support, the `conda` install command will install cudatoolkit as well.
   - When installing with `pip` directly (e.g. for non-conda environments), CUDA toolkit may also need to be manually installed. CUDA toolkit can be found at: https://developer.nvidia.com/cuda-downloads.
-#
-## Install additional dependencies
+### Install additional dependencies
 ```shell
 pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingface_hub scikit-image accelerate controlnet_aux
 pip install git+https://github.com/cloneofsimo/lora.git
 ```
-Most pre-existing StableDiffusion-compatible environments will already have some of these installed.
+
 #
 # Model Installation
-## Local installation via git
-Git must be installed on your system. Equivalent to [Option B: Manual model install](#option-b-manual-model-install), but automated.
+
+### Specifying a remote model from huggingface.co (SD 1.x only):
+<details><summary>[Loading a huggingface model from a model ID]</summary>
+
+- You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4.
+- Model installation should occur automatically, even without being logged into huggingface hub. A custom model id can be specified via `-om` (see:[Specifying models](#specifying-models))
+- If your (custom) online model repository requires access credentials, you can provide them via the following:
+  - Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
+  - Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
+</details>
+
+## Local model installation:
+### Converting monolithic models (single model file: `.safetensors` or `.ckpt`/`.pt`/...)
+Most models, especially custom models, tend to be distributed as a single file, intended for use with the 'standard' Stablediffusion implementation. Frequently, no native files for diffusers are available.
+`convert_model_files.py` Can be used to convert a single model file of any custom StableDiffusion model into the relevant diffusers files:
+```shell
+# this will load the model file './my_custom_model.safetensors' and create a diffusers model in 'models/my_custom_model'
+python convert_model_files.py my_custom_model.safetensors
+# optionally, a different name for the diffusers model can be specified: this will create a diffusers model in 'models/myModelName'
+python convert_model_files.py my_custom_model.safetensors --name myModelName
+```
+- The script should function on both 'standard' StableDiffusion models (SD1.x, untested for SD2.x) and SDXL models (this includes models derived from Playground). Refiner models are currently not supported
+- Converting file formats outside of `.safetensors` (usually `.ckpt`) is possible, but should only be done if you are certain that you can trust the author. Non-`.safetensors` model files are capable of containing arbitrary data, including malicious code.
+
+### Downloading a model via a model ID from [huggingface](https://huggingface.co/models)
+To automatically download a model from https://huggingface.co while avoiding any unneeded files (e.g. model files for different implementations/backends), `download_model_files.py` can be used:
+```shell
+# download StableDiffusion v1.5 to 'models/SDv1.5'
+python download_model_files.py runwayml/stable-diffusion-v1-5 --name SDv1.5
+# download Playground's 'Playground v2 1024px aesthetic' model to 'models/playgroundv2_aesthetic'
+python download_model_files.py playgroundai/playground-v2-1024px-aesthetic --name playgroundv2_aesthetic
+# download StableDiffusionXL-base-v1.0 to 'models/stable-diffusion-xl-base-1.0' (name inferred from the model ID as none was specified)
+python download_model_files.py stabilityai/stable-diffusion-xl-base-1.0
+# download StableDiffusion v2.1 to 'models/stable-diffusion-2-1' (name inferred)
+python download_model_files.py stabilityai/stable-diffusion-2-1
+```
+- The script should function on 'standard' StableDiffusion models (SD1.x and SD2.x) as well as SDXL models or other models with an analogous architecture (e.g. [Playground v2](https://huggingface.co/playgroundai/playground-v2-1024px-aesthetic))
+- Downloads are performed by `huggingface_hub`. If supported, this will download larger model files to a user cache directory and place symbolic links in the model directory to avoid storing multiple copies. This behavior can be disabled via the `--no-link` flag.
+- `--name` can be used to specify the local name of the model (folder name in `models`). If not specified, the remote model name will be used.
+- Some models may not provide `.safetensors` files, only having `.pt` model files available. The `--pickle` flag can be used to download such files instead. Only use these files if you are certain that you can trust the author. Non-`.safetensors` model files are capable of containing arbitrary data, including malicious code.
+  - If such a model is also available as a single `.safetensors` file, it is recommended to download and [convert this file](#converting-monolithic-models-single-model-file-safetensors-or-ckptpt) instead.
+- Some models may be mixed between `.safetensors` and `.pt` files. This could be the case if the model author provided e.g. the unet and vae files directly, with the text encoder being copied over from a different model, in a different format. To download both `.safetensors` and `.pt` files, the flag `-add-pickle` can be used.
+  - If some model files are provided in both formats, this will download superfluous `.pt` files.
+  - As noted above, downloading `.pt` files is not recommended if avoidable, and converting a single `.safetensors` file should be preferred if available.
+- This should download all necessary files of a model. If a model uses different filenames, however, files may fail to be caught. The `--full` flag will enforce the downloading of all files provided in the repository.
+
+### Other installation methods
+
+#### Manually downloading files (not recommended)
+<details><summary>[Example: Manually installing SD1.4, minimal SD1.x directory structure]</summary>
+
+- Navigate to https://huggingface.co/CompVis/stable-diffusion-v1-4/. Note the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)).
+- Head to the `Files and versions` tab, and navigate to `stable-diffusion-v1-4/unet`
+  - Download both `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`)
+  - place both files in `models/stable-diffusion-v1-4/unet`
+- Repeat for the VAE model: In the `Files and versions` tab, navigate to `stable-diffusion-v1-4/vae`
+  - Download both `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`)
+  - Place the files in `models/stable-diffusion-v1-4/vae`
+- Consider keeping the branch on the default: `main` instead of switching to `fp16`. The fp32 weights are larger (3.44GB instead of 1.72GB for SD1.4), but can be loaded for both full precision (fp32) and half precision (fp16) use.
+- Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over directly. See [Converting monolithic models](#converting-monolithic-models-single-model-file-safetensors-or-ckptpt)
+- Note: The VAE files can instead be replaced by an StabilityAIs improved `ft-EMA` / `ft-MSE` VAEs, which are available under [huggingface.co/stabilityai/sd-vae-ft-mse/tree/main](https://huggingface.co/stabilityai/sd-vae-ft-mse/tree/main)
+
+The following files should be present in the model directory. `.bin` files may be substituted with `.safetensors` files. Additional files may be present, especially when the model is acquired via `git clone`.
+```shell
+v1.5/
+├── unet/
+│   ├── config.json
+│   └── diffusion_pytorch_model.bin
+└── vae/
+    ├── config.json
+    └── diffusion_pytorch_model.bin
+```
+</details>
+
+#### Local installation via git
+<details><summary>[Example: installing StableDiffusion v2.1 via git lfs]</summary>
+
+Git must be installed on your system.
 Note the license terms ([CreativeML OpenRAIL++-M](https://huggingface.co/stabilityai/stable-diffusion-2/blob/main/LICENSE-MODEL)).
 
 From the root directory of this repository, clone your model repository into `models/` (this example will clone StableDiffusion v2.1):
@@ -36,13 +112,12 @@ git lfs clone https://huggingface.co/stabilityai/stable-diffusion-2-1 models/sta
 ```
 This may take a while.
 Using 'git lfs clone' will yield a deprecation warning, however, cloning through 'git clone' may fail to display any progress information on some platforms.
+</details>
 
-#
-## Alternative model installation options
-Models can either be automatically installed by providing a huggingface token, or manually installed by downloading them from huggingface yourself.
+#### A Note on StableDiffusion version 2.x+:
+<details><summary>[SD 2.x model installation notes, minimal SD 2.x directory structure]</summary>
 
-### A Note on StableDiffusion version 2.x+:
-Currently, only [Option B: manual model install](#option-b-manual-model-install) is supported for SD2.x models. StableDiffusion v2.1 can be acquired from https://huggingface.co/stabilityai/stable-diffusion-2-1.
+Currently, only [Local model installation](#local-model-installation) is supported for SD2.x models. StableDiffusion v2.1 can be acquired from https://huggingface.co/stabilityai/stable-diffusion-2-1.
 In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and `tokenizer` folders must also be added to the model directory, together with their respective files:
 - `models/*/scheduler/`: `scheduler_config.json`
 - `models/*/text_encoder/`: `config.json` and `pytorch_model.bin` (or `pytorch_model.safetensors`)
@@ -50,7 +125,6 @@ In addition to the `unet` and `vae` folders, the `scheduler`, `text_encoder` and
 
 If `scheduler/scheduler_config.json` is not provided, the model will be presumed to not be a v_prediction model (this will cause issues with anything but the _base_ variant of SD2.x).
 If `text_encoder` and `tokenizer` do not provide the required files, the model will be loaded with `openai/clip-vit-large-patch14`, which is used in SD1.x-style models. This is incompatible with SD2.x.
-<details><summary>[Example SD2.1 model directory structure]</summary>
 
 The following files should be present in the model directory. `.bin` files may be substituted with `.safetensors` files. Additional files may be present, especially when the model is acquired via `git clone`.
 ```shell
@@ -74,42 +148,11 @@ stable-diffusion-2-1/
 ```
 </details>
 
-### Option A: Automatic model install via huggingface:
-- You should have read and accepted the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)) of the relevant StableDiffusion model repository at https://huggingface.co/CompVis/stable-diffusion-v1-4.
-- Model installation should occur automatically, even without being logged into huggingface hub. A custom model id can be specified via `-om` (see:[Specifying models](#specifying-models))
-- If your (custom) online model repository requires access credentials, you can provide them via the following:
-  - Either paste the token into the `tokens.py` file: `HUGGINGFACE_TOKEN = "your token here"`
-  - Or log into huggingface-cli with your token (run `huggingface-cli login` in a terminal while your python environment is activated). This login should remain stored in your user directory until you log out with the cli, independent of your python environment.
-
-### Option B: Manual model install:
-- Navigate to https://huggingface.co/CompVis/stable-diffusion-v1-4/. Note the license terms ([CreativeML OpenRAIL-M](https://huggingface.co/spaces/CompVis/stable-diffusion-license)).
-- Head to the `Files and versions` tab, and navigate to `stable-diffusion-v1-4/unet`
-  - Download both `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`)
-  - place both files in `models/stable-diffusion-v1-4/unet`
-- Repeat for the VAE model: In the `Files and versions` tab, navigate to `stable-diffusion-v1-4/vae`
-  - Download both `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`)
-  - Place the files in `models/stable-diffusion-v1-4/vae`
-- Consider keeping the branch on the default: `main` instead of switching to `fp16`. The fp32 weights are larger (3.44GB instead of 1.72GB for SD1.4), but can be loaded for both full precision (fp32) and half precision (fp16) use.
-- Note: The checkpoint files for diffusers are not the same as standard StableDiffusion checkpoint files (e.g. sd-v1-4.ckpt). They can not be copied over directly.
-  - If required, custom (monolithic) model checkpoints designated for the "standard StableDiffusion" implementation can be converted to separate models for use with diffusers using their provided conversion script: [diffusers/scripts/convert_original_stable_diffusion_to_diffusers.py](https://github.com/huggingface/diffusers/blob/main/scripts/convert_original_stable_diffusion_to_diffusers.py), available from the [huggingface diffusers repository](https://github.com/huggingface/diffusers).
-- Note: The VAE files can instead be replaced by an StabilityAIs improved `ft-EMA` / `ft-MSE` VAEs, which are available under [huggingface.co/stabilityai/sd-vae-ft-mse/tree/main](https://huggingface.co/stabilityai/sd-vae-ft-mse/tree/main)
-<details><summary>[Example SD1.x model directory structure]</summary>
-
-The following files should be present in the model directory. `.bin` files may be substituted with `.safetensors` files. Additional files may be present, especially when the model is acquired via `git clone`.
-```shell
-v1.5/
-├── unet/
-│   ├── config.json
-│   └── diffusion_pytorch_model.bin
-└── vae/
-    ├── config.json
-    └── diffusion_pytorch_model.bin
-```
-</details>
-
 #
 # Usage & Features
-- Features include text-to-image, image-to-image (including cycling), and options for precision/devices to control generation speed and memory usage. StableDiffusion is supported for both version 1.x and version 2.x, including custom models.
+- StableDiffusion is supported for version 1.x (e.g. SD v1.5), version 2.x (e.g. SD v2.1), and StableDiffusionXL, including custom models. This includes support for [Playground v2](https://huggingface.co/playgroundai/playground-v2-1024px-aesthetic).
+  - Refiner models are not currently supported. For SDXL, only the 'base' models can be used.
+- Features include text-to-image, image-to-image (including cycling), and options for precision/devices to control generation speed and memory usage.
   - Advanced prompt manipulation options including mixing, concatenation, custom in-prompt weights and (per-token) CLIP-skip settings are available.
   - Additional memory optimisation options include (automatic) sequential batching, the usage of xformers attention by default, attention/vae slicing and CPU offloading (see: [Optimisation settings](#device-performace-and-optimization-settings))
 - Animating prompt interpolations is possible for both image-to-image cycling and text-to-image (`-cfi`, see: [Additional Flags](#additional-flags)).
@@ -121,6 +164,7 @@ v1.5/
   - When the processing performs local blurring, the blur mask is generated via [CLIPSeg](https://huggingface.co/blog/clipseg-zero-shot) for any labels detected by the default safety checker. As absolute detection levels of CLIPSeg are likely less reliable than those produced by the safety checker (CLIPSeg is based on a smaller, less accurate CLIP model), and are thus far uncalibrated for safety checking purposes, the blur mask is generated by selecting any areas of high relative intensity for the given labels. If the safety checker detects a label for which CLIPSeg is not able to provide a sufficiently confident segmentation, this will result in more of the image being obscured.
 ### Extensions
 - "Textual Inversion Concepts", custom prompt embeddings, from https://huggingface.co/sd-concepts-library can be placed in `models/concepts` (only the .bin file is required, other files are ignored). They will be loaded into the text encoder automatically. `.pt`-style custom embeddings are also supported in the same way.
+  - When using an SDXL model (or any other model with multiple text encoders), concept embeddings will be loaded into any text encoder with a matching feature dimension. This allows embeddings created for SD1.x to be used on the first of the two text encoders of SDXL.
 - LoRA embeddings are supported (`-lop`,`-low`, see: [Additional Flags](#additional-flags)). This includes native diffusers attn_procs LoRA embeddings, ["lora_diffusion"](https://github.com/cloneofsimo/lora.git) embeddings and other convertable embeddings (LoRA embeddings made/compatible with ["kohya-ss/sd-scripts"](https://github.com/kohya-ss/sd-scripts), with both 'normal' linear LoRAs and convolutional LoRAs being supported).
   - The integrated converter should be able to load LoCon and experimental IA3 '(IA)^3' [LyCORIS](https://github.com/KohakuBlueleaf/LyCORIS) models. Requests for other useful types of "LoRA-like" extension models are welcomed in the issues section.
   - The LoRA converter is derived and modified from the [haofanwang/diffusers](https://github.com/haofanwang/diffusers/blob/75501a37157da4968291a7929bb8cb374eb57f22/scripts/convert_lora_safetensor_to_diffusers.py) conversion script, see [diffusers PR#2403](https://github.com/huggingface/diffusers/pull/2403)
@@ -136,6 +180,7 @@ v1.5/
   - When switching to 'concatenation' mixing mode (`-mc`, see: [Additional Flags](#additional-flags)), mixed prompts have their embeddings multiplied by their prompt weight, and are then concatenated into one (longer) prompt. This will make use of dynamic length support where necessary. Additionally, a `+` can be appended to a prompt weight to signify that the end token embedding of the preceding prompt and the start token embedding of the subsequent prompt should be removed, resulting in a 'more direct' concatenation. This is interpreted as a 'normal concatenation' (instead of applying a sum) when not running in concatenation mode. (Example: `Painting of a cat;1.25+;Photograph of a cat;0.8;`)
 - Prompts can be specified with an (individual) CLIP-skip setting by appending a trailing `{cls<n>}` for a setting of `n`. This will skip the last *n* layers of CLIP, the text encoder. Increasing this value will reduce the "amount of processing"/"depth of interpretation" performed by the text encoder. A value of `0` is equivalent to specifying no CLIP-skip setting.
   - **Note:** Other StableDiffusion implementations may refer to disabled CLIP-skipping as 'a CLIP skip of 1', not 'a CLIP skip of 0'. In this case, equivalent CLIP-skip values in this implementation will always be one less.
+  - **Note:** StableDiffusionXL and similar models override a CLIP-skip of 0 to a CLIP-skip of 1 by default. The pooled prompt ignores any CLIP-skip setting. To experiment with a CLIP-skip of 0 on SDXL prompts it can be specified via `{cls0}` or via in-prompt weights `( :1;0)`.
   - Example: `"Painting of a cat{cls2}"` will encode "Painting of a cat", while skipping the final two layers of the text encoder.
   - When combined with prompt mixing or negative prompts (`;;`, see above), the prompt separator must be specified after the CLIP-skip setting. The skip setting is independent for each sub-prompt.
     - Example: `"Painting of a cat{cls1};3; Photograph of a cat{cls2};1;"`
@@ -147,6 +192,11 @@ v1.5/
   - Prompt weights are applied after the prompt encoding itself, and will not cause any (additional) fragmentation or chunking of the prompt. This is also the case for local CLIP-skip settings: The prompt is fully encoded, after which the embeddings for different CLIP-skip settings are interleaved according to the requested level on a per-token-basis/per-embedding-vector-basis.
   - Example: `"an (oil painting:0.8) of a cat, (displayed in a gallery:1.2;1)"` will decrease the magnitude of the embedding vectors encoding 'oil painting' by 20%, while utilizing the embedding vectors of the prompt with a CLIP-skip of 1 to encode 'displayed in a gallery', and increasing their magnitude by 20%. To only apply a local CLIP-skip without modifying prompt weights, a weight of 1 must be used: `"an oil painting of a cat, (displayed in a gallery:1;1)"`
   - Stacking multiple weight modifiers by encapsulating them inside eachother is not supported. Instead, individual 'effective' weights of sections must be specified in parallel.
+- For models with multiple text encoders (SDXL or similar), different prompts can be specified for each text encoder by separating them with `//`.
+  - This can be used to specify a Textual Inversion embedding (see: [Extensions](#extensions)) only in the prompt of the encoder that supports the embedding. Embeddings intended for use with SD1.x will be available on the first of the two encoders of SDXL.
+  - This is evaluated after prompt separators (`||` and `;;`) but before any weight or skip specifiers (e.g. `( :1.5)`, `( :0.9;1)`, `{cls2}`)
+    - Example (using every tweak possible): `"(Photograph:1.25) of a cat, pinned to the fridge {cls0}//Painting of a (cat:1.1;1), displayed in a (gallery :1;0){cls2};;<my_negative_embedding>//low quality, blurry;-1;"`
+  - **Note:** The second text encoder of SDXL (or similar models) is likely to have a greater influence on the result, as it also provides the pooled prompt embedding vector. (Additionally, the second encoder provides a larger fraction of the standard prompt embedding, due to a larger feature dimension.)
 
 # 
 ## text to image
@@ -248,8 +298,8 @@ When applying image-to-image multiple times sequentially (often with a lower str
 - `-sps`/`--second-pass-steps` specifies the number of sampling steps used for the second pass (when a second pass is requested via `-spr`).
 - `-spc`/`--second-pass-controlnet` switches the second pass to use the first pass image in a selected controlnet (instead of applying image to image). For batch sizes >1, the same (first) image from the first pass will be used as the controlnet input for every batch item (does not apply when running in sequential mode).
 ### Specifying models
-- `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. See: [Automatic model install](#option-a-automatic-model-install-via-huggingface)
-- `-lm`/`--local-model` can be used to specify a directory containing local model files. This directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`) file each. See: [Manual model install](#option-b-manual-model-install)
+- `-om`/`--online-model` can be used to specify an online model id for acquisition from huggingface hub. This will override the default local (manual) and automatic models. SD1.x only. See: [Specifying a remote model](#specifying-a-remote-model-from-huggingface-sd-1x-only)
+- `-lm`/`--local-model` can be used to specify a directory containing local model files. This directory should contain `unet` and `vae` dirs, with a `config.json` and `diffusion_pytorch_model.bin` (or `diffusion_pytorch_model.safetensors`) file each. For SD2.1 or SDXL, additional files will need to be present. See: [Local model installation](#local-model-installation)
 ### Re-using stored latents
 - `-in`/`--interpolate-latents` accepts two image paths for retrieving and interpolating latents from the images. This will only work for images of the same size which have had their latents stored in metadata (`generate.py` does this by default, as it will only increase image size by 50-100kB). While the interpolation occurs in the latent space (after which the VAE is applied to decode individual images), results will usually not differ from crossfading the images in image space directly. Results are saved like in `--animate`.
 - `-rnc`/`--re-encode` can be used to specify a path to an image or folder of images, which will be re-encoded using the VAE of the loaded model. This uses the latents stored in image metadata.
@@ -296,7 +346,7 @@ When applying image-to-image multiple times sequentially (often with a lower str
   - `ATTENTION_SLICING` see: `-as` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
   - `CPU_OFFLOAD` see: `-co` in [Device, Performace and Optimization settings](#device-performace-and-optimization-settings)
   - `PERMIT_RELOAD` can be set to `True` to allow users to switch the current model, toggle CPU offloading and set attention slicing via the `/reload` command.
-    - If set to `True`, `permittel_local_model_paths` specifies a whitelist of local model names with their respective model paths (see: [Manual model install](#option-b-manual-model-install)), while `permitted_model_ids` specifies a whitelist of names with respective huggingface hub model ids (see: [Automatic model install](#option-a-automatic-model-install-via-huggingface))
+    - If set to `True`, `permittel_local_model_paths` specifies a whitelist of local model names with their respective model paths (see: [Local model installation](#local-model-installation)), while `permitted_model_ids` specifies a whitelist of names with respective huggingface hub model ids (see: [Specifying a remote model](#specifying-a-remote-model-from-huggingface-sd-1x-only))
   - `PERMITTED_LORAS` specifies a whitelist of LoRA embeddings which can optionally be loaded when reloading. By default, this will be any `lora/*.safetensors` file.
   - `INPUT_IMAGES_BACKGROUND_COLOR` can be used to set a the frame highlighting color of input images (used to visually separate inputs from outputs)
 - Available commands are specified via discord `slash commands`. The pre-existing commands serve as a starting point for creating optimal commands for your use-case.

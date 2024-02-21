@@ -19,7 +19,7 @@ from pathlib import Path
 import generate
 generate.PREPROCESS_DISPLAY_CV2 = False
 generate.SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
-from generate import load_models, QuickGenerator, load_controlnet, image_autogrid, IMPLEMENTED_SCHEDULERS, IMPLEMENTED_GS_SCHEDULES, CONTROLNET_SHORTNAMES, IMPLEMENTED_CONTROLNET_PREPROCESSORS
+from generate import load_models, QuickGenerator, load_controlnet, image_autogrid, IMPLEMENTED_SCHEDULERS, IMPLEMENTED_GS_SCHEDULES, CONTROLNET_SHORTNAMES, IMPLEMENTED_CONTROLNET_PREPROCESSORS, input_to_seed
 from tokens import get_discord_token
 
 # set to True to enable the /reload command.
@@ -402,16 +402,8 @@ def run_advanced(
     steps = steps if steps > 0 else 1
     steps = steps if steps <= 150 else 150
     amount = amount if amount <= 16 else 16
-    try:
-        seed = int(seed)
-    except:
-        seed = -1
-    try:
-        eta_seed = int(eta_seed)
-    except:
-        eta_seed = -1
-    seed = seed if seed > 0 else None
-    eta_seed = eta_seed if eta_seed > 0 else None
+    seed = input_to_seed(seed)
+    eta_seed = input_to_seed(eta_seed)
     # if values above 64 are given, presume them to be pixel values
     w = (512 + (width*64)) if width < 64 else width
     h = (512 + (height*64)) if height < 64 else height

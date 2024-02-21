@@ -37,7 +37,7 @@ from dataclasses import dataclass
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
 # for manual model installs
-models_local_dir = "models/stable-diffusion-2-1"
+models_local_dir = "models/playgroundv2_aesthetic"
 # for metadata, written during model load
 using_local_unet, using_local_vae = False,False
 # location of textual inversion concepts (if present). (recursively) search for any .bin files. see see: https://huggingface.co/sd-concepts-library
@@ -76,12 +76,15 @@ SAFETY_PROCESSOR_CLIPSEG_MODEL = "CIDAS/clipseg-rd64-refined" # "CIDAS/clipseg-r
 SAFETY_PROCESSOR_DISPLAY_MASK_CV2 = False
 # increase to boost safety checker thresholds with an extra margin.
 SAFETY_LEVEL_GAIN = 1.0
-# Switch to using xformers attention if installed. Can be set to False to manually disable xformers attention regardless of availability.
-XFORMERS_ENABLED = True
 # When using (differential) progress animation, boost the variance of earlier steps to be in-line with expectations. Early animation steps will look more oversaturated and "noisy" instead of undersaturated and "diffuse"
 ANIMATE_BOOST_VARIANCE = False
 # Compression factor of the sigmoid function when using threshold schedules (gs/controlnet/lora: th2, th5, th7). Values between 20 and 100 recommended. Lower values smooth out the transition, while higher values make the threshold more direct.
 SIGMOID_GS_MULT_COMPRESSION = 50
+# SDXL pooled extra_embeds always use a CLIP skip of 0. Setting this to False would apply per-token skip values of the standard prompt_embeds before pooling
+SDXL_NO_TOKEN_SKIP_ON_POOLED = True
+
+# Switch to using xformers attention if installed. Can be set to False to manually disable xformers attention regardless of availability.
+XFORMERS_ENABLED = True
 try:
     import xformers
 except ImportError:
@@ -150,13 +153,13 @@ def parse_args():
     parser.add_argument("-s","--steps", type=int, default=50, help="number of sampling steps", dest="steps")
     parser.add_argument("-sc","--scheduler", type=str, default="mdpms", choices=IMPLEMENTED_SCHEDULERS, help="scheduler used when sampling in the diffusion loop", dest="sched_name")
     parser.add_argument("-e", "--ddim-eta", type=float, default=0.0, help="eta adds additional random noise when sampling, only applied on ddim sampler. 0 -> deterministic", dest="ddim_eta")
-    parser.add_argument("-es","--ddim-eta-seed", type=int, default=None, help="secondary seed for the eta noise with ddim sampler and eta>0", dest="eta_seed")
+    parser.add_argument("-es","--ddim-eta-seed", type=str, default=None, help="secondary seed for the eta noise with ddim sampler and eta>0", dest="eta_seed")
     parser.add_argument("-H","--H", type=int, default=512, help="image height, in pixel space", dest="height")
     parser.add_argument("-W","--W", type=int, default=512, help="image width, in pixel space", dest="width")
     parser.add_argument("-n", "--n-samples", type=int, default=1, help="how many samples to produce for each given prompt. A.k.a. batch size", dest="n_samples")
     parser.add_argument("-seq", "--sequential_samples", action="store_true", help="Run batch in sequence instead of in parallel. Removes VRAM requirement for increased batch sizes, increases processing time.", dest="sequential_samples")
     parser.add_argument("-cs", "--scale", type=float, default=9, help="(classifier free) guidance scale (higher values may increse adherence to prompt but decrease 'creativity')", dest="guidance_scale")
-    parser.add_argument("-S","--seed", type=int, default=None, help="initial noise seed for reproducing/modifying outputs (None will select a random seed)", dest="seed")
+    parser.add_argument("-S","--seed", type=str, default=None, help="initial noise seed for reproducing/modifying outputs (None will select a random seed)", dest="seed")
     parser.add_argument("--unet-full", action='store_false', help="Run diffusion UNET at full precision (fp32). Default is half precision (fp16). Increases memory load.", dest="half")
     parser.add_argument("--latents-half", action='store_true', help="Generate half precision latents (fp16). Default is full precision latents (fp32), memory usage will only reduce by <1MB. Outputs will be slightly different.", dest="half_latents")
     parser.add_argument("--diff-device", type=str, default="cuda", help="Device for running diffusion process", dest="diffusion_device")
@@ -219,6 +222,9 @@ def main():
     DEFAULT_NEGATIVE_PROMPT = args.default_negative
     ACTIVE_LORA = args.lora_path
     ACTIVE_LORA_WEIGHT = args.lora_weight
+
+    args.seed = input_to_seed(args.seed)
+    args.eta_seed = input_to_seed(args.eta_seed)
 
     if args.online_model is not None:
         # set the online model id
@@ -346,7 +352,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     torch.no_grad() # We don't need gradients where we're going.
     tokenizer:transformers_models.clip.tokenization_clip.CLIPTokenizer
     text_encoder:transformers_models.clip.modeling_clip.CLIPTextModel
-    unet:diffusers_models.unet_2d_condition.UNet2DConditionModel
+    # unet:diffusers_models.unets.unet_2d_condition.UNet2DConditionModel, # new model class location. changed with recent diffusers ver. Keep this commented out for version compatibility for now
     vae:diffusers_models.AutoencoderKL
 
     unet_model_id = model_id
@@ -378,15 +384,27 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         else:
             print(f"Using vae '{vae_model_id}' (no local data present at {vae_dir})")
         text_encoder_dir = os.path.join(models_local_dir, "text_encoder")
-        if dir_has_model_files(text_encoder_dir, [["config.json"], ["pytorch_model.bin", "pytorch_model.safetensors", "model.bin", "model.safetensors"]]):
-            print(f"Using local text encoder! ({models_local_dir})")
-            text_encoder_id = text_encoder_dir
+        text_encoder_2_dir = os.path.join(models_local_dir, "text_encoder_2")
+        filegroups_text_encoder = [["config.json"], ["pytorch_model.bin", "pytorch_model.safetensors", "model.bin", "model.safetensors"]]
+        if dir_has_model_files(text_encoder_dir, filegroups_text_encoder):
+            if dir_has_model_files(text_encoder_2_dir, filegroups_text_encoder):
+                text_encoder_id = (text_encoder_dir, text_encoder_2_dir)
+                print(f"Using local text encoder! ({models_local_dir}) [SDXL]")
+            else:
+                text_encoder_id = text_encoder_dir
+                print(f"Using local text encoder! ({models_local_dir})")
         else:
             print(f"Using text encoder '{text_encoder_id}' (no local data present at {text_encoder_dir})")
         tokenizer_dir = os.path.join(models_local_dir, "tokenizer")
-        if all([os.path.exists(os.path.join(tokenizer_dir, f)) for f in ["merges.txt","vocab.json"]]):
-            print(f"Using local tokenizer! ({models_local_dir})")
-            tokenizer_id = tokenizer_dir
+        tokenizer_2_dir = os.path.join(models_local_dir, "tokenizer_2")
+        filegroups_tokenizer = [["merges.txt"],["vocab.json"]]
+        if dir_has_model_files(tokenizer_dir, filegroups_tokenizer):
+            if dir_has_model_files(tokenizer_2_dir, filegroups_tokenizer):
+                print(f"Using local tokenizer! ({models_local_dir}) [SDXL]")
+                tokenizer_id = (tokenizer_dir, tokenizer_2_dir)
+            else:
+                print(f"Using local tokenizer! ({models_local_dir})")
+                tokenizer_id = tokenizer_dir
         else:
             print(f"Using tokenizer '{tokenizer_id}' (no local data present at {tokenizer_dir})")
 
@@ -560,11 +578,50 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     # Load the tokenizer and text encoder to tokenize and encode the text.
     #tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
     #text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-    tokenizer = CLIPTokenizer.from_pretrained(tokenizer_id)
-    text_encoder = CLIPTextModel.from_pretrained(text_encoder_id)
+    if not (isinstance(tokenizer_id, tuple) or isinstance(text_encoder_id, tuple)):
+        # not SDXL
+        tokenizer = CLIPTokenizer.from_pretrained(tokenizer_id)
+        text_encoder = CLIPTextModel.from_pretrained(text_encoder_id)
+    elif all([isinstance(tokenizer_id, tuple), isinstance(text_encoder_id, tuple), len(tokenizer_id)==2, len(text_encoder_id)==2]):
+        tokenizer = SDXLTokenizer(*[CLIPTokenizer.from_pretrained(tok_id) for tok_id in tokenizer_id])
+        text_encoder = SDXLTextEncoder(*[CLIPTextModel.from_pretrained(te_id) for te_id in text_encoder_id])
+    else: # this case should currently be unreachable. Either the model dir is malformed, or someone released a new diffusion model with 3+ text encoders.
+        tokenizer_id = tokenizer_id if isinstance(tokenizer_id, tuple) else (tokenizer_id,)
+        text_encoder_id = text_encoder_id if isinstance(text_encoder_id, tuple) else (text_encoder_id,)
+        assert len(tokenizer_id) == len(text_encoder_id), f"Tokenizer count {len(tokenizer_id)} must match TextEncoder count {len(text_encoder_id)}!"
+        tokenizer = MultiTokenizer(*[CLIPTokenizer.from_pretrained(tok_id) for tok_id in tokenizer_id])
+        text_encoder = MultiTextEncoder(*[CLIPTextModel.from_pretrained(te_id) for te_id in text_encoder_id])
+
+    force_zeros_for_empty_prompt = None
+    is_SDXL = None
+    try:
+        model_index_path = Path(models_local_dir).joinpath("model_index.json")
+        assert model_index_path.exists()
+        from json import load as load_json
+        model_index_data = load_json(model_index_path)
+        force_zeros_for_empty_prompt = model_index_data.get("force_zeros_for_empty_prompt", None)
+        index_pipe_class = model_index_data.get("_class_name", None)
+        if index_pipe_class is not None:
+            is_SDXL = False if index_pipe_class == "StableDiffusionPipeline" else True if index_pipe_class == "StableDiffusionXLPipeline" else None
+    except Exception:
+        pass
+    # if we do not have / can't parse a model index, we'll have to infer force_zeros_for_empty_prompt and is_SDXL
+    # this should be True for SDXL-style models (which have multiple encoders) and false for SD1.x/SD2.x models (single encoder)
+    force_zeros_for_empty_prompt = force_zeros_for_empty_prompt if force_zeros_for_empty_prompt is not None else isinstance(text_encoder, MultiTextEncoder)
+    is_SDXL = is_SDXL if is_SDXL is not None else isinstance(text_encoder, MultiTextEncoder)
+    setattr(text_encoder, "force_zeros_for_empty_prompt", force_zeros_for_empty_prompt)
+    setattr(text_encoder, "is_SDXL", is_SDXL)
+    if isinstance(text_encoder, MultiTextEncoder):
+        for enc in text_encoder.get_encoders():
+            setattr(enc, "force_zeros_for_empty_prompt", force_zeros_for_empty_prompt)
+            setattr(enc, "is_SDXL", is_SDXL)
 
     try:
-        MAX_CLIP_SKIP = len(text_encoder.text_model.encoder.layers)
+        if not isinstance(text_encoder, MultiTextEncoder):
+            MAX_CLIP_SKIP = len(text_encoder.text_model.encoder.layers)
+        else:
+            # if we have multiple text encoders, the general clip skip limit will be the lowest common denominator
+            MAX_CLIP_SKIP = min([len(item.text_model.encoder.layers) for item in text_encoder.get_encoders()])
     except Exception:
         print_exc()
         print("Unable to infer encoder hidden layer count (CLIP skip limit) from the text encoder!")
@@ -577,10 +634,24 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     if len(available_concepts) > 0:
         print(f"Adding {len(available_concepts)} Textual Inversion concepts found in {concepts_path}: ")
         for item in available_concepts:
-            try:
-                load_learned_embed_in_clip(item, text_encoder, tokenizer)
-            except Exception as e:
-                print(f"Loading concept from {item} failed: {e}")
+            if not (isinstance(text_encoder, MultiTextEncoder) or isinstance(tokenizer, MultiTokenizer)):
+                try:
+                    load_learned_embed_in_clip(item, text_encoder, tokenizer)
+                except Exception as e:
+                    print(f"Loading concept from {item} failed: {e}")
+            else:
+                exceptions = []
+                loaded_encoder_idx = []
+                for enc,tok,idx in zip(text_encoder.get_encoders(), tokenizer.get_encoders(), range(len(text_encoder.get_encoders()))):
+                    try:
+                        load_learned_embed_in_clip(item, enc, tok)
+                        loaded_encoder_idx.append(idx+1)
+                    except Exception as e:
+                        exceptions.append(e)
+                if len(loaded_encoder_idx) == 0:
+                    print(f" (failed)")
+                else:
+                    print(f" [>te_{loaded_encoder_idx[0] if len(loaded_encoder_idx) == 1 else loaded_encoder_idx}]", end="")
         print("")
 
     patch_wrapper(unet,text_encoder,tokenizer)
@@ -588,8 +659,13 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     # text encoder should be offloaded after adding custom embeddings to ensure that every embedding is actually on the same device.
     if cpu_offloading:
         cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
-        cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        if not isinstance(text_encoder, MultiTextEncoder):
+            cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+        else:
+            for item in text_encoder.get_encoders():
+                cpu_offload(item, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
 
+    # due to the recursive attribute search approach of recurse_set_xformers, it already works with MultiTextEncoder/MultiTokenizer
     recurse_set_xformers([tokenizer, text_encoder, unet, vae, rate_nsfw])
     return tokenizer, text_encoder, unet, vae, rate_nsfw
 
@@ -629,17 +705,40 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
     parsed_keys = 0
     null_keys = 0
 
-    # directly update weight in diffusers model
     for key in state_dict:
-        # as we have set the alpha beforehand, so just skip
+        curr_layer, curr_model = None, None
+        alpha_scale = 1.0
+        # ignore alpha keys when checking them directly. We could ignore alpha keys entirely, but this would force the end-user to scale the merge strength when alpha != model_dim
         if ".alpha" in key or key in visited:
             continue
+        # when visiting a non-alpha key, check if it is accompanied by a respective alpha key.
+        alpha_value = state_dict.get(f"{key.rsplit('.',2)[0]}.alpha",None)
+        if alpha_value is not None:
+            try:
+                # position of the lora dim in the weight shape depends on if we're looking at a lora_down or a lora_up key.
+                # thus far, alphas were only found in 'lora_down/lora_up' data of inspected LoRA/extra-model architectures. This may fail for novel architectures which also use alpha values in keys.
+                lora_dim = state_dict[key].shape[0 if "lora_down" in key else 1]
+                alpha_scale = alpha_value / lora_dim
+            except Exception as e:
+                print(f"Found alpha key for LoRA key {key}, but failed to derive scaling factor: {e}")
 
         if "text" in key and LORA_PREFIX_TEXT_ENCODER in key:
-            layer_infos = key.split(".")[0].split(LORA_PREFIX_TEXT_ENCODER + "_")[-1].split("_")
-            curr_layer = text_encoder
-            curr_model = text_encoder
-            _merge_strength = merge_strength_text_encoder
+            _merge_strength = merge_strength_text_encoder * alpha_scale
+            if not isinstance(text_encoder, MultiTextEncoder):
+                layer_infos = key.split(".")[0].split(LORA_PREFIX_TEXT_ENCODER + "_")[-1].split("_")
+                curr_layer = text_encoder
+                curr_model = text_encoder
+            else:
+                # for SDXL, the two encoders will have lora keys with prefixes lora_te1_(...) and lora_te1_(...) as opposed to lora_te_(...) for single-text_encoder models
+                for i in range(len(text_encoder.get_encoders())):
+                    # for every text encoder we have, we check if it matches the key index. Crude, we could read the index from the key with a regex directly.
+                    current_prefix = f"{LORA_PREFIX_TEXT_ENCODER}{i+1}"
+                    if current_prefix in key:
+                        layer_infos = key.split(".")[0].split(current_prefix + "_")[-1].split("_")
+                        curr_layer = text_encoder
+                        curr_model = text_encoder
+                        # break # we could break here, and save ourselves from checking one other string with SDXL.
+                        # In the unlikely scenario of us having 10+ text encoders, breaking can yield incorrect results unless we checked the range in reverse.
             if text_encoder is None:
                 unparsed_keys += 1
                 continue
@@ -647,7 +746,7 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
             layer_infos = key.split(".")[0].split(LORA_PREFIX_UNET + "_")[-1].split("_")
             curr_layer = unet
             curr_model = unet
-            _merge_strength = merge_strength
+            _merge_strength = merge_strength * alpha_scale
             if unet is None:
                 unparsed_keys += 1
                 continue
@@ -869,7 +968,7 @@ def controlnet_preprocess(image:Image.Image, width:int, height:int, preprocessor
 def generate_segmented(
         tokenizer:transformers_models.clip.tokenization_clip.CLIPTokenizer,
         text_encoder:transformers_models.clip.modeling_clip.CLIPTextModel,
-        unet:diffusers_models.unet_2d_condition.UNet2DConditionModel,
+        unet, #:diffusers_models.unets.unet_2d_condition.UNet2DConditionModel, # new model class location. changed with recent diffusers ver. Keep this commented out for version compatibility for now
         vae:diffusers_models.AutoencoderKL,
         IO_DEVICE="cpu",UNET_DEVICE="cuda",rate_nsfw=(lambda x: False),half_precision_latents=False
     ):
@@ -878,8 +977,13 @@ def generate_segmented(
         vae_compute_device = IO_DEVICE
     else:
         vae_compute_device = OFFLOAD_EXEC_DEVICE
-    if not text_encoder.device == torch.device("meta"):
-        text_encoder.to(IO_DEVICE)
+    if not isinstance(text_encoder, MultiEncoder):
+        if not text_encoder.device == torch.device("meta"):
+            text_encoder.to(IO_DEVICE)
+    else:
+        for enc in text_encoder.get_encoders():
+            if not enc.device == torch.device("meta"):
+                enc.to(IO_DEVICE)
     if not unet.device == torch.device("meta"):
         unet.to(UNET_DEVICE)
         unet_compute_device = UNET_DEVICE
@@ -895,287 +999,18 @@ def generate_segmented(
     #if UNET_DEVICE == "meta" and unet.dtype == torch.float16:
     #    half_precision_latents = True
 
-    def process_prompt_segmentation(prompt, default_skip=0):
-        segment_weights = []
-        processed_segments = []
-        segment_skips = []
-        # the start token is not part of the segments - add a leading weight of 1 and a leading skip of <default> for it.
-        token_weights = [1]
-        token_skips = [default_skip]
-        # split out segments where custom weights are defined. Use non-greedy content matching to identify the segment: '.+?'
-        weighted_segments = re.split("\((.+?:-?[\.0-9;]+)\)", prompt)
-        for segment in weighted_segments:
-            segment = segment.strip()
-            # empty segments will exclusively show up with zero-length prompts, which produce one empty segment. Their handling can be ignored.
-            segment_weight = 1
-            segment_skip = default_skip
-            split_by_segment_weight = re.split(":(-?[\.0-9;]+)$",segment)
-            if len(split_by_segment_weight)>1:
-                # should result in _exactly_ three segments: prompt, weight capture group, trailing empty segment (caused by the '\)$' at the end of the regex expression
-                # multiple captures shall be impossible, as the regex requires the end of the string '$'
-                assert len(split_by_segment_weight) == 3
-                # take first item of regex split (the prompt). leading '(' will have been removed by the split, as it is outside the capture group.
-                segment = split_by_segment_weight[0].strip()
-                # take second item (captured prompt weight with potential skip) - leading ':' and trailing ')' shall have been excluded from the capture
-                weight_item = split_by_segment_weight[1].strip()
-                # split off a potential skip value
-                weight_item_split = weight_item.split(";")
-                if len(weight_item_split) > 2:
-                    tqdm.write(f"NOTE: malformed prompt segment value: {weight_item}")
-                segment_weight = try_float(weight_item_split[0],1)
-                segment_skip = default_skip if len(weight_item_split)<=1 else try_int(weight_item_split[1],default_skip)
-            processed_segments.append(segment)
-            segment_weights.append(segment_weight)
-            segment_skips.append(segment_skip)
-            segment_tokens = tokenizer(segment,padding=False,max_length=None,truncation=False,return_tensors="pt",return_overflowing_tokens=False).input_ids[0]
-            # tokenize segment without padding, remove leading <|startoftext|> and trailing <|endoftext|> to measure the segment token count. see note below about max_length=None
-            segment_token_count = len(segment_tokens)-2
-            token_weights += [segment_weight]*segment_token_count
-            token_skips += [segment_skip]*segment_token_count
-
-        # join segments back together, but keep a space between then (otherwise words would amalgamate at the join points)
-        prompt = " ".join(processed_segments)
-        return prompt, token_weights, token_skips
-
-    # build attention io_data in reduced form
-    def weight_summary_item_string(i, prev_seg_count, prev_weight, prev_skip, text_input):
-        segment_start_index = i - prev_seg_count
-        # from start_index to (inclusive) start_index+count-1 - ':start_index+count' as the second index of l[a:b] is exclusive
-        segment_text = tokenizer.batch_decode([text_input.input_ids[0][segment_start_index:segment_start_index+prev_seg_count]])[0].strip()
-        segment_text = segment_text if not len(segment_text) > 14 else segment_text[:5]+"..."+segment_text[-5:]
-        return f" ({prev_weight}{';'+str(prev_skip) if prev_skip>0 else ''}@{segment_text})"
-    def prompt_weight_summary_string(token_weights, token_skips, text_input):
-        summary = ""
-        if True: #len(token_weights) > 2: # do not run processing on empty prompts.
-            prev_seg=(token_weights[1],token_skips[1])
-            prev_seg_count = 1
-            for i,seg in enumerate(zip(token_weights,token_skips)):
-                if i <= 1:
-                    # skip value of leading start token. Additionally, skip first weight, as it is initialized outside the loop. not excluded from the list to keep enum indices correct.
-                    continue
-                if prev_seg == seg:
-                    prev_seg_count += 1
-                else:
-                    # extract first token of attention value start - first index is <count> before the current index (which is no longer included), +1 as the weights start after startoftext
-                    summary+=(weight_summary_item_string(i, prev_seg_count, prev_seg[0], prev_seg[1], text_input))
-                    prev_seg = seg
-                    prev_seg_count = 1
-            # append final weight and count, which would occur from the subsequent weight i+1
-            summary+=(weight_summary_item_string(i+1, prev_seg_count, prev_seg[0], prev_seg[1], text_input))
-        else:
-            summary = ""
-        return summary.strip()
-
-    def encode_embedding_vectors(text_chunks, attention_mask, token_skips, default_clip_skip):
-        if all([skip <= 0 for skip in token_skips]): # a value of 0 (index: [-1]) would yield the final layer output, equivalent to default behavior
-            # unpack state, batch dim from every encode
-            processed_chunks = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask)[0][0] for text_chunk in text_chunks]
-            token_counts = [len(c) for c in processed_chunks]
-            # re-attach chunks
-            embedding_vectors = torch.cat(processed_chunks)
-            return embedding_vectors, token_counts
-        else:
-            # [text_encoder.text_model.final_layer_norm(text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states[-(clip_skip_layers+1)]) for text_chunk in text_chunks]
-            # encode every chunk, retrieve all hidden layers
-            text_chunks_hidden_states = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states for text_chunk in text_chunks]
-            # embeddings must be available for any token skip level requested, as well as for the default skip level (applied on start/end/padding tokens)
-            embedding_vectors = {
-                required_skip_level : torch.cat([text_encoder.text_model.final_layer_norm(chunk_hidden_states[-(required_skip_level+1)])[0] for chunk_hidden_states in text_chunks_hidden_states])
-                for required_skip_level in set(token_skips+[default_clip_skip])
-            }
-            # use the default skip level to extract per-chunk token counts
-            processed_chunks_of_default_skip = [text_encoder.text_model.final_layer_norm(chunk_hidden_states[-(default_clip_skip+1)])[0] for chunk_hidden_states in text_chunks_hidden_states]
-            token_counts = [len(c) for c in processed_chunks_of_default_skip]
-            # re-build resulting embedding vectors by interleaving the embedding vectors for different skip levels according to token_skips_after_start
-            new_embedding_vectors = []
-            # iterate over the vector count of the embedding (equal length for every decoded skip level)
-            for i in range(len(embedding_vectors[default_clip_skip])):
-                # retrieve the skip value of state i, use the default value if reading states of trailing end/padding tokens without a specified value.
-                skip_level = default_clip_skip if not i in range(len(token_skips)) else token_skips[i]
-                # select the embedding of the requested skip level, pick the vector at the index of the current iteration
-                new_embedding_vectors.append(embedding_vectors[skip_level][i])
-            embedding_vectors = torch.stack(new_embedding_vectors)
-            return embedding_vectors, token_counts
-
-    def apply_embedding_vector_weights(embedding_vectors, token_weights):
-        # Ignore (ending and padding) vectors outside of the stored range of token weights. Their weight will be 1.
-        return torch.stack([emb_vector if not i in range(len(token_weights)) else emb_vector*token_weights[i] for i,emb_vector in enumerate(embedding_vectors)])
-
-    @torch.no_grad()
-    def perform_text_encode(prompt,clip_skip_layers=0,pad_to_length=None,prefer_default_length=False):
-        io_data = {}
-
-        prompt = prompt.strip()
-        clip_skip_prompt_override = re.search('\{cls[0-9]+\}$', prompt) # match only '{cls<int>}' at the end of the prompt
-        if clip_skip_prompt_override is not None:
-            clip_skip_layers = min(int(clip_skip_prompt_override[0][4:-1]), MAX_CLIP_SKIP) # take match, drop leading '{cls' and trailing '}'. Clamp to possible value limit
-            # since this only matches on the end of the string, splitting multiple times on unfortunate prompts is not possible
-            prompt = re.split('\{cls[0-9]+\}$', prompt)[0]
-        io_data["clip_skip_layers"] = [clip_skip_layers]
-        # set rerun layers *after* checking for skip override. this allows producing of 'special tensors' with a trailing clip skip override
-        rerun_self_kwargs = {"clip_skip_layers":clip_skip_layers,"pad_to_length":pad_to_length,"prefer_default_length":prefer_default_length}
-
-        # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
-        sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
-        # first, grab all substitutions and replace them by a temporary UUID. This avoids substring collisions between substitution values and subsequent (shorter) substitution keys.
-        for (p,subst,identifier) in sorted_substitutions:
-            prompt = prompt.replace(p, f"<{identifier}>")
-        # then, replace UUID placeholders with substitution values. Substring collisions should not be an issue.
-        for (p,subst,identifier) in sorted_substitutions:
-            prompt = prompt.replace(f"<{identifier}>", subst)
-
-        # text embeddings
-        prompt, token_weights, token_skips = process_prompt_segmentation(prompt,clip_skip_layers)
-
-        text_input = tokenizer(
-            prompt,
-            padding="max_length" if pad_to_length is not None else False,
-            max_length=pad_to_length, # NOTE: None may be treated as "auto-select length limit of model" according to docs - however, no limit seems to be set with both L/14 (SD1.x) and OpenClip (SD2.x)
-            truncation=(pad_to_length is not None),
-            return_tensors="pt",
-            return_overflowing_tokens=(pad_to_length is not None),
-        )
-        # if the prompt is shorter than the standard token limit without a specified padding setting, but default-size embeddings are preferred, rerun with default pad length.
-        if len(text_input.input_ids[0]) <= tokenizer.model_max_length and pad_to_length is None and prefer_default_length:
-            return perform_text_encode(prompt,pad_to_length=tokenizer.model_max_length,prefer_default_length=False,**{k:v for k,v in rerun_self_kwargs.items() if not k in ["pad_to_length","prefer_default_length"]})
-        num_truncated_tokens = getattr(text_input,"num_truncated_tokens",[0])
-        io_data["text_readback"] = [t.strip() for t in tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)]
-        # SD2.0 openCLIP seems to pad with '!'. compact these down.
-        trailing_char_counts = []
-        for i, readback_string in enumerate(io_data["text_readback"]):
-            new_count = 0
-            for char in readback_string[::-1]: # reverse string -> move inwards from the back
-                if char == '!':
-                    new_count += 1
-                else:
-                    break
-            if new_count > 0: # [:-0] would be [:0], thus eliminating the entire string.
-                io_data["text_readback"][i] = readback_string[:-new_count]
-            trailing_char_counts.append(new_count)
-        # if a batch element had items truncated, the remaining token count is the negative of the amount of truncated tokens
-        # otherwise, count the amount of <|endoftext|> in the readback. Sidenote: this will report incorrectly if the prompt is below the token limit and happens to contain "<|endoftext|>" for some unthinkable reason.
-        io_data["remaining_token_count"] = [(- item) if item>0 else (io_data["text_readback"][idx].count("<|endoftext|>") - 1) if item!=0 and pad_to_length is not None else float('inf') for idx,item in enumerate(num_truncated_tokens)]
-        # If there is more space when looking at SD2.0 padding (trailing '!'), output it instead.
-        io_data["remaining_token_count"] = [max(remaining, trailing) for (remaining,trailing) in zip(io_data["remaining_token_count"], trailing_char_counts)]
-        io_data["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in io_data["text_readback"]]
-        #io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist() # unused, as the text encoders of both SD1.x and SD2.x lack a "use_attention_mask" attribute denoting manual attention maps.
-        try:
-            io_data["weights"] = [prompt_weight_summary_string(token_weights, token_skips, text_input)]
-        except:
-            io_data["weights"] = ""
-
-        chunk_count = (len(text_input.input_ids[0]) // tokenizer.model_max_length) + (1 if (len(text_input.input_ids[0])%tokenizer.model_max_length) > 0 else 0)
-        text_chunks = torch.chunk(text_input.input_ids[0], chunk_count)
-        # reassemble chunk items into batches of size 1
-        text_chunks = [torch.stack([chunk]) for chunk in text_chunks]
-
-        if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask:
-            attention_mask = text_input.attention_mask.to(IO_DEVICE)
-        else:
-            attention_mask = None
-
-        embedding_vectors, io_data["tokens"] = encode_embedding_vectors(text_chunks, attention_mask, token_skips, clip_skip_layers)
-
-        embedding_vectors = apply_embedding_vector_weights(embedding_vectors, token_weights)
-        # repack batch dimension around the embedding vectors
-        text_embeddings = torch.stack([embedding_vectors])
-
-        special_embeddings = get_special_embeddings(prompt.strip(), rerun_self_kwargs)
-        if special_embeddings is not None:
-            text_embeddings = special_embeddings
-
-        return text_embeddings, io_data
-
-    def get_special_embeddings(prompt, run_encode_kwargs):
-        if prompt == "<damaged_uncond>":
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            for i in range(uncond.shape[1]):
-                # create some tensor damage: mix half of the vector elements with a random element of the same vector.
-                idx = torch.randperm(uncond.shape[2])
-                for j in range(uncond.shape[2]):
-                    if torch.rand(1) > 0.5:
-                        uncond[:,i,j] = (uncond[:,i,j]*2 + uncond[:,i,idx[j]]) /3
-            return uncond
-        elif prompt == "<alpha_dropout_uncond>":
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            return torch.nn.functional.alpha_dropout(uncond, p=0.5)
-        elif prompt == "<all_starts>":
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            for i in range(1,uncond.shape[1]):
-                uncond[:,i] = uncond[:,0]
-            return uncond
-        elif prompt == "<all_ends>":
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            for i in range(0,uncond.shape[1]-1):
-                uncond[:,i] = uncond[:,-1]
-            return uncond
-        elif prompt == "<all_start_end>":
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            for i in range(1,uncond.shape[1]-1):
-                uncond[:,i] = uncond[:,0] if i%2==0 else uncond[:,-1]
-            return uncond
-        elif prompt == "<safety_concepts>": # could be used as negative prompt?
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            embeddings = globals().get("_safety_embeddings", None)
-            if embeddings is None or not "concepts" in embeddings:
-                return uncond
-            else:
-                # place between startoftext and endoftext vectors of uncond, rebuild batch dim
-                return torch.stack([torch.stack([uncond[0][0]] + [x for x in embeddings["concepts"].clone().to(uncond.device, uncond.dtype)] + [uncond[0][1]])])
-        elif prompt == "<safety_special>": # could be used as negative prompt?
-            uncond, _ = perform_text_encode("", **run_encode_kwargs)
-            embeddings = globals().get("_safety_embeddings", None)
-            if embeddings is None or not "special" in embeddings:
-                return uncond
-            else:
-                return torch.stack([torch.stack([uncond[0][0]] + [x for x in embeddings["special"].clone().to(uncond.device, uncond.dtype)] + [uncond[0][1]])])
-        return None
-
-    def apply_pad_tensor_to_embedding(in_tensor:torch.Tensor, pad_source:torch.Tensor, encapsulated=True):
-        if encapsulated:
-            # unpack and re-pack batch dimension of prompt
-            return torch.stack([apply_pad_tensor_to_embedding(in_tensor[0],pad_source[0],False)])
-
-        if in_tensor.shape[0] == pad_source.shape[0]:
-            return in_tensor
-        elif in_tensor.shape[0] > pad_source.shape[0]:
-            tqdm.write(f"WARNING: Embed chunk too large when applying padding! Padding {in_tensor.shape} with {pad_source.shape} requested!")
-            return in_tensor[:][:len(pad_source)]
-        else:
-            # fill as many vectors with data from the input tensor as possible. If the index is out of range for the input tensor, fill with the pad tensor. Rebuild batch dim.
-            return torch.stack([in_tensor[i] if i in range(len(in_tensor)) else pad_vector for i, pad_vector in enumerate(pad_source)])
-
-    def equalize_embedding_lengths(a:torch.Tensor, b:torch.Tensor):
-        # if the embeddings are not of equal length, zero-pad the shorter of the two embeddings to make the shapes equal.
-        if a is None and b is None:
-            raise ValueError("Unable to equalize embedding lengths as both embeddings are None")
-        a = a if a is not None else torch.zeros_like(b)
-        b = b if b is not None else torch.zeros_like(a)
-        a = a if not (b.shape[1] > a.shape[1]) else apply_pad_tensor_to_embedding(a,torch.zeros_like(b))
-        b = b if not (a.shape[1] > b.shape[1]) else apply_pad_tensor_to_embedding(b,torch.zeros_like(a))
-        return a,b
-
-    def add_encoding_sum(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_to_prev:bool):
-        next_encoding *= next_multiplier
-        # if the length of the current sum does not match the length of the next encoding, pad the shorter tensor.
-        current_sum, next_encoding = equalize_embedding_lengths(current_sum, next_encoding)
-        return (next_encoding if current_sum is None else current_sum + next_encoding), current_multiplier+next_multiplier
-
-    def add_encoding_cat(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_to_prev:bool):
-        next_encoding *= next_multiplier
-        # Remove startoftext and endoftext vectors if this is a direct concat.
-        if concat_direct_to_prev and current_sum is not None:
-            next_encoding = next_encoding[:,1:] # remove startoftext from new embedding
-            current_sum = current_sum[:,:-1] # remove trailing endoftext from prev embedding
-        #next_encoding = next_encoding if not concat_direct_to_next else next_encoding[:,:-1]
-        # concat in dim 1 - skip batch dim. Return multiplier as 1 - no division by a scale sum should be performed in concat mode.
-        return (next_encoding if current_sum is None else torch.cat([current_sum,next_encoding],dim=1)), 1
-
+    # check is_SDXL property of encoders
+    # done: Wrap this to deal with SDXL multiple encoders: encode on both, then concat in dim=-1 (length must be equalized first)
+    # done: allow secondary prompt separator for encoder_1/encoder_2 separate prompts
+    # done: deal with SDXL extra embeddings: standard prompt_embeds have a default skip of 1 and are seemingly without the final_layer_norm, extra pooled_prompt_embeds are always the pooled final outputs regardless of skip
+    # done: read and respect force_zeros_for_empty_prompt attr of text encoder(s)
     @torch.no_grad()
     def encode_prompt(prompt, encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False, extended_length_enforce_minimum=False, drop_zero_weight_encodings=CONCAT_DROP_ZERO_WEIGHT_EMBEDDINGS):
         # invalid (too small) lengths -> use model default
         static_length = tokenizer.model_max_length if (static_length is not None) and (static_length <= 2) else static_length
         perform_encode_kwargs = {
+            "tokenizer":tokenizer,
+            "text_encoder":text_encoder,
             "clip_skip_layers":clip_skip_layers,
             "pad_to_length":static_length,
             #"prefer_default_length":not dynamic_length_mode,
@@ -1190,8 +1025,8 @@ def generate_segmented(
             prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*\+?);", raw_item)
             if len(prompt_segments) == 1:
                 # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
-                new_embedding_positive, new_io_data = perform_text_encode(raw_item, **perform_encode_kwargs)
-                new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
+                new_embedding_positive, new_io_data = perform_text_encode_wrapper(prompt_segments, **perform_encode_kwargs)
+                new_embedding_negative, _ = perform_text_encode_wrapper(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
             else:
                 # print(f"Mixing {len(prompt_segments)//2} prompts with their respective weights")
                 # perpare invalid segments list to desired shape after splitting
@@ -1213,7 +1048,7 @@ def generate_segmented(
                 concat_direct_to_prev = False
                 for i, segment in enumerate(prompt_segments):
                     if i % 2 == 0:
-                        next_encoding, next_io_data = perform_text_encode(segment, **perform_encode_kwargs)
+                        next_encoding, next_io_data = perform_text_encode_wrapper(segment, **perform_encode_kwargs)
                         for key in next_io_data:
                             # glue together the io_data sublist of all the prompts being mixed
                             new_io_data[key] += next_io_data[key]
@@ -1222,7 +1057,8 @@ def generate_segmented(
                         concat_direct_to_next = segment.endswith('+')
                         segment = segment[:-1] if concat_direct_to_next else segment # remove trailing '+' if present.
                         multiplier = 1 if segment == "" else float(segment)
-                        new_io_data["text_readback"][-1] += f";{multiplier}{'+' if concat_direct_to_next else ''};"
+                        multiplier_readback = f";{multiplier}{'+' if concat_direct_to_next else ''};"
+                        new_io_data["text_readback"][-1] += multiplier_readback if not isinstance(new_io_data["text_readback"][-1], list) else [multiplier_readback]
                         # add either to positive, or to negative encodings & multipliers
                         is_negative_multiplier = multiplier < 0
                         # in dynamic length mode, concatenate prompts together instead of mixing. Otherwise, add new encodings to respective sum based on their multiplier.
@@ -1252,7 +1088,7 @@ def generate_segmented(
                     encodings_sum_positive, encodings_sum_negative = equalize_embedding_lengths(encodings_sum_positive, encodings_sum_negative)
                     if encodings_sum_positive is None:
                         tqdm.write("WARNING: only negative multipliers for prompt mixing are present. Using '' as a placeholder for positive prompts!")
-                        encodings_sum_positive, _ = perform_text_encode("", **perform_encode_kwargs)
+                        encodings_sum_positive, _ = perform_text_encode_wrapper("", **perform_encode_kwargs)
                         multiplier_sum_positive = 1.0
                     new_text_embeddings = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is not None:
@@ -1263,17 +1099,17 @@ def generate_segmented(
                     # use mixed prompt tensor as prompt embedding
                     new_embedding_positive = new_text_embeddings
                     # use default, empty uncond embedding
-                    new_embedding_negative, _ = perform_text_encode(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
+                    new_embedding_negative, _ = perform_text_encode_wrapper(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
                 else:
                     if encodings_sum_positive is None:
                         # add an empty prompt for positive embeddings. Saving iodata of an empty placeholder is probably not necessary.
-                        replacement_encoding_positive, additional_io_data = perform_text_encode("", **perform_encode_kwargs)
+                        replacement_encoding_positive, additional_io_data = perform_text_encode_wrapper("", **perform_encode_kwargs)
                         new_embedding_positive = replacement_encoding_positive
                     else:
                         new_embedding_positive = encodings_sum_positive / multiplier_sum_positive
                     if encodings_sum_negative is None:
                         # create default, empty uncond embedding. Skip iodata. It would not normally be saved for the empty uncond embedding.
-                        replacement_encoding_negative, additional_io_data = perform_text_encode(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
+                        replacement_encoding_negative, additional_io_data = perform_text_encode_wrapper(DEFAULT_NEGATIVE_PROMPT, **perform_encode_kwargs)
                         new_embedding_negative = replacement_encoding_negative
                     else:
                         new_embedding_negative = (encodings_sum_negative / multiplier_sum_negative)
@@ -1288,101 +1124,59 @@ def generate_segmented(
             for key in io_data:
                 io_data[key] = io_data[key][0]
 
-        embedding_lengths = [embedding.shape[1] for embedding in embeddings_list_prompt+embeddings_list_uncond]
+        embedding_lengths = [embedding.shape[1] if not isinstance(embedding,SDXLPromptEmbedding) else embedding.prompt_embeds.shape[1] for embedding in embeddings_list_prompt+embeddings_list_uncond]
         # if embedding sizes do not match, or if embeddings are shorter than an enforced minimum length, pad them wherever necessary.
         if (not all([el == embedding_lengths[0] for el in embedding_lengths])) or (extended_length_enforce_minimum and embedding_lengths[0]<tokenizer.model_max_length):
             max_embed_length = max(embedding_lengths)
             # if enforced, extend prompts to at least the default length
             max_embed_length = max_embed_length if not extended_length_enforce_minimum else max([tokenizer.model_max_length,max_embed_length])
-            padded_uncond_embedding, _ = perform_text_encode("", **{k:v for k,v in perform_encode_kwargs.items() if not k in ["pad_to_length"]}, pad_to_length=max_embed_length)
+            padded_uncond_embedding, _ = perform_text_encode_wrapper("", **{k:v for k,v in perform_encode_kwargs.items() if not k in ["pad_to_length"]}, pad_to_length=max_embed_length)
             embeddings_list_prompt = [apply_pad_tensor_to_embedding(emb,padded_uncond_embedding) for emb in embeddings_list_prompt]
             embeddings_list_uncond = [apply_pad_tensor_to_embedding(emb,padded_uncond_embedding) for emb in embeddings_list_uncond]
+        def pack_embeddings_list(embeddings_list):
+            if not any([isinstance(x, SDXLPromptEmbedding) for x in embeddings_list]):
+                return torch.cat(embeddings_list)
+            else:
+                assert all([isinstance(x, SDXLPromptEmbedding) for x in embeddings_list]), f"embeddings list containing a mixture of SDXL and non-SDXL embeddings was produced: {[type(x) for x in embeddings_list]}"
+                prompt_embeds_list = [x.prompt_embeds for x in embeddings_list]
+                pooled_prompt_embeds_list = [x.pooled_prompt_embeds for x in embeddings_list]
+                return SDXLPromptEmbedding(pack_embeddings_list(prompt_embeds_list), pack_embeddings_list(pooled_prompt_embeds_list))
         # stack list of text encodings to be processed back into a tensor
-        text_embeddings = torch.cat(embeddings_list_prompt)
+        text_embeddings = pack_embeddings_list(embeddings_list_prompt)
         # get the resulting batch size
         batch_size = len(text_embeddings)
-        # create tensor of uncond embeddings for the batch size by stacking n instances of the singular uncond embedding
-        uncond_embeddings = torch.cat(embeddings_list_uncond)
+        # create tensor of uncond embeddings for the batch size.
+        uncond_embeddings = pack_embeddings_list(embeddings_list_uncond)
         # n*77*768 + n*77*768 -> 2n*77*768
-        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+        if not any([isinstance(x, SDXLPromptEmbedding) for x in [uncond_embeddings, text_embeddings]]):
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+        else:
+            assert all([isinstance(x, SDXLPromptEmbedding) for x in [uncond_embeddings, text_embeddings]]), f"text embeddings and uncond embeddings inconsistent between SDXL and non-SDXL embeddings: {[type(x) for x in [uncond_embeddings, text_embeddings]]}"
+            text_embeddings = SDXLPromptEmbedding(torch.cat([uncond_embeddings.prompt_embeds, text_embeddings.prompt_embeds]), torch.cat([uncond_embeddings.pooled_prompt_embeds, text_embeddings.pooled_prompt_embeds]))
+        # SDXLPromptEmbedding forwards .to() call to both embeddings contained within and returns itself.
         if half_precision_latents:
-                text_embeddings = text_embeddings.to(dtype=torch.float16)
+            text_embeddings = text_embeddings.to(dtype=torch.float16)
         text_embeddings = text_embeddings.to(UNET_DEVICE)
 
         return text_embeddings, batch_size, io_data
 
-    def get_gs_mult(gs_schedule:str, progress_factor:float, step_idx:int=None):
-        gs_mult = 1
-        if gs_schedule is None or gs_schedule == "":
-            pass
-        elif gs_schedule == "sin": # half-sine (between 0 and pi; 0 -> 1 -> 0)
-            gs_mult = np.sin(np.pi * progress_factor)
-        elif gs_schedule == "isin": # inverted half-sine (1 -> 0 -> 1)
-            gs_mult = 1.0 - np.sin(np.pi * progress_factor)
-        elif gs_schedule == "fsin": # full sine (0 -> 1 -> 0 -> -1 -> 0) for experimentation
-            gs_mult = np.sin(2*np.pi * progress_factor)
-        elif gs_schedule == "anneal5": # rectified 2.5x full sine (5 bumps)
-            gs_mult = np.abs(np.sin(2*np.pi * progress_factor*2.5))
-        elif gs_schedule == "ianneal5": # 1- (rectified 2.5x full sine (5 bumps))
-            gs_mult = 1 - np.abs(np.sin(2*np.pi * progress_factor*2.5))
-        elif gs_schedule == "cos": # quarter-cos (between 0 and pi/2; 1 -> 0)
-            gs_mult = np.cos(np.pi/2 * progress_factor)
-        elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
-            gs_mult = 1.0 - np.cos(np.pi/2 * progress_factor)
-        elif gs_schedule == "rand": # random multiplier in [0,1)
-            gs_mult = np.random.rand()
-        elif gs_schedule == "frand": # random multiplier, with negative values
-            gs_mult = np.random.rand()*2-1
-        elif gs_schedule == "buzz": # switch back and forth between 0 and 1. Downwards compatibility: If no step is provided, randomly switch between 0 and 1.
-            gs_mult = float(np.random.randint(0,2) if not isinstance(step_idx, int) else step_idx%2)
-        elif gs_schedule == "th2": # threshold at 0.25
-            gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.25)*SIGMOID_GS_MULT_COMPRESSION))
-        elif gs_schedule == "th5": # threshold at 0.5
-            gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.5)*SIGMOID_GS_MULT_COMPRESSION))
-        elif gs_schedule == "th7": # threshold at 0.75
-            gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.75)*SIGMOID_GS_MULT_COMPRESSION))
-        elif gs_schedule == "ith2": # threshold at 0.25
-            gs_mult = 1/(1 + np.exp((-progress_factor+0.25)*SIGMOID_GS_MULT_COMPRESSION))
-        elif gs_schedule == "ith5": # threshold at 0.5
-            gs_mult = 1/(1 + np.exp((-progress_factor+0.5)*SIGMOID_GS_MULT_COMPRESSION))
-        elif gs_schedule == "ith7": # threshold at 0.75
-            gs_mult = 1/(1 + np.exp((-progress_factor+0.75)*SIGMOID_GS_MULT_COMPRESSION))
-        else:
-            # Could add a warning here.
-            pass
-        return gs_mult
+    # Adapted from diffusers SDXL pipeline: https://github.com/huggingface/diffusers/blob/66f94eaa0c68a893b2aba1ec9f79ee7890786fba/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L696
+    def make_time_ids(original_size:tuple=(1024,1024), target_size:tuple=(1024,1024), crop_coords_top_left:tuple=(0,0)):
+        """
+        see: https://huggingface.co/docs/diffusers/main/en/using-diffusers/sdxl#size-conditioning
+        original_size : "content size" where lower values indicate content/detail levels of upscaled lower resolution images
+        target_size : "composition size" where square values should yield a composition aligned with what 'square images' tend to look like
+        see: https://huggingface.co/docs/diffusers/main/en/using-diffusers/sdxl#crop-conditioning
+        crop_coords_top_left : indicates centered composition with no cropped image content. Set to produce off-center/cropped outputs
+        """
+        add_time_ids = list(original_size+crop_coords_top_left+target_size)
+        assert isinstance(text_encoder, SDXLTextEncoder)
+        expected_time_embedding_dim = unet.add_embedding.linear_1.in_features
+        time_embedding_dim = unet.config.get("addition_time_embed_dim", 0) * len(add_time_ids) + text_encoder.get_encoders()[1].config.projection_dim
+        assert expected_time_embedding_dim == time_embedding_dim, f"unet expects time embedding with {expected_time_embedding_dim} features, created vector with {time_embedding_dim} features! Configuration error on unet time_embedding_type or text_encoder_2 projection_dim"
+        return torch.tensor([add_time_ids])
 
-    def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_name=False):
-        if high_beta:
-            # scheduler default
-            beta_start, beta_end = 0.0001, 0.02
-        else:
-            # stablediffusion default
-            beta_start, beta_end = 0.00085, 0.012
-        scheduler_params = {"beta_start":beta_start, "beta_end":beta_end, "beta_schedule":"scaled_linear", "num_train_timesteps":1000, "skip_prk_steps":True, "use_karras_sigmas":use_karras_sigmas}
-        if V_PREDICTION_MODEL:
-            if not sched_name in V_PREDICTION_SCHEDULERS:
-                tqdm.write(f"WARNING: A v_prediction model is running, but the selected scheduler {sched_name} is not listed as v_prediction enabled. THIS WILL YIELD BAD RESULTS! Switch to one of {V_PREDICTION_SCHEDULERS}")
-            else:
-                scheduler_params["prediction_type"] = "v_prediction"
-        # pndm: skip_prk_steps=True "for some models like stable diffusion the prk steps can/should be skipped to produce better results." # pndm: skip_prk_steps=True
-        assert sched_name in SCHEDULER_OPTIONS, f"Requested unknown scheduler: {sched_name}"
-        scheduler_class = SCHEDULER_OPTIONS.get(sched_name)
-        available_scheduler_params = {k:v for k,v in scheduler_params.items() if k in scheduler_class._get_init_keys(scheduler_class)}
-        scheduler = scheduler_class(**available_scheduler_params)
-        if not return_name:
-            return scheduler
-        else:
-            return scheduler, f"{sched_name}{f' (Karras sigmas)' if available_scheduler_params.get('use_karras_sigmas',False) else ''}{f' (high beta)' if high_beta else ''}"
-
-    # see diffusers PR: https://github.com/huggingface/diffusers/commit/12a232efa99d7a8c33f54ae515c5a3d6fc5c8f34
-    def rescale_prediction(noise_pred:torch.Tensor, noise_pred_text:torch.Tensor, rescale_factor:float=0.66) -> torch.Tensor:
-        def get_std(x:torch.Tensor) -> torch.Tensor:
-            return x.std(dim=list(range(1, x.ndim)), keepdim=True)
-        prediction_scale_factor = (get_std(noise_pred_text) / get_std(noise_pred))
-        return noise_pred * (1-rescale_factor) + noise_pred*prediction_scale_factor*rescale_factor
-
-
+    # done: deal with SDXL extra unet args: text_embeds (extra pooled embeds), time_ids, timestep_cond=None (optionally implement, is off on both SDXL and PGv2)
     @torch.no_grad()
     def generate_segmented_exec(
             prompt=["art"], width=512, height=512, steps=50, gs=7.5, seed=None, sched_name="pndm", eta=0.0, eta_seed=None, high_beta=False,
@@ -1454,9 +1248,27 @@ def generate_segmented(
         else:
             generator_unet = torch.Generator("cpu").manual_seed(seed)
 
+        sampling_loop_cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
+        cast_unet_args = {"device":sampling_loop_cast_device, "dtype":unet.dtype}
+
         sched_name = sched_name.lower().strip()
 
+        # the produced batch_size is the number of requested outputs (classifier-free-guidance -> *2 for the forward pass item count)
         text_embeddings, batch_size, io_data = encode_prompt(prompt, encoder_level_negative_prompts, clip_skip_layers, static_length, mix_mode_concat)
+        unet_extra_kwargs = {}
+        if isinstance(text_embeddings, SDXLPromptEmbedding):
+            # TODO: make these parameters! (lowering negative original_size should provide a free detail boost?)
+            positive_time_ids = make_time_ids((height, width), (height,width), (0,0))
+            # e.g.: negative_time_ids = make_time_ids((int(height/16)*8, int(width/16)*8), (height,width), (0,0))
+            negative_time_ids = make_time_ids((height, width), (height,width), (0,0))
+            time_ids = torch.cat([negative_time_ids]*(batch_size) + [positive_time_ids]*(batch_size), dim=0)
+            unet_extra_kwargs = {"added_cond_kwargs":{"text_embeds":text_embeddings.pooled_prompt_embeds.to(**cast_unet_args), "time_ids":time_ids.to(**cast_unet_args)}, "timestep_cond":None}
+            if unet.config.get("time_cond_proj_dim", None) is not None:
+                tqdm.write(f"{NotImplementedError(f'model architecture requests guidance_scale_embedding (timestep_cond): unet time_cond_proj_dim: {unet.config.time_cond_proj_dim}')}")
+                # base SDXL does not use this. currently fixed to timestep_cond=None
+            #print(text_embeddings.prompt_embeds.shape, text_embeddings.pooled_prompt_embeds.shape, time_ids.shape)
+            # after unpacking the pooled embeds to extra kwargs, put the prompt_embeds tensor where it belongs.
+            text_embeddings = text_embeddings.prompt_embeds
         for key in io_data:
             SUPPLEMENTARY["io"][key] = io_data[key]
 
@@ -1488,7 +1300,7 @@ def generate_segmented(
                 init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
                 init_latents = vae_with_failover(vae, init_image_tensor.to(IO_DEVICE), decode=False).latent_dist.sample()
                 # apply inverse scaling
-                init_latents = 0.18215 * init_latents
+                init_latents = vae.config.get("scaling_factor",0.18215) * init_latents
                 init_latents_list.append(init_latents)
             # if the init latent batch is smaller than the actual batch size, expand it.
             if len(init_latents_list) < batch_size:
@@ -1535,19 +1347,14 @@ def generate_segmented(
             setattr(unet, "lora_strength", lora_schedule_mult)
             # predict the noise residual
             with torch.no_grad():
-                cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
-                cast_unet_args = {"device":cast_device, "dtype":unet.dtype}
                 down_block_residuals, mid_block_residual, incompatible = apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i)
                 if incompatible:
-                    tqdm.write(f"Dimension mismatch between controlnet and diffusion UNET! Versions may be mismatched between SD1.x and SD2.x! Disabling controlnet for this diffusion.")
+                    tqdm.write(f"Mismatch between controlnet and diffusion UNET! Versions may be mixed between SD1.x / SD2.x / SDXL! Disabling controlnet for this diffusion.")
                     controlnet_input = None
                     SUPPLEMENTARY["io"]["controlnet"] = None
                 if not unet_sequential_batch:
                     try:
-                        noise_pred = unet(
-                            latent_model_input.to(**cast_unet_args), t.to(**cast_unet_args), encoder_hidden_states=text_embeddings.to(**cast_unet_args),
-                            down_block_additional_residuals=down_block_residuals, mid_block_additional_residual=mid_block_residual,
-                        )["sample"]
+                        noise_pred = exec_unet_parallel(cast_unet_args, text_embeddings, unet_extra_kwargs, t, latent_model_input, down_block_residuals, mid_block_residual)
                     except RuntimeError as e:
                         if 'out of memory' in str(e):
                             unet_sequential_batch = True
@@ -1555,13 +1362,21 @@ def generate_segmented(
                             raise e
                 if unet_sequential_batch:
                     # re-check the condition. Will now be True if batching failed.
-                    def batch_idx(x, i):
-                        return None if x is None else torch.stack([x[i]])
-                    noise_pred = torch.cat([unet(
-                        batch_idx(latent_model_input,i).to(**cast_unet_args), t.to(**cast_unet_args), encoder_hidden_states=batch_idx(text_embeddings,i).to(**cast_unet_args),
-                        down_block_additional_residuals=None if down_block_residuals is None else batch_idx(down_block_residuals,i).to(**cast_unet_args),
-                        mid_block_additional_residual=None if mid_block_residual is None else mid_block_residual.to(**cast_unet_args),
-                    )["sample"] for i in range(len(latent_model_input))])
+                    noise_pred = exec_unet_sequential(cast_unet_args, text_embeddings, unet_extra_kwargs, t, latent_model_input, down_block_residuals, mid_block_residual)
+                else:
+                    if cuda_memory_empty() and not unet_sequential_batch:
+                        # check this after running a cycle. If we completed a cycle using shared memory, we don't need to re-compute the results.
+                        unet_device = unet.device
+                        try:
+                            unet.to("cpu")
+                        except Exception:
+                            pass # when offloaded to cpu, model switching will fail (copy out of meta tensor)
+                        cleanup_memory() # temporarily purging the UNET from GPU memory seems to help clear out slightly more memory in some cases, leading to a faster seq_batch forward
+                        try:
+                            unet.to(unet_device)
+                        except Exception:
+                            pass
+                        unet_sequential_batch = True
 
             # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -1602,7 +1417,7 @@ def generate_segmented(
         if animate:
             SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
         # scale and decode the image latents with vae
-        latents = 1 / 0.18215 * latents
+        latents = 1 / vae.config.get("scaling_factor",0.18215) * latents
         latents = latents.to(IO_DEVICE)
         latents = latents.to(vae.dtype)
         image = vae_with_failover(vae, latents, decode=True)
@@ -1634,7 +1449,7 @@ def generate_segmented(
                 pass # when offloaded to cpu, model switching will fail (copy out of meta tensor)
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
-                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_with_failover(vae,(item*(1 / 0.18215)).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_with_failover(vae,(item*(1 / vae.config.get("scaling_factor",0.18215))).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
                 # if any safety processing was applied, copy it to the animated output
                 img_blur_masks = [getattr(image_item, "blur_mask", None) for image_item in pil_images]
                 img_removals = [getattr(image_item, "safety_remove", False) for image_item in pil_images]
@@ -1661,9 +1476,36 @@ def generate_segmented(
 
         return pil_images, SUPPLEMENTARY
 
+    def exec_unet_sequential(cast_unet_args, text_embeddings, unet_extra_kwargs, t, latent_model_input, down_block_residuals, mid_block_residual):
+        return torch.cat([unet(
+                        batch_idx(latent_model_input,i).to(**cast_unet_args), t.to(**cast_unet_args), encoder_hidden_states=batch_idx(text_embeddings,i).to(**cast_unet_args), **batch_idx(unet_extra_kwargs,i),
+                        down_block_additional_residuals=None if down_block_residuals is None else batch_idx(down_block_residuals,i).to(**cast_unet_args),
+                        mid_block_additional_residual=None if mid_block_residual is None else mid_block_residual.to(**cast_unet_args),
+                    )["sample"] for i in range(len(latent_model_input))])
+
+    def batch_idx(x, i, batch_size=None):
+        if isinstance(x, torch.Tensor):
+            if batch_size is not None and not x.shape[0] == batch_size*2:
+                tqdm.write(f"sequential batch indexing error: tensor size[0] in {x.shape} does not match batch size {batch_size*2}")
+                return x
+            return None if x is None else torch.stack([x[i]])
+        elif isinstance(x, dict):
+            return {k:batch_idx(v, i) for k,v in x.items()}
+        else:
+            return x
+
+    def exec_unet_parallel(cast_unet_args, text_embeddings, unet_extra_kwargs, t, latent_model_input, down_block_residuals, mid_block_residual):
+        return unet(
+            latent_model_input.to(**cast_unet_args), t.to(**cast_unet_args), encoder_hidden_states=text_embeddings.to(**cast_unet_args), **unet_extra_kwargs,
+            down_block_additional_residuals=down_block_residuals, mid_block_additional_residual=mid_block_residual,
+        )["sample"]
+
     def apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i=None):
         incompatible = False
         if controlnet_input is not None:
+            if isinstance(text_embeddings, SDXLPromptEmbedding):
+                print(f"Controlnets for SDXL not yet implemented.")
+                return None, None, True
             controlnet_mult = get_gs_mult(controlnet_strength_scheduler, progress_factor, i)
             cast_controlnet_args = {"device":controlnet.device, "dtype":torch.float16}
             try:
@@ -1913,34 +1755,29 @@ def load_learned_embed_in_clip(learned_embeds_path, text_encoder, tokenizer, tar
 
     # add the token(s) in tokenizer
     for (token, embed) in zip(tokens, embeds):
-        try:
-            encoder_shape = text_encoder.get_input_embeddings().weight.data[0].shape
-            if not encoder_shape == embed.shape:
-                if encoder_shape[0] in [768, 1024] and embed.shape[0] in [768,1024]:
-                    sd1_clip = "SD_1.x" #"CLIP-ViT-L/14, SD_1.x"
-                    sd2_clip = "SD_2.x" #"OpenCLIP-ViT/H, SD_2.x"
-                    raise RuntimeError(f"Text encoder: {sd1_clip if encoder_shape[0] == 768 else sd2_clip}, embed: {sd1_clip if embed.shape[0] == 768 else sd2_clip}")
-                raise RuntimeError(f"Incompatible: embed shape {embed.shape} does not match text encoder shape {text_encoder.get_input_embeddings().weight.data[0].shape}")
-            num_added_tokens = tokenizer.add_tokens(token)
-            if num_added_tokens == 0:
-                # simply attempt to add the token with a number suffix
-                for i in range(0, 256):
-                    if num_added_tokens == 0:
-                        num_added_tokens = tokenizer.add_tokens(f"{token}{i}")
-                    else:
-                        break
+        encoder_shape = text_encoder.get_input_embeddings().weight.data[0].shape
+        if not encoder_shape == embed.shape:
+            if encoder_shape[0] in [768, 1024] and embed.shape[0] in [768,1024]:
+                sd1_clip = "SD_1.x" #"CLIP-ViT-L/14, SD_1.x"
+                sd2_clip = "SD_2.x" #"OpenCLIP-ViT/H, SD_2.x"
+                raise RuntimeError(f"Text encoder: {sd1_clip if encoder_shape[0] == 768 else sd2_clip}, embed: {sd1_clip if embed.shape[0] == 768 else sd2_clip}")
+            raise RuntimeError(f"Incompatible: embed shape {embed.shape} does not match text encoder shape {text_encoder.get_input_embeddings().weight.data[0].shape}")
+        num_added_tokens = tokenizer.add_tokens(token)
+        if num_added_tokens == 0:
+            # simply attempt to add the token with a number suffix
+            for i in range(0, 256):
                 if num_added_tokens == 0:
-                    print(f"WARNING: Unable to add token {token} to tokenizer. Too many instances? Skipping addition!")
-                    continue
-            # resize the token embeddings
-            text_encoder.resize_token_embeddings(len(tokenizer))
-            # get the id for the token and assign the embed
-            token_id = tokenizer.convert_tokens_to_ids(token)
-            text_encoder.get_input_embeddings().weight.data[token_id] = embed
-        except RuntimeError as e:
-            print(f" (incompatible: {token}) {e}")
-            return
-            #print_exc()
+                    num_added_tokens = tokenizer.add_tokens(f"{token}{i}")
+                else:
+                    break
+            if num_added_tokens == 0:
+                print(f"WARNING: Unable to add token {token} to tokenizer. Too many instances? Skipping addition!")
+                continue
+        # resize the token embeddings
+        text_encoder.resize_token_embeddings(len(tokenizer))
+        # get the id for the token and assign the embed
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        text_encoder.get_input_embeddings().weight.data[token_id] = embed
 
     if not original_token in PROMPT_SUBST:
         PROMPT_SUBST[original_token] = token_subst_value
@@ -2002,7 +1839,7 @@ def save_output(p, imgs, argdict, perform_save=True, latents=None, display=False
                     new_img.save(filepath_noext+".png", pnginfo=item_metadata)
                 item_metadata_list.append(item_metadata)
 
-        metadata.add_text("prompt", str(collapse_representation(p)))
+        metadata.add_text("prompt", str(collapse_repetitions(p)))
         metadata.add_text("prompt_data", f"{prompts_for_metadata}\n{argdict_str}")
         metadata.add_text("latents", grid_latent_string)
     else:
@@ -2309,13 +2146,13 @@ def create_interpolation(a, b, steps, vae, overextend=0.5):
     print("decoding...")
     with torch.no_grad():
         # processing images in target device one-by-one saves VRAM.
-        image_sequence = tensor_to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / 0.18215))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
+        image_sequence = tensor_to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / vae.config.get("scaling_factor",0.18215)))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
 
 def re_encode(filepath, vae):
     latent = load_latents_from_image(filepath)
     with torch.no_grad():
-        image = tensor_to_pil(vae.decode(latent.to(DIFFUSION_DEVICE) * (1 / 0.18215))[0])
+        image = tensor_to_pil(vae.decode(latent.to(DIFFUSION_DEVICE) * (1 / vae.config.get("scaling_factor",0.18215)))[0])
     return image
 
 class Placeholder():
@@ -2551,11 +2388,11 @@ class QuickGenerator():
         final_latent = SUPPLEMENTARY['latent']['final_latent']
         PIL_animation_frames = argdict.pop("image_sequence")
         # reduce prompt representation: only output one prompt instance for a larger batch of the same prompt
-        argdict["text_readback"] = collapse_representation(argdict.pop("text_readback"), n=3)
-        argdict["remaining_token_count"] = collapse_representation(argdict["remaining_token_count"], n=3)
-        argdict["weights"] = collapse_representation(argdict.pop("weights"), n=3)
-        argdict["clip_skip_layers"] = collapse_representation(argdict.pop("clip_skip_layers"),n=3)
-        argdict["tokens"] = collapse_representation(argdict.pop("tokens"),n=3)
+        argdict["text_readback"] = collapse_repetitions(argdict.pop("text_readback"), n=3)
+        argdict["remaining_token_count"] = collapse_repetitions(argdict["remaining_token_count"], n=3)
+        argdict["weights"] = collapse_repetitions(argdict.pop("weights"), n=3)
+        argdict["clip_skip_layers"] = collapse_repetitions(argdict.pop("clip_skip_layers"),n=3)
+        argdict["tokens"] = collapse_repetitions(argdict.pop("tokens"),n=3)
         if argdict["width"] == 512:
             argdict.pop("width")
         if argdict["height"] == 512:
@@ -2587,6 +2424,8 @@ class QuickGenerator():
             argdict.pop("concat")
         if argdict.get("sequential", False) and len(out) < 2:
             argdict.pop("sequential")
+        if argdict.get("lora_schedule", "") is None:
+            argdict.pop("lora_schedule")
         full_image, full_metadata, metadata_items = save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
         if self.animate:
             # init frames by image list
@@ -2723,6 +2562,493 @@ class QuickGenerator():
         if save_final:
             animation_files_basepath = save_animations([frames])
         return out,SUPPLEMENTARY, (full_image, full_metadata, metadata_items)
+
+def perform_text_encode_wrapper(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False):
+    sdxl_conds = [isinstance(text_encoder, SDXLTextEncoder), isinstance(tokenizer, SDXLTokenizer), getattr(text_encoder, "is_SDXL", False)]
+    perform_enc_exec_args = {"prompt":prompt, "clip_skip_layers":clip_skip_layers, "pad_to_length":pad_to_length, "prefer_default_length":prefer_default_length}
+    if not any(sdxl_conds):
+        embeddings, io_data = perform_text_encode(tokenizer=tokenizer, text_encoder=text_encoder, **perform_enc_exec_args)
+        # likely unnecessary, this attribute isn't really found outside of SDXL architectures
+        if getattr(text_encoder, "force_zeros_for_empty_prompt", False) and prompt.strip() == "":
+            embeddings = torch.zeros_like(embeddings)
+        return embeddings, io_data
+    else:
+        assert isinstance(text_encoder, MultiTextEncoder) and isinstance(tokenizer, MultiTokenizer), f"SDXL: {'in' if not isinstance(tokenizer, MultiTokenizer) else ''}correct tokenizer type ({type(tokenizer)}), {'in' if not isinstance(text_encoder, MultiTokenizer) else ''}correct text_encoder type ({type(text_encoder)})"
+        assert len(tokenizer.get_encoders()) == len(text_encoder.get_encoders()), f"tokenizer count ({len(tokenizer.get_encoders())}) does not match text_encoder count ({len(text_encoder.get_encoders())})"
+        if not getattr(text_encoder, "is_SDXL"):
+            print(f"Notice: Multiple text encoders (SDXL-style) present, but non-SDXL encodings requested.")
+            return multiencoder_encode_wrapper(prompt, tokenizer, text_encoder, perform_enc_exec_args)
+        else: # is_SDXL property refers to the pipeline that diffusers would use being the SDXL pipeline.
+            # SDXL pipeline: standard prompt embeds are seemingly non-normed and skip the last layer of CLIP by default
+            base_exec_args = {**perform_enc_exec_args, "clip_skip_layers":max(perform_enc_exec_args["clip_skip_layers"], 1), "no_layer_norm":True}
+            embeddings_base, io_data_base = multiencoder_encode_wrapper(prompt, tokenizer, text_encoder, base_exec_args)
+            # extra pooled_prompt_embeds contain the pooled final layer output regardless of CLIP skip setting.
+            pooled_exec_args = {**perform_enc_exec_args, "clip_skip_layers":0, "no_layer_norm":False, "pooled_result":True}
+            # pooled embeddings are only generated via the second text encoder, and remain unstacked.
+            embeddings_pooled, io_data_pooled = perform_text_encode(tokenizer=tokenizer.get_encoders()[1], text_encoder=text_encoder.get_encoders()[1], **pooled_exec_args)
+            embeddings = SDXLPromptEmbedding(embeddings_base, embeddings_pooled)
+            #io_data = {k:[v] + [io_data_pooled.get(k,None)] for k,v in io_data_base.items()}
+            return embeddings, io_data_base
+
+def multiencoder_encode_wrapper(prompt, tokenizer, text_encoder, perform_enc_exec_args):
+    embeddings_list = []
+    io_data = None
+    prompts = prompt.split("//")
+    prev_readback = None
+    for tok,enc,idx in zip(tokenizer.get_encoders(), text_encoder.get_encoders(), range(len(text_encoder.get_encoders()))):
+        index_prompt = prompts[idx%len(prompts)]
+        index_exec_args = {**perform_enc_exec_args, "prompt":index_prompt}
+        new_emb, new_io_data = perform_text_encode(tokenizer=tok, text_encoder=enc, **index_exec_args)
+        embeddings_list.append(new_emb)
+        if io_data is None:
+            io_data = {k:[v] for k,v in new_io_data.items()}
+            io_data["text_readback"] = new_io_data["text_readback"]
+            prev_readback = new_io_data["text_readback"]
+        else:
+            for key in new_io_data:
+                #io_data[key] = io_data.get(key, []).append(new_io_data[key])
+                if not key == "text_readback":
+                    io_data[key].append(new_io_data[key])
+                else:
+                    if new_io_data["text_readback"] != prev_readback:
+                        if len(io_data[key]) == 1:
+                            io_data[key] = io_data[key][0] + " // " + new_io_data["text_readback"][0]
+                        else:
+                            io_data[key] += ["//"] + new_io_data["text_readback"]
+                    prev_readback = new_io_data["text_readback"]
+        if not isinstance(io_data["text_readback"], list):
+            io_data["text_readback"] = [io_data["text_readback"]]
+    assert len(embeddings_list) == 2, f"SDXL embedding processing not available for embedding count of {len(embeddings_list)}. Should be 2."
+    emb_a, emb_b = equalize_embedding_lengths(embeddings_list[0], embeddings_list[1])
+    embeddings = torch.cat((emb_a, emb_b), dim=-1)
+
+    if getattr(text_encoder, "force_zeros_for_empty_prompt", False) and prompt.strip() == "":
+        embeddings = torch.zeros_like(embeddings)
+    return embeddings, io_data
+
+def process_prompt_segmentation(tokenizer, prompt, default_skip=0):
+    segment_weights = []
+    processed_segments = []
+    segment_skips = []
+    # the start token is not part of the segments - add a leading weight of 1 and a leading skip of <default> for it.
+    token_weights = [1]
+    token_skips = [default_skip]
+    # split out segments where custom weights are defined. Use non-greedy content matching to identify the segment: '.+?'
+    weighted_segments = re.split("\((.+?:-?[\.0-9;]+)\)", prompt)
+    for segment in weighted_segments:
+        segment = segment.strip()
+        # empty segments will exclusively show up with zero-length prompts, which produce one empty segment. Their handling can be ignored.
+        segment_weight = 1
+        segment_skip = default_skip
+        split_by_segment_weight = re.split(":(-?[\.0-9;]+)$",segment)
+        if len(split_by_segment_weight)>1:
+            # should result in _exactly_ three segments: prompt, weight capture group, trailing empty segment (caused by the '\)$' at the end of the regex expression
+            # multiple captures shall be impossible, as the regex requires the end of the string '$'
+            assert len(split_by_segment_weight) == 3
+            # take first item of regex split (the prompt). leading '(' will have been removed by the split, as it is outside the capture group.
+            segment = split_by_segment_weight[0].strip()
+            # take second item (captured prompt weight with potential skip) - leading ':' and trailing ')' shall have been excluded from the capture
+            weight_item = split_by_segment_weight[1].strip()
+            # split off a potential skip value
+            weight_item_split = weight_item.split(";")
+            if len(weight_item_split) > 2:
+                tqdm.write(f"NOTE: malformed prompt segment value: {weight_item}")
+            segment_weight = try_float(weight_item_split[0],1)
+            segment_skip = default_skip if len(weight_item_split)<=1 else try_int(weight_item_split[1],default_skip)
+        processed_segments.append(segment)
+        segment_weights.append(segment_weight)
+        segment_skips.append(segment_skip)
+        segment_tokens = tokenizer(segment,padding=False,max_length=None,truncation=False,return_tensors="pt",return_overflowing_tokens=False).input_ids[0]
+        # tokenize segment without padding, remove leading <|startoftext|> and trailing <|endoftext|> to measure the segment token count. see note below about max_length=None
+        segment_token_count = len(segment_tokens)-2
+        token_weights += [segment_weight]*segment_token_count
+        token_skips += [segment_skip]*segment_token_count
+
+    # join segments back together, but keep a space between then (otherwise words would amalgamate at the join points)
+    prompt = " ".join(processed_segments)
+    return prompt, token_weights, token_skips
+
+def apply_embedding_vector_weights(embedding_vectors, token_weights):
+    # Ignore (ending and padding) vectors outside of the stored range of token weights. Their weight will be 1.
+    return torch.stack([emb_vector if not i in range(len(token_weights)) else emb_vector*token_weights[i] for i,emb_vector in enumerate(embedding_vectors)])
+
+# build attention io_data in reduced form
+def weight_summary_item_string(tokenizer, i, prev_seg_count, prev_weight, prev_skip, text_input):
+    segment_start_index = i - prev_seg_count
+    # from start_index to (inclusive) start_index+count-1 - ':start_index+count' as the second index of l[a:b] is exclusive
+    segment_text = tokenizer.batch_decode([text_input.input_ids[0][segment_start_index:segment_start_index+prev_seg_count]])[0].strip()
+    segment_text = segment_text if not len(segment_text) > 14 else segment_text[:5]+"..."+segment_text[-5:]
+    return f" ({prev_weight}{';'+str(prev_skip) if prev_skip>0 else ''}@{segment_text})"
+
+def prompt_weight_summary_string(tokenizer, token_weights, token_skips, text_input):
+    summary = ""
+    if True: #len(token_weights) > 2: # do not run processing on empty prompts.
+        prev_seg=(token_weights[1],token_skips[1])
+        prev_seg_count = 1
+        for i,seg in enumerate(zip(token_weights,token_skips)):
+            if i <= 1:
+                # skip value of leading start token. Additionally, skip first weight, as it is initialized outside the loop. not excluded from the list to keep enum indices correct.
+                continue
+            if prev_seg == seg:
+                prev_seg_count += 1
+            else:
+                # extract first token of attention value start - first index is <count> before the current index (which is no longer included), +1 as the weights start after startoftext
+                summary+=(weight_summary_item_string(tokenizer, i, prev_seg_count, prev_seg[0], prev_seg[1], text_input))
+                prev_seg = seg
+                prev_seg_count = 1
+        # append final weight and count, which would occur from the subsequent weight i+1
+        summary+=(weight_summary_item_string(tokenizer, i+1, prev_seg_count, prev_seg[0], prev_seg[1], text_input))
+    else:
+        summary = ""
+    return summary.strip()
+
+# directly copied and adapted from transformers.models.clip.modeling_clip.CLIPTextTransformer.forward()
+def pool_hidden_state(hidden_state, input_ids, text_encoder):
+    eos_token_id = text_encoder.text_model.eos_token_id
+    if eos_token_id == 2:
+        # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
+        # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
+        # ------------------------------------------------------------
+        # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+        pooled_output = hidden_state[
+            torch.arange(hidden_state.shape[0], device=hidden_state.device),
+            input_ids.to(dtype=torch.int, device=hidden_state.device).argmax(dim=-1),
+        ]
+    else:
+        # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
+        pooled_output = hidden_state[
+            torch.arange(hidden_state.shape[0], device=hidden_state.device),
+            # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
+            (input_ids.to(dtype=torch.int, device=hidden_state.device) == eos_token_id)
+            .int()
+            .argmax(dim=-1),
+        ]
+    return pooled_output
+
+def encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, default_clip_skip:int=0, no_layer_norm:bool=False):
+    if all([skip <= 0 for skip in token_skips]): # a value of 0 (index: [-1]) would yield the final layer output, equivalent to default behavior
+        # unpack state, batch dim from every encode
+        processed_chunks = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask)[0][0] for text_chunk in text_chunks]
+        token_counts = [len(c) for c in processed_chunks]
+        # re-attach chunks
+        embedding_vectors = torch.cat(processed_chunks)
+        return embedding_vectors, token_counts
+    else:
+        if not no_layer_norm:
+            def norm_fn(hidden_states, skip_level):
+                return text_encoder.text_model.final_layer_norm(hidden_states[-(skip_level+1)])[0]
+        else:
+            def norm_fn(hidden_states, skip_level):
+                return hidden_states[-(skip_level+1)][0] # nn.LayerNorm in_shape == out_shape -> indexing remains the same
+        # [text_encoder.text_model.final_layer_norm(text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states[-(clip_skip_layers+1)]) for text_chunk in text_chunks]
+        # encode every chunk, retrieve all hidden layers
+        text_chunks_hidden_states = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states for text_chunk in text_chunks]
+        # embeddings must be available for any token skip level requested, as well as for the default skip level (applied on start/end/padding tokens)
+        embedding_vectors = {
+            required_skip_level : torch.cat([norm_fn(chunk_hidden_states, required_skip_level) for chunk_hidden_states in text_chunks_hidden_states])
+            for required_skip_level in set(token_skips+[default_clip_skip])
+        }
+        # use the default skip level to extract per-chunk token counts
+        processed_chunks_of_default_skip = [norm_fn(chunk_hidden_states, default_clip_skip) for chunk_hidden_states in text_chunks_hidden_states]
+        token_counts = [len(c) for c in processed_chunks_of_default_skip]
+        # re-build resulting embedding vectors by interleaving the embedding vectors for different skip levels according to token_skips_after_start
+        new_embedding_vectors = []
+        # iterate over the vector count of the embedding (equal length for every decoded skip level)
+        for i in range(len(embedding_vectors[default_clip_skip])):
+            # retrieve the skip value of state i, use the default value if reading states of trailing end/padding tokens without a specified value.
+            skip_level = default_clip_skip if not i in range(len(token_skips)) else token_skips[i]
+            # select the embedding of the requested skip level, pick the vector at the index of the current iteration
+            new_embedding_vectors.append(embedding_vectors[skip_level][i])
+        embedding_vectors = torch.stack(new_embedding_vectors)
+        return embedding_vectors, token_counts
+
+@torch.no_grad()
+def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False, no_layer_norm=False, pooled_result=False):
+    io_data = {}
+
+    prompt = prompt.strip()
+    clip_skip_prompt_override = re.search('\{cls[0-9]+\}$', prompt) # match only '{cls<int>}' at the end of the prompt
+    if clip_skip_prompt_override is not None:
+        clip_skip_layers = min(int(clip_skip_prompt_override[0][4:-1]), MAX_CLIP_SKIP) # take match, drop leading '{cls' and trailing '}'. Clamp to possible value limit
+        # since this only matches on the end of the string, splitting multiple times on unfortunate prompts is not possible
+        prompt = re.split('\{cls[0-9]+\}$', prompt)[0]
+    io_data["clip_skip_layers"] = [clip_skip_layers]
+    # set rerun layers *after* checking for skip override. this allows producing of 'special tensors' with a trailing clip skip override
+    rerun_self_kwargs = {"tokenizer":tokenizer, "text_encoder":text_encoder, "clip_skip_layers":clip_skip_layers,"pad_to_length":pad_to_length,"prefer_default_length":prefer_default_length,"no_layer_norm":no_layer_norm,"pooled_result":pooled_result}
+
+    # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
+    sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
+    # first, grab all substitutions and replace them by a temporary UUID. This avoids substring collisions between substitution values and subsequent (shorter) substitution keys.
+    for (p,subst,identifier) in sorted_substitutions:
+        prompt = prompt.replace(p, f"<{identifier}>")
+    # then, replace UUID placeholders with substitution values. Substring collisions should not be an issue.
+    for (p,subst,identifier) in sorted_substitutions:
+        prompt = prompt.replace(f"<{identifier}>", subst)
+
+    # text embeddings
+    prompt, token_weights, token_skips = process_prompt_segmentation(tokenizer, prompt, clip_skip_layers)
+
+    text_input = tokenizer(
+        prompt,
+        padding="max_length" if pad_to_length is not None else False,
+        max_length=pad_to_length, # NOTE: None may be treated as "auto-select length limit of model" according to docs - however, no limit seems to be set with both L/14 (SD1.x) and OpenClip (SD2.x)
+        truncation=(pad_to_length is not None),
+        return_tensors="pt",
+        return_overflowing_tokens=(pad_to_length is not None),
+    )
+    # if the prompt is shorter than the standard token limit without a specified padding setting, but default-size embeddings are preferred, rerun with default pad length.
+    if len(text_input.input_ids[0]) <= tokenizer.model_max_length and pad_to_length is None and prefer_default_length:
+        return perform_text_encode(prompt=prompt,pad_to_length=tokenizer.model_max_length,prefer_default_length=False,**{k:v for k,v in rerun_self_kwargs.items() if not k in ["pad_to_length","prefer_default_length"]})
+    num_truncated_tokens = getattr(text_input,"num_truncated_tokens",[0])
+    io_data["text_readback"] = [t.strip() for t in tokenizer.batch_decode(text_input.input_ids, cleanup_tokenization_spaces=False)]
+    # SD2.0 openCLIP seems to pad with '!'. compact these down.
+    trailing_char_counts = []
+    for i, readback_string in enumerate(io_data["text_readback"]):
+        new_count = 0
+        for char in readback_string[::-1]: # reverse string -> move inwards from the back
+            if char == '!':
+                new_count += 1
+            else:
+                break
+        if new_count > 0: # [:-0] would be [:0], thus eliminating the entire string.
+            io_data["text_readback"][i] = readback_string[:-new_count]
+        trailing_char_counts.append(new_count)
+    # if a batch element had items truncated, the remaining token count is the negative of the amount of truncated tokens
+    # otherwise, count the amount of <|endoftext|> in the readback. Sidenote: this will report incorrectly if the prompt is below the token limit and happens to contain "<|endoftext|>" for some unthinkable reason.
+    io_data["remaining_token_count"] = [(- item) if item>0 else (io_data["text_readback"][idx].count("<|endoftext|>") - 1) if item!=0 and pad_to_length is not None else float('inf') for idx,item in enumerate(num_truncated_tokens)]
+    # If there is more space when looking at SD2.0 padding (trailing '!'), output it instead.
+    io_data["remaining_token_count"] = [max(remaining, trailing) for (remaining,trailing) in zip(io_data["remaining_token_count"], trailing_char_counts)]
+    io_data["text_readback"] = [s.replace("<|endoftext|>","").replace("<|startoftext|>","") for s in io_data["text_readback"]]
+    #io_data["attention"] = text_input.attention_mask.cpu().numpy().tolist() # unused, as the text encoders of both SD1.x and SD2.x lack a "use_attention_mask" attribute denoting manual attention maps.
+    try:
+        io_data["weights"] = [prompt_weight_summary_string(tokenizer, token_weights, token_skips, text_input)]
+    except:
+        io_data["weights"] = ""
+
+    chunk_count = (len(text_input.input_ids[0]) // tokenizer.model_max_length) + (1 if (len(text_input.input_ids[0])%tokenizer.model_max_length) > 0 else 0)
+    text_chunks = torch.chunk(text_input.input_ids[0], chunk_count)
+    # reassemble chunk items into batches of size 1
+    text_chunks = [torch.stack([chunk]) for chunk in text_chunks]
+
+    if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask:
+        attention_mask = text_input.attention_mask.to(IO_DEVICE)
+    else:
+        attention_mask = None
+
+    if pooled_result and SDXL_NO_TOKEN_SKIP_ON_POOLED:
+        # the pooled embeds on SDXL are always at a skip of 0 regardless of requested skip level. Unless overriden by the global, ignore per-token skip settings.
+        token_skips = [0 for _ in token_skips]
+
+    embedding_vectors, io_data["tokens"] = encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, clip_skip_layers, no_layer_norm)
+
+    embedding_vectors = apply_embedding_vector_weights(embedding_vectors, token_weights)
+    # repack batch dimension around the embedding vectors
+    text_embeddings = torch.stack([embedding_vectors])
+
+    special_embeddings = get_special_embeddings(prompt.strip(), rerun_self_kwargs)
+    if special_embeddings is not None:
+        text_embeddings = special_embeddings
+
+    if pooled_result:
+        # this may yield funky results with heavy prompt customisation! if the prompt was chunked, we pool the re-concatenated data. If special embeddings were used, we pool whatever mess we produced.
+        text_embeddings = pool_hidden_state(text_embeddings, text_input.input_ids[0], text_encoder)
+
+    return text_embeddings, io_data
+
+def get_special_embeddings(prompt, run_encode_kwargs):
+    if prompt == "<damaged_uncond>":
+        uncond, _ = perform_text_encode(prompt="", **run_encode_kwargs)
+        for i in range(uncond.shape[1]):
+            # create some tensor damage: mix half of the vector elements with a random element of the same vector.
+            idx = torch.randperm(uncond.shape[2])
+            for j in range(uncond.shape[2]):
+                if torch.rand(1) > 0.5:
+                    uncond[:,i,j] = (uncond[:,i,j]*2 + uncond[:,i,idx[j]]) /3
+        return uncond
+    elif prompt == "<alpha_dropout_uncond>":
+        uncond, _ = perform_text_encode(prompt="", **run_encode_kwargs)
+        return torch.nn.functional.alpha_dropout(uncond, p=0.5)
+    elif prompt == "<all_starts>":
+        uncond, _ = perform_text_encode(prompt="", **run_encode_kwargs)
+        for i in range(1,uncond.shape[1]):
+            uncond[:,i] = uncond[:,0]
+        return uncond
+    elif prompt == "<all_ends>":
+        uncond, _ = perform_text_encode(prompt="", **run_encode_kwargs)
+        for i in range(0,uncond.shape[1]-1):
+            uncond[:,i] = uncond[:,-1]
+        return uncond
+    elif prompt == "<all_start_end>":
+        uncond, _ = perform_text_encode(prompt="" **run_encode_kwargs)
+        for i in range(1,uncond.shape[1]-1):
+            uncond[:,i] = uncond[:,0] if i%2==0 else uncond[:,-1]
+        return uncond
+    # TODO: These max break, (or may pad to garbage) with the secondary SDXL encoder
+    elif prompt == "<safety_concepts>": # could be used as negative prompt?
+        uncond, _ = perform_text_encode(prompt="", **run_encode_kwargs)
+        embeddings = globals().get("_safety_embeddings", None)
+        if embeddings is None or not "concepts" in embeddings:
+            return uncond
+        else:
+            # place between startoftext and endoftext vectors of uncond, rebuild batch dim
+            return torch.stack([torch.stack([uncond[0][0]] + [x for x in embeddings["concepts"].clone().to(uncond.device, uncond.dtype)] + [uncond[0][1]])])
+    elif prompt == "<safety_special>": # could be used as negative prompt?
+        uncond, _ = perform_text_encode(prompt="", **run_encode_kwargs)
+        embeddings = globals().get("_safety_embeddings", None)
+        if embeddings is None or not "special" in embeddings:
+            return uncond
+        else:
+            return torch.stack([torch.stack([uncond[0][0]] + [x for x in embeddings["special"].clone().to(uncond.device, uncond.dtype)] + [uncond[0][1]])])
+    return None
+
+def apply_pad_tensor_to_embedding(in_tensor:torch.Tensor, pad_source:torch.Tensor, encapsulated=True):
+    if any([isinstance(x, SDXLPromptEmbedding) for x in [in_tensor, pad_source]]):
+        assert all([isinstance(x, SDXLPromptEmbedding) for x in [in_tensor, pad_source]]), f"[SDXL] apply_pad_tensor_to_embedding: in_tensor: {type(in_tensor)} and pad_source: {type(pad_source)} do not match!"
+        # pooled embeds shall not expand!
+        return SDXLPromptEmbedding(apply_pad_tensor_to_embedding(in_tensor.prompt_embeds, pad_source.prompt_embeds, encapsulated), in_tensor.pooled_prompt_embeds)
+
+    if encapsulated:
+        # unpack and re-pack batch dimension of prompt
+        return torch.stack([apply_pad_tensor_to_embedding(in_tensor[0],pad_source[0],False)])
+
+    if in_tensor.shape[0] == pad_source.shape[0]:
+        return in_tensor
+    elif in_tensor.shape[0] > pad_source.shape[0] or any([x>y for x,y in zip(in_tensor.shape, pad_source.shape)]):
+        tqdm.write(f"WARNING: Embed chunk too large when applying padding! Padding {in_tensor.shape} with {pad_source.shape} requested!")
+        return in_tensor[:][:len(pad_source)]
+    else:
+        # fill as many vectors with data from the input tensor as possible. If the index is out of range for the input tensor, fill with the pad tensor. Rebuild batch dim.
+        # when padding the token length of encoders with a different feature dim, the pad vectors will be expanded to the larger of the two. When padding smaller feature vectors, limit the feature size of the pad source.
+        return torch.stack([in_tensor[i] if i in range(len(in_tensor)) else pad_vector[:in_tensor.shape[1]] for i, pad_vector in enumerate(pad_source)])
+
+def equalize_embedding_lengths(a:torch.Tensor, b:torch.Tensor):
+    if not any([isinstance(x, SDXLPromptEmbedding) for x in [a, b]]):
+        # if the embeddings are not of equal length, zero-pad the shorter of the two embeddings to make the shapes equal.
+        if a is None and b is None:
+            raise ValueError("Unable to equalize embedding lengths as both embeddings are None")
+        a = a if a is not None else torch.zeros_like(b)
+        b = b if b is not None else torch.zeros_like(a)
+        # the feature dim will be mismatched if we pad prompts of different encoders to the same length when stacking. The pad source must be expanded to the maximum possible coverage required.
+        max_shape = tuple([max(x,y) for x,y in zip(a.shape, b.shape)])
+        a = a if not (b.shape[1] > a.shape[1]) else apply_pad_tensor_to_embedding(a,torch.zeros(max_shape, dtype=b.dtype, device=b.device))
+        b = b if not (a.shape[1] > b.shape[1]) else apply_pad_tensor_to_embedding(b,torch.zeros(max_shape, dtype=a.dtype, device=a.device))
+        return a,b
+    else:
+        assert all([isinstance(x, SDXLPromptEmbedding) or x is None for x in [a, b]]), f"[SDXL] equalize_embedding_lengths: {type(a)}, {type(b)} do not match!"
+        assert not all([x is None for x in [a,b]]), f"Unable to equalize embedding lengths as both embeddings are None"
+        # the pooled embeds must not be expanded.
+        a = a if a is not None else SDXLPromptEmbedding(torch.zeros_like(b.prompt_embeds), torch.zeros_like(b.pooled_prompt_embeds))
+        b = b if b is not None else SDXLPromptEmbedding(torch.zeros_like(a.prompt_embeds), torch.zeros_like(a.pooled_prompt_embeds))
+        max_shape = tuple([max(x,y) for x,y in zip(a.shape, b.shape)])
+        a = a if not (b.prompt_embeds.shape[1] > a.prompt_embeds.shape[1]) else SDXLPromptEmbedding(apply_pad_tensor_to_embedding(a.prompt_embeds,torch.zeros(max_shape, dtype=b.prompt_embeds.dtype, device=b.prompt_embeds.device)), a.pooled_prompt_embeds)
+        b = b if not (a.prompt_embeds.shape[1] > b.prompt_embeds.shape[1]) else SDXLPromptEmbedding(apply_pad_tensor_to_embedding(b.prompt_embeds,torch.zeros(max_shape, dtype=a.prompt_embeds.dtype, device=a.prompt_embeds.device)), b.pooled_prompt_embeds)
+        return a,b
+
+
+def add_encoding_sum(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_to_prev:bool):
+    if not any([isinstance(x, SDXLPromptEmbedding) for x in [current_sum, next_encoding]]):
+        next_encoding *= next_multiplier
+        # if the length of the current sum does not match the length of the next encoding, pad the shorter tensor.
+        current_sum, next_encoding = equalize_embedding_lengths(current_sum, next_encoding)
+        return (next_encoding if current_sum is None else current_sum + next_encoding), current_multiplier+next_multiplier
+    else:
+        assert all([isinstance(x, SDXLPromptEmbedding) or x is None for x in [current_sum, next_encoding]]), f"[SDXL] add_encoding_sum: {type(current_sum)}, {type(next_encoding)} do not match!"
+        run_args = {"current_multiplier":current_multiplier,"next_multiplier":next_multiplier,"concat_direct_to_prev":concat_direct_to_prev}
+        prompt_embeds, multiplier_result = add_encoding_sum(None if current_sum is None else current_sum.prompt_embeds, next_encoding.prompt_embeds, **run_args)
+        pooled_prompt_embeds, multiplier_result_2 = add_encoding_sum(None if current_sum is None else current_sum.pooled_prompt_embeds, next_encoding.pooled_prompt_embeds, **run_args)
+        assert multiplier_result == multiplier_result_2, f"[SDXL] add_encoding_sum: Multiplier results mismatch despite same parameters! ({multiplier_result} != {multiplier_result_2})"
+        return SDXLPromptEmbedding(prompt_embeds, pooled_prompt_embeds), multiplier_result
+
+def add_encoding_cat(current_sum:torch.Tensor, next_encoding:torch.Tensor, current_multiplier:float, next_multiplier:float, concat_direct_to_prev:bool):
+    if not any([isinstance(x, SDXLPromptEmbedding) for x in [current_sum, next_encoding]]):
+        next_encoding *= next_multiplier
+        # Remove startoftext and endoftext vectors if this is a direct concat.
+        if concat_direct_to_prev and current_sum is not None:
+            next_encoding = next_encoding[:,1:] # remove startoftext from new embedding
+            current_sum = current_sum[:,:-1] # remove trailing endoftext from prev embedding
+        #next_encoding = next_encoding if not concat_direct_to_next else next_encoding[:,:-1]
+        # concat in dim 1 - skip batch dim. Return multiplier as 1 - no division by a scale sum should be performed in concat mode.
+        return (next_encoding if current_sum is None else torch.cat([current_sum,next_encoding],dim=1)), 1
+    else:
+        assert all([isinstance(x, SDXLPromptEmbedding) or x is None for x in [current_sum, next_encoding]]), f"[SDXL] add_encoding_cat: {type(current_sum)}, {type(next_encoding)} do not match!"
+        run_args = {"current_multiplier":current_multiplier,"next_multiplier":next_multiplier, "concat_direct_to_prev":concat_direct_to_prev}
+        prompt_embeds, _ = add_encoding_cat(None if current_sum is None else current_sum.prompt_embeds, next_encoding.prompt_embeds, **run_args)
+        # the shape of the pooled embed can not be extended, and thus, can not be concatenated either. We have to fall back to adding via sum.
+        pooled_prompt_embeds, multiplier_result = add_encoding_sum(None if current_sum is None else current_sum.pooled_prompt_embeds, next_encoding.pooled_prompt_embeds, **run_args)
+        return SDXLPromptEmbedding(prompt_embeds, pooled_prompt_embeds), multiplier_result
+
+def get_gs_mult(gs_schedule:str, progress_factor:float, step_idx:int=None):
+    gs_mult = 1
+    if gs_schedule is None or gs_schedule == "":
+        pass
+    elif gs_schedule == "sin": # half-sine (between 0 and pi; 0 -> 1 -> 0)
+        gs_mult = np.sin(np.pi * progress_factor)
+    elif gs_schedule == "isin": # inverted half-sine (1 -> 0 -> 1)
+        gs_mult = 1.0 - np.sin(np.pi * progress_factor)
+    elif gs_schedule == "fsin": # full sine (0 -> 1 -> 0 -> -1 -> 0) for experimentation
+        gs_mult = np.sin(2*np.pi * progress_factor)
+    elif gs_schedule == "anneal5": # rectified 2.5x full sine (5 bumps)
+        gs_mult = np.abs(np.sin(2*np.pi * progress_factor*2.5))
+    elif gs_schedule == "ianneal5": # 1- (rectified 2.5x full sine (5 bumps))
+        gs_mult = 1 - np.abs(np.sin(2*np.pi * progress_factor*2.5))
+    elif gs_schedule == "cos": # quarter-cos (between 0 and pi/2; 1 -> 0)
+        gs_mult = np.cos(np.pi/2 * progress_factor)
+    elif gs_schedule == "icos": # inverted quarter-cos (0 -> 1)
+        gs_mult = 1.0 - np.cos(np.pi/2 * progress_factor)
+    elif gs_schedule == "rand": # random multiplier in [0,1)
+        gs_mult = np.random.rand()
+    elif gs_schedule == "frand": # random multiplier, with negative values
+        gs_mult = np.random.rand()*2-1
+    elif gs_schedule == "buzz": # switch back and forth between 0 and 1. Downwards compatibility: If no step is provided, randomly switch between 0 and 1.
+        gs_mult = float(np.random.randint(0,2) if not isinstance(step_idx, int) else step_idx%2)
+    elif gs_schedule == "th2": # threshold at 0.25
+        gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.25)*SIGMOID_GS_MULT_COMPRESSION))
+    elif gs_schedule == "th5": # threshold at 0.5
+        gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.5)*SIGMOID_GS_MULT_COMPRESSION))
+    elif gs_schedule == "th7": # threshold at 0.75
+        gs_mult = 1- 1/(1 + np.exp((-progress_factor+0.75)*SIGMOID_GS_MULT_COMPRESSION))
+    elif gs_schedule == "ith2": # threshold at 0.25
+        gs_mult = 1/(1 + np.exp((-progress_factor+0.25)*SIGMOID_GS_MULT_COMPRESSION))
+    elif gs_schedule == "ith5": # threshold at 0.5
+        gs_mult = 1/(1 + np.exp((-progress_factor+0.5)*SIGMOID_GS_MULT_COMPRESSION))
+    elif gs_schedule == "ith7": # threshold at 0.75
+        gs_mult = 1/(1 + np.exp((-progress_factor+0.75)*SIGMOID_GS_MULT_COMPRESSION))
+    else:
+        # Could add a warning here.
+        pass
+    return gs_mult
+
+def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_name=False):
+    if high_beta:
+        # scheduler default
+        beta_start, beta_end = 0.0001, 0.02
+    else:
+        # stablediffusion default
+        beta_start, beta_end = 0.00085, 0.012
+    scheduler_params = {"beta_start":beta_start, "beta_end":beta_end, "beta_schedule":"scaled_linear", "num_train_timesteps":1000, "skip_prk_steps":True, "use_karras_sigmas":use_karras_sigmas}
+    if V_PREDICTION_MODEL:
+        if not sched_name in V_PREDICTION_SCHEDULERS:
+            tqdm.write(f"WARNING: A v_prediction model is running, but the selected scheduler {sched_name} is not listed as v_prediction enabled. THIS WILL YIELD BAD RESULTS! Switch to one of {V_PREDICTION_SCHEDULERS}")
+        else:
+            scheduler_params["prediction_type"] = "v_prediction"
+    # pndm: skip_prk_steps=True "for some models like stable diffusion the prk steps can/should be skipped to produce better results." # pndm: skip_prk_steps=True
+    assert sched_name in SCHEDULER_OPTIONS, f"Requested unknown scheduler: {sched_name}"
+    scheduler_class = SCHEDULER_OPTIONS.get(sched_name)
+    available_scheduler_params = {k:v for k,v in scheduler_params.items() if k in scheduler_class._get_init_keys(scheduler_class)}
+    scheduler = scheduler_class(**available_scheduler_params)
+    if not return_name:
+        return scheduler
+    else:
+        return scheduler, f"{sched_name}{f' (Karras sigmas)' if available_scheduler_params.get('use_karras_sigmas',False) else ''}{f' (high beta)' if high_beta else ''}"
+
+# see diffusers PR: https://github.com/huggingface/diffusers/commit/12a232efa99d7a8c33f54ae515c5a3d6fc5c8f34
+def rescale_prediction(noise_pred:torch.Tensor, noise_pred_text:torch.Tensor, rescale_factor:float=0.66) -> torch.Tensor:
+    def get_std(x:torch.Tensor) -> torch.Tensor:
+        return x.std(dim=list(range(1, x.ndim)), keepdim=True)
+    prediction_scale_factor = (get_std(noise_pred_text) / get_std(noise_pred))
+    return noise_pred * (1-rescale_factor) + noise_pred*prediction_scale_factor*rescale_factor
 
 def controlnet_aux_extractor(detector_model, *args, **kwargs):
     try:
@@ -2886,6 +3212,77 @@ class SafetyProcessor():
         setattr(processed_image, "blur_mask", blur_mask)
         return processed_image
 
+class MultiEncoder():
+    def __init__(self, *args):
+        self._encoders:tuple = (*args,)
+    def get_encoders(self) -> tuple:
+        return self._encoders
+class MultiTextEncoder(MultiEncoder):
+    pass
+class MultiTokenizer(MultiEncoder):
+    pass
+class SDXLTextEncoder(MultiTextEncoder):
+    def __init__(self, text_encoder_1, text_encoder_2):
+        self._encoders:tuple = (text_encoder_1, text_encoder_2)
+    def to(self, *args, **kwargs):
+        self.encoders[0].to(*args, **kwargs)
+        self.encoders[1].to(*args, **kwargs)
+        return self
+class SDXLTokenizer(MultiTokenizer):
+    def __init__(self, text_encoder_1, text_encoder_2):
+        self._encoders:tuple = (text_encoder_1, text_encoder_2)
+
+@dataclass()
+class SDXLPromptEmbedding():
+    prompt_embeds:torch.Tensor
+    pooled_prompt_embeds:torch.Tensor
+    def to(self, *args, **kwargs):
+        self.prompt_embeds = self.prompt_embeds.to(*args, **kwargs)
+        self.pooled_prompt_embeds = self.pooled_prompt_embeds.to(*args, **kwargs)
+        return self
+    def __len__(self):
+        len_1 = 0 if self.prompt_embeds is None else len(self.prompt_embeds)
+        len_2 = 0 if self.pooled_prompt_embeds is None else len(self.pooled_prompt_embeds)
+        if len_1 == len_2:
+            return len_1
+        else:
+            raise AttributeError(f"Length of {type(self)} is ambiguos for unequal lengths of contained elements: {len_1} != {len_2}")
+    def __add__(self, other):
+        if not isinstance(other, SDXLPromptEmbedding):
+            return SDXLPromptEmbedding(self.prompt_embeds+other, self.pooled_prompt_embeds+other)
+        else:
+            return SDXLPromptEmbedding(self.prompt_embeds+other.pooled_prompt_embeds, self.pooled_prompt_embeds+other.pooled_prompt_embeds)
+    def __sub__(self, other):
+        if not isinstance(other, SDXLPromptEmbedding):
+            return SDXLPromptEmbedding(self.prompt_embeds-other, self.pooled_prompt_embeds-other)
+        else:
+            return SDXLPromptEmbedding(self.prompt_embeds-other.pooled_prompt_embeds, self.pooled_prompt_embeds-other.pooled_prompt_embeds)
+    def __mul__(self, other):
+        if not isinstance(other, SDXLPromptEmbedding):
+            return SDXLPromptEmbedding(self.prompt_embeds*other, self.pooled_prompt_embeds*other)
+        else:
+            raise NotImplementedError(f"Multiplication of two {type(self)} is not available.")
+    def __truediv__(self, other):
+        if not isinstance(other, SDXLPromptEmbedding):
+            return SDXLPromptEmbedding(self.prompt_embeds*other, self.pooled_prompt_embeds*other)
+        else:
+            raise NotImplementedError(f"Division of two {type(self)} is not available.")
+
+# check if we've ran out of dedicated GPU memory, and are starting to use shared memory
+def cuda_memory_empty() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    else:
+        # the metric below is unreliable for estimating if pytorch is actually using memory inside the shared pool.
+        try:
+            return torch.cuda.mem_get_info()[0] <= 0
+        except Exception as e:
+            if not globals().get("_PRINTED_CUDA_MEM_EMPTY_WARNING", False):
+                print(f"Unable to probe remaining CUDA memory despite CUDA being available. {e}")
+                global _PRINTED_CUDA_MEM_EMPTY_WARNING
+                _PRINTED_CUDA_MEM_EMPTY_WARNING = True
+            return False
+
 def choose_int(upper_bound:int):
     if upper_bound <= 1:
         return 0
@@ -2903,7 +3300,6 @@ def unpack_encapsulated_lists(x):
         x = x[0]
     return x
 
-# TODO: Remake this function at some point
 # create a string from a list, while removing duplicate string items in a row. Returns "[]" for empty lists. n>1 recursively re-applies the function.
 def collapse_representation(item_list,keep_lowest_level=False,n=1):
     return str(do_collapse_representation(item_list,keep_lowest_level,n))
@@ -2923,6 +3319,70 @@ def do_collapse_representation(item_list, keep_lowest_level=False, n=1):
     # unpack a second time, turning a potential list of only a single item into the item itself
     collapsed = unpack_encapsulated_lists(collapsed)
     return collapsed
+
+# try to find a minimal chunk size n where every n items the contents of the list are repeated. If a such a size is found, only display the first chunk (others are repetitions).
+# apply to recursive items before evaluating chunks.
+def collapse_repetitions(item_list, keep_lowest_level=False, n=1):
+    return str(do_collapse_repetitions(item_list,keep_lowest_level,n))
+def do_collapse_repetitions(item_list, keep_lowest_level=False, n=1):
+    if n <= 0:
+        return item_list
+    item_list = unpack_encapsulated_lists(item_list)
+    collapsed = []
+    if isinstance(item_list, list) and ((not keep_lowest_level) or (all([isinstance(x,list) for x in item_list]))):
+        for item in item_list:
+            # drop sequential repetitions: only append the next item if it differs from the last item to be added
+            item = do_collapse_repetitions(item,keep_lowest_level,n-1)
+            collapsed.append(item)
+        found_size = None
+        for chunk_size in range(1, len(collapsed)):
+            # upper half of the range is redundant.
+            if len(collapsed)%chunk_size != 0:
+                continue
+            chunked = [[None for _ in range(chunk_size)] for _ in range(len(collapsed)//chunk_size)]
+            for i,item in enumerate(collapsed):
+                chunk_idx = i//chunk_size
+                intra_chunk_idx = i%chunk_size
+                chunked[chunk_idx][intra_chunk_idx] = item
+            if all([x == chunked[0] for x in chunked]):
+                found_size = chunk_size
+                break
+        if found_size is not None:
+            collapsed = collapsed[:found_size]
+    else:
+        return item_list
+    # unpack a second time, turning a potential list of only a single item into the item itself
+    collapsed = unpack_encapsulated_lists(collapsed)
+    return collapsed
+
+
+def input_to_seed(input:str) -> int:
+    if input in (None, "None"):
+        return None
+    if isinstance(input, int):
+        return input & 0xffffffffffffffff
+    try:
+        seed = int(input, 10 if not input.startswith("0x") else 16)
+        return seed & 0xffffffffffffffff if seed >= 0 else None # map negative values to None -> random seed
+    except Exception:
+        pass
+    return hash_str_to_seed(input)
+
+# DJBX33A hash function. Bitwise and to limit values to 63 bits (some headroom over the 64 bit seed limit).
+def hash_str_to_seed(input:str) -> int:
+    if not isinstance(input, str):
+        if hasattr(input, "__repr__"):
+            input = repr(input)
+        elif hasattr(input, "__str__"):
+            input = str(input)
+        else:
+            raise ValueError(f"Unable to derive str from {type(input)}")
+    input_bytes = bytes(input, 'utf-8', errors="ignore")
+    hash = 5381
+    for in_byte in input_bytes:
+        hash += (hash<<5) + in_byte
+        hash &= 0x7fffffffffffffff
+    return hash
 
 if __name__ == "__main__":
     try:
