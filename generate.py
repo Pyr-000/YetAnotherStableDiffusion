@@ -1547,7 +1547,8 @@ def generate_segmented(
                 was_slicing, was_tiling = vae.use_slicing, vae.use_tiling
                 vae.enable_slicing() # should take care of potential OOMs caused by large batches
                 vae.enable_tiling() # should take care of potential OOMs caused by large resolution
-            results = vae.decode(latents.to(vae.device)) if decode else vae.encode(latents.to(vae.device))
+            cast_device = vae.device if not vae.device == torch.device("meta") else OFFLOAD_EXEC_DEVICE
+            results = vae.decode(latents.to(cast_device)) if decode else vae.encode(latents.to(cast_device))
             if minimize_memory:
                 if not was_slicing:
                     vae.disable_slicing()
