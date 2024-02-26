@@ -371,7 +371,7 @@ pip install py-cord
   - `/square <text prompt> <Image attachment>` generates a default image with 512x512 resolution (overridden to 768x768 for SD2.x). Accepts an optional image attachment for performing image-to-image.
   - `/portrait <text prompt> <Image attachment>` (shortcut for 512x768 resolution images)
   - `/landscape <text prompt> <Image attachment>"` (shortcut for 768x512 resolution images)
-  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <mix_concatenate> <ddim_eta> <eta_seed> <controlnet> <controlnet_sd2> <controlnet_input> <controlnet_strength> <controlnet_schedule> <second_pass_resize> <second_pass_steps> <second_pass_ctrl> <use_karras_sigmas> <lora_schedule>`
+  - `/advanced <text prompt> <width> <height> <seed> <guidance_scale> <steps> <img2img_strength> <Image attachment> <amount> <scheduler> <gs_schedule> <static_length> <controlnet> <controlnet_sd2> <controlnet_input> <controlnet_strength> <controlnet_schedule> <second_pass_resize> <second_pass_steps> <second_pass_ctrl> <use_karras_sigmas> <lora_schedule>`
     - `Width` and `height` are specified either as pixels (for values >64), or as a multiplier of 64, offset from 512x512. A `width` of `3` and `height` of `-2` will result in an image which is `512+64*3 = 704` pixels wide and `512-64*2 = 384` pixels high
     - If seeds are set to a value below `0`, the seed is randomized. The randomly picked seed will be returned in the image response.
     - `scheduler`, `gs_schedule`, `controlnet` and `controlnet_schedule` display available options.

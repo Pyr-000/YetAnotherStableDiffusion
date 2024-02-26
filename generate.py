@@ -257,15 +257,27 @@ def main():
 
     # if interpolation is requested, run interpolation instead!
     if args.interpolation_targets is not None:
-        # swap places between UNET and VAE to speed up large batch decode.
-        unet = unet.to(IO_DEVICE)
-        vae = vae.to(DIFFUSION_DEVICE)
+        # swap places between UNET and VAE to speed up large batch decode. (When offloaded, skip this.)
+        try:
+            unet = unet.to(IO_DEVICE)
+        except NotImplementedError:
+            pass
+        try:
+            vae = vae.to(DIFFUSION_DEVICE)
+        except NotImplementedError:
+            pass
         create_interpolation(args.interpolation_targets[0], args.interpolation_targets[1], args.steps, vae, args.interpolation_extend)
         exit()
 
     if args.re_encode is not None:
-        unet = unet.to(IO_DEVICE)
-        vae = vae.to(DIFFUSION_DEVICE)
+        try:
+            unet = unet.to(IO_DEVICE)
+        except NotImplementedError:
+            pass
+        try:
+            vae = vae.to(DIFFUSION_DEVICE)
+        except NotImplementedError:
+            pass
         enc_path = Path(args.re_encode)
         if not enc_path.exists():
             print(f"Selected path does not exist: {enc_path}")
@@ -2145,15 +2157,17 @@ def create_interpolation(a, b, steps, vae, overextend=0.5):
     with torch.no_grad():
         interpolated = interpolate_latents(al,bl,steps,overextend)
     print("decoding...")
+    vae_compute_device = vae.device if not vae.device == torch.device("meta") else OFFLOAD_EXEC_DEVICE
     with torch.no_grad():
         # processing images in target device one-by-one saves VRAM.
-        image_sequence = tensor_to_pil(torch.stack([vae.decode(torch.stack([item.to(DIFFUSION_DEVICE)]) * (1 / vae.config.get("scaling_factor",0.18215)))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
+        image_sequence = tensor_to_pil(torch.stack([vae.decode(torch.stack([item.to(vae.dtype).to(vae_compute_device)]) * (1 / vae.config.get("scaling_factor",0.18215)))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
 
 def re_encode(filepath, vae):
     latent = load_latents_from_image(filepath)
+    vae_compute_device = vae.device if not vae.device == torch.device("meta") else OFFLOAD_EXEC_DEVICE
     with torch.no_grad():
-        image = tensor_to_pil(vae.decode(latent.to(DIFFUSION_DEVICE) * (1 / vae.config.get("scaling_factor",0.18215)))[0])
+        image = tensor_to_pil(vae.decode(latent.to(vae.dtype).to(vae_compute_device) * (1 / vae.config.get("scaling_factor",0.18215)))[0])
     return image
 
 class Placeholder():
