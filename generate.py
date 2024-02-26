@@ -497,15 +497,16 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                         tqdm.write(f"Could not load LoRa file: {e}")
                         return False
 
-                    encoder_is_sd1 = text_encoder.get_input_embeddings().weight.data.shape[1] == 768
+                    encoder_is_sd1 = not isinstance(text_encoder, MultiEncoder) and text_encoder.get_input_embeddings().weight.data.shape[1] == 768
 
                     # first, try loading as a diffusers attn_procs (most specific format)
                     try:
-                        sd1_len_keys = [k for k in load_data.keys() if len(getattr(load_data[k], "shape", [])) >=2 and 768 == load_data[k].shape[1]]
+                        _load_data = {k:v for k,v in load_data.items()} # on SDXL, having attn_procs try to load a convertable lora will cause the dict to end up emptied. pass a shallow copy instead.
+                        sd1_len_keys = [k for k in _load_data.keys() if len(getattr(_load_data[k], "shape", [])) >=2 and 768 == _load_data[k].shape[1]]
                         is_sd1 = all([("transformer_blocks.0.attn2.processor.to_" in x and "_lora.down.weight" in x) for x in sd1_len_keys]) and len(sd1_len_keys) >= 32
                         if is_sd1 != encoder_is_sd1: # crude version check, maybe replace with something better
                             raise ValueError(f"{lora_item} contains weights for {'SD2.x' if encoder_is_sd1 else 'SD1.x'}, but encoder is {'SD1.x' if encoder_is_sd1 else 'SD2.x'}")
-                        unet.load_attn_procs(load_data)
+                        unet.load_attn_procs(_load_data)
                         tqdm.write(f"{lora_item} loaded as a diffusers attn_proc!")
                         return True
                     except Exception as e:
@@ -717,6 +718,26 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
     parsed_keys = 0
     null_keys = 0
 
+    if isinstance(text_encoder, SDXLTextEncoder):
+        # we have an SDXL model.
+        try:
+            keymap_path = Path("SDXL_unet_key_map.tsv")
+            sdxl_unet_key_map_str = keymap_path.read_text().replace("\r","\n").replace("\n\n","\n") # \r\n -> \n, \r -> \n. if line endings were transformed, return them to form.
+            # we already have a string hash function here, should be good enough to serve as a simple validation checksum.
+            expected_sdxl_map_seed_hash = 331545443627423047
+            sdxl_map_seed_hash = hash_str_to_seed(sdxl_unet_key_map_str)
+            if sdxl_map_seed_hash != expected_sdxl_map_seed_hash:
+                print(f"NOTE: SDXL unet key map {keymap_path} hash: {sdxl_map_seed_hash} does not match the expected value.")
+            sdxl_unet_map_lines = [(x.split("\t")) for x in sdxl_unet_key_map_str.split("\n") if not x.strip() == ""]
+            sdxl_unet_keymap = {x[0].replace(".","_").strip():x[1].strip() for x in sdxl_unet_map_lines}
+            if len(sdxl_unet_keymap.keys()) < len(sdxl_unet_map_lines):
+                print(f"NOTE: {len(sdxl_unet_map_lines)} unet keymap entries yielded a map of {len(sdxl_unet_keymap.keys())} keys.")
+        except Exception as e:
+            print(f"Unable to retrieve SDXL unet key map: {e}")
+            sdxl_unet_keymap = {}
+    else:
+        sdxl_unet_keymap = {}
+
     for key in state_dict:
         curr_layer, curr_model = None, None
         alpha_scale = 1.0
@@ -742,19 +763,20 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
                 curr_model = text_encoder
             else:
                 # for SDXL, the two encoders will have lora keys with prefixes lora_te1_(...) and lora_te1_(...) as opposed to lora_te_(...) for single-text_encoder models
-                for i in range(len(text_encoder.get_encoders())):
+                for i, te in enumerate(text_encoder.get_encoders()):
                     # for every text encoder we have, we check if it matches the key index. Crude, we could read the index from the key with a regex directly.
                     current_prefix = f"{LORA_PREFIX_TEXT_ENCODER}{i+1}"
                     if current_prefix in key:
                         layer_infos = key.split(".")[0].split(current_prefix + "_")[-1].split("_")
-                        curr_layer = text_encoder
-                        curr_model = text_encoder
+                        curr_layer = te
+                        curr_model = te
                         # break # we could break here, and save ourselves from checking one other string with SDXL.
                         # In the unlikely scenario of us having 10+ text encoders, breaking can yield incorrect results unless we checked the range in reverse.
             if text_encoder is None:
                 unparsed_keys += 1
                 continue
         elif LORA_PREFIX_UNET in key:
+            #_key = key.replace("_middle_block_", "_mid_block_").replace("_input_blocks_", "_down_blocks_").replace("_output_blocks_", "_up_blocks_")
             layer_infos = key.split(".")[0].split(LORA_PREFIX_UNET + "_")[-1].split("_")
             curr_layer = unet
             curr_model = unet
@@ -774,19 +796,34 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
             continue
 
         # find the target layer
-        temp_name = layer_infos.pop(0)
-        while len(layer_infos) > -1:
-            try:
-                curr_layer = curr_layer.__getattr__(temp_name)
-                if len(layer_infos) > 0:
-                    temp_name = layer_infos.pop(0)
-                elif len(layer_infos) == 0:
-                    break
-            except Exception:
-                if len(temp_name) > 0:
-                    temp_name += "_" + layer_infos.pop(0)
-                else:
-                    temp_name = layer_infos.pop(0)
+        try:
+            temp_name = layer_infos.pop(0)
+            while len(layer_infos) > -1:
+                try:
+                    curr_layer = curr_layer.__getattr__(temp_name)
+                    if len(layer_infos) > 0:
+                        temp_name = layer_infos.pop(0)
+                    elif len(layer_infos) == 0:
+                        break
+                except Exception:
+                    if len(temp_name) > 0:
+                        temp_name += "_" + layer_infos.pop(0)
+                    else:
+                        temp_name = layer_infos.pop(0)
+        except Exception as e:
+            if key.startswith(LORA_PREFIX_UNET+"_") and len(sdxl_unet_keymap) > 0:
+                key_in_unet = key[len(LORA_PREFIX_UNET+"_"):].split(".")[0]
+                try:
+                    assert key_in_unet in sdxl_unet_keymap, "Unable to resolve key via SDXL unet keymap"
+                    curr_layer = retrieve_unet_layer_via_map(curr_model, sdxl_unet_keymap[key_in_unet])
+                except Exception as e:
+                    print(f"Parsing {key_in_unet} via unet keymap failed: {e}")
+                    unparsed_keys += 1
+                    continue
+            else:
+                print(f"LoRA converter keyparse {e} | {key} | {type(curr_layer) if not hasattr(curr_layer, 'weight') else curr_layer.weight.data.shape} | {state_dict[pair_keys[0]].shape} | {state_dict[pair_keys[1]].shape}")
+                unparsed_keys += 1
+                continue
 
         if not ("lora_up" in key or "lora_down" in key):
             if state_dict[key].shape == (1,) and state_dict[key][0] in (0.0,):
@@ -921,10 +958,27 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
             visited.append(item)
         #except Exception as e:
             # print(f"LoRA converter {e} | {key} | {curr_layer.weight.data.shape} | {state_dict[pair_keys[0]].shape} | {state_dict[pair_keys[1]].shape}")
+    data_keys = len([k for k in state_dict.keys() if not k.endswith(".alpha")])
     if unparsed_keys > 0:
         print(f"LoRA loaded {parsed_keys} keys, with {unparsed_keys-null_keys} keys (and {null_keys} null keys) not being applied.")
-        if parsed_keys == 0:
-            raise ValueError("Could not parse and load any keys from the LoRA state dict.")
+    if data_keys > parsed_keys+unparsed_keys:
+        print(f"LoRA contains {data_keys} data keys. {data_keys - (parsed_keys+unparsed_keys)} were marked as neither parsed nor unparsed (failed to be evaluated).")
+    if parsed_keys == 0:
+        raise ValueError("Could not parse and load any keys from the LoRA state dict.")
+
+def retrieve_unet_layer_via_map(item, key_target):
+    key_split = key_target.split("$",1)
+    next_module = key_split[0]
+    next_item = None
+    if hasattr(item, "_modules"):
+        next_item = item._modules.get(next_module, None)
+    assert next_item is not None
+    # if there is no remainder to the path we are following, we have found our module
+    if len(key_split) == 1:
+        return next_item
+    # otherwise, continue travelling through modules
+    return retrieve_unet_layer_via_map(next_item, key_split[1])
+
 
 def try_int(s:str, default:int=None):
     try:
