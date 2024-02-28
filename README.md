@@ -12,6 +12,15 @@ Extra scripts for model acquisition or conversion (converting from monolithic si
 - [lora_diffusion](https://github.com/cloneofsimo/lora.git) can be installed to load their compatible LoRA embeddings.
 - The `scikit-image` package is required when performing color correction during image cycling
 
+> [!NOTE]
+> [Playground v2.5](https://huggingface.co/playgroundai/playground-v2.5-1024px-aesthetic) is supported, but requires schedulers which are only available in diffusers >= 0.27. Currently, only the schedulers `mdpms` (default) and `euler` come with an EDM-variant compatible with this model.
+>
+> At the time of writing, version 0.27 has not yet been fully released, and must be installed as a development build from the git repository:
+>
+> ```pip install git+https://github.com/huggingface/diffusers.git```
+>
+> Previous versions of diffusers are still supported by this repository to preserve compatibility with the release branch, but will fail to produce any usable output with this model.
+
 # Python Installation
 Python version 3.9+ is required. Testing is currently carried out under Python 3.9.
 ### Install `pytorch`

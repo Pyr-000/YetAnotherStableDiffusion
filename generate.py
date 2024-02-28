@@ -13,6 +13,10 @@ from transformers import models as transformers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, CLIPSegProcessor, CLIPSegForImageSegmentation
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler
+try:
+    from diffusers import EDMDPMSolverMultistepScheduler, EDMEulerScheduler
+except ImportError:
+    EDMDPMSolverMultistepScheduler, EDMEulerScheduler = None, None
 from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel
 from diffusers.utils import is_accelerate_available
 import argparse
@@ -33,6 +37,7 @@ import re
 from tokens import get_huggingface_token
 import uuid
 from dataclasses import dataclass
+from json import loads as load_json_str
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -110,6 +115,7 @@ SCHEDULER_OPTIONS = {
     "deis": DEISMultistepScheduler,
     "unipc": UniPCMultistepScheduler
 }
+EDM_SCHEDULERS = {"mdpms": EDMDPMSolverMultistepScheduler, "euler": EDMEulerScheduler}
 IMPLEMENTED_SCHEDULERS = list(SCHEDULER_OPTIONS.keys())
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
 IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand", "buzz", "th2", "th5", "th7", "ith2", "ith5", "ith7"]
@@ -573,7 +579,16 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
 
         if cpu_offloading:
             cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
-
+        try:
+            local_model_path = Path(models_local_dir)
+            assert local_model_path.exists() and local_model_path.is_dir()
+            sched_config_path = local_model_path.joinpath("scheduler/scheduler_config.json")
+            assert sched_config_path.exists() and sched_config_path.is_file()
+            sched_target = str(load_json_str(sched_config_path.read_text()).get("_class_name","none"))
+            has_edm_scheduler = sched_target.lower().startswith("edm")
+            setattr(unet, "edm_scheduler", has_edm_scheduler)
+        except Exception:
+            pass
         if unet_only:
             patch_wrapper(unet,None,None)
             recurse_set_xformers(unet)
@@ -584,6 +599,19 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         vae = AutoencoderKL.from_pretrained(vae_model_id, subfolder="vae", use_auth_token=use_auth_token_vae, torch_dtype=torch.float16)
     else:
         vae = AutoencoderKL.from_pretrained(vae_model_id, subfolder="vae", use_auth_token=use_auth_token_vae)
+        try: # playground v2.5 can somehow have the VAE end up with 0.13025 as config.scale_factor? scheduler_config.json specifies 0.5. This may just be an issue with 0.27 being a dev build?
+            vae_path = Path(vae_model_id)
+            assert vae_path.exists() and vae_path.is_dir()
+            vae_cfg_file = vae_path.joinpath("config.json")
+            assert vae_cfg_file.exists() and vae_cfg_file.is_file()
+            vae_cfg_data = load_json_str(vae_cfg_file.read_text())
+            scaling_factor = vae_cfg_data.get("scaling_factor", None)
+            assert scaling_factor is not None and isinstance(scaling_factor, float)
+            setattr(vae, "scaling_factor_override", scaling_factor)
+            if vae.config.get("scaling_factor", 0.0) != scaling_factor:
+                vae.config["scaling_factor"] = scaling_factor
+        except Exception as e:
+            pass
     if vae_only:
         recurse_set_xformers(vae)
         return vae
@@ -610,8 +638,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     try:
         model_index_path = Path(models_local_dir).joinpath("model_index.json")
         assert model_index_path.exists()
-        from json import load as load_json
-        model_index_data = load_json(model_index_path)
+        model_index_data = load_json_str(model_index_path.read_text())
         force_zeros_for_empty_prompt = model_index_data.get("force_zeros_for_empty_prompt", None)
         index_pipe_class = model_index_data.get("_class_name", None)
         if index_pipe_class is not None:
@@ -1338,7 +1365,8 @@ def generate_segmented(
         for key in io_data:
             SUPPLEMENTARY["io"][key] = io_data[key]
 
-        scheduler, io_sched_name = get_scheduler(sched_name=sched_name, high_beta=high_beta, use_karras_sigmas=use_karras_sigmas, return_name=True)
+        unet_uses_edm_scheduler = getattr(unet, "edm_scheduler", False)
+        scheduler, io_sched_name = get_scheduler(sched_name=sched_name, high_beta=high_beta, use_karras_sigmas=use_karras_sigmas, return_name=True, edm_scheduler=unet_uses_edm_scheduler)
         SUPPLEMENTARY["io"]["sched_name"] = io_sched_name
         # set timesteps. Also offset, as pipeline does this
         scheduler_offset = 1 if "offset" in set(inspect.signature(scheduler.set_timesteps).parameters.keys()) else 0
@@ -1366,7 +1394,7 @@ def generate_segmented(
                 init_image_tensor = 2.0 * torch.from_numpy(image_processing) - 1.0
                 init_latents = vae_with_failover(vae, init_image_tensor.to(IO_DEVICE), decode=False).latent_dist.sample()
                 # apply inverse scaling
-                init_latents = vae.config.get("scaling_factor",0.18215) * init_latents
+                init_latents = scale_latents_vae(vae, init_latents, reverse=True)
                 init_latents_list.append(init_latents)
             # if the init latent batch is smaller than the actual batch size, expand it.
             if len(init_latents_list) < batch_size:
@@ -1483,7 +1511,7 @@ def generate_segmented(
         if animate:
             SUPPLEMENTARY["latent"]["latent_sequence"].append(latents.clone().cpu())
         # scale and decode the image latents with vae
-        latents = 1 / vae.config.get("scaling_factor",0.18215) * latents
+        latents = scale_latents_vae(vae, latents)
         latents = latents.to(IO_DEVICE)
         latents = latents.to(vae.dtype)
         image = vae_with_failover(vae, latents, decode=True)
@@ -1515,7 +1543,7 @@ def generate_segmented(
                 pass # when offloaded to cpu, model switching will fail (copy out of meta tensor)
             with torch.no_grad():
                 # process items one-by-one to avoid overfilling VRAM with a batch containing all items at once.
-                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_with_failover(vae,(item*(1 / vae.config.get("scaling_factor",0.18215))).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
+                SUPPLEMENTARY["io"]["image_sequence"] = [to_pil(vae_with_failover(vae,scale_latents_vae(vae,item).to(DIFFUSION_DEVICE,vae.dtype)), False)[0] for item in tqdm(SUPPLEMENTARY["latent"]["latent_sequence"], position=0, desc="Decoding animation latents")]
                 # if any safety processing was applied, copy it to the animated output
                 img_blur_masks = [getattr(image_item, "blur_mask", None) for image_item in pil_images]
                 img_removals = [getattr(image_item, "safety_remove", False) for image_item in pil_images]
@@ -2214,14 +2242,14 @@ def create_interpolation(a, b, steps, vae, overextend=0.5):
     vae_compute_device = vae.device if not vae.device == torch.device("meta") else OFFLOAD_EXEC_DEVICE
     with torch.no_grad():
         # processing images in target device one-by-one saves VRAM.
-        image_sequence = tensor_to_pil(torch.stack([vae.decode(torch.stack([item.to(vae.dtype).to(vae_compute_device)]) * (1 / vae.config.get("scaling_factor",0.18215)))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
+        image_sequence = tensor_to_pil(torch.stack([vae.decode(scale_latents_vae(vae,torch.stack([item.to(vae.dtype).to(vae_compute_device)])))[0][0] for item in tqdm(interpolated, position=0, desc="Decoding latents")]))
     save_animations([image_sequence])
 
 def re_encode(filepath, vae):
     latent = load_latents_from_image(filepath)
     vae_compute_device = vae.device if not vae.device == torch.device("meta") else OFFLOAD_EXEC_DEVICE
     with torch.no_grad():
-        image = tensor_to_pil(vae.decode(latent.to(vae.dtype).to(vae_compute_device) * (1 / vae.config.get("scaling_factor",0.18215)))[0])
+        image = tensor_to_pil(vae.decode(scale_latents_vae(vae, latent.to(vae.dtype).to(vae_compute_device)))[0])
     return image
 
 class Placeholder():
@@ -3092,7 +3120,7 @@ def get_gs_mult(gs_schedule:str, progress_factor:float, step_idx:int=None):
         pass
     return gs_mult
 
-def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_name=False):
+def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_name=False, edm_scheduler=False):
     if high_beta:
         # scheduler default
         beta_start, beta_end = 0.0001, 0.02
@@ -3105,15 +3133,27 @@ def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_n
             tqdm.write(f"WARNING: A v_prediction model is running, but the selected scheduler {sched_name} is not listed as v_prediction enabled. THIS WILL YIELD BAD RESULTS! Switch to one of {V_PREDICTION_SCHEDULERS}")
         else:
             scheduler_params["prediction_type"] = "v_prediction"
-    # pndm: skip_prk_steps=True "for some models like stable diffusion the prk steps can/should be skipped to produce better results." # pndm: skip_prk_steps=True
-    assert sched_name in SCHEDULER_OPTIONS, f"Requested unknown scheduler: {sched_name}"
-    scheduler_class = SCHEDULER_OPTIONS.get(sched_name)
+    if not edm_scheduler:
+        # pndm: skip_prk_steps=True "for some models like stable diffusion the prk steps can/should be skipped to produce better results." # pndm: skip_prk_steps=True
+        assert sched_name in SCHEDULER_OPTIONS, f"Requested unknown scheduler: {sched_name}"
+        scheduler_class = SCHEDULER_OPTIONS.get(sched_name)
+    else:
+        if (not sched_name in EDM_SCHEDULERS) or EDM_SCHEDULERS.get(sched_name) is None:
+            print(f"WARNING: A model requesting an edm scheduler is running, but the selected scheduler {sched_name} does not have a loadable EDM variant available. THIS WILL YIELD BAD RESULTS! Switch to one of {list(EDM_SCHEDULERS.keys())}")
+            if EDM_SCHEDULERS.get(sched_name, 0) is None:
+                print(f"EDM scheduler failed to import. This indicates that diffusers may need to be updated.")
+            return get_scheduler(sched_name=sched_name, high_beta=high_beta, use_karras_sigmas=use_karras_sigmas, return_name=return_name, edm_scheduler=False)
+        scheduler_class = EDM_SCHEDULERS.get(sched_name)
+        scheduler_params = { # placeholder default config for edm mdpms
+            "algorithm_type": "dpmsolver++", "dynamic_thresholding_ratio": 0.995, "euler_at_final": False, "final_sigmas_type": "zero", "lower_order_final": True, "num_train_timesteps": 1000, "prediction_type": "epsilon",
+            "rho": 7.0, "sample_max_value": 1.0, "sigma_data": 0.5, "sigma_max": 80.0, "sigma_min": 0.002, "solver_order": 2, "solver_type": "midpoint", "thresholding": False
+        }
     available_scheduler_params = {k:v for k,v in scheduler_params.items() if k in scheduler_class._get_init_keys(scheduler_class)}
     scheduler = scheduler_class(**available_scheduler_params)
     if not return_name:
         return scheduler
     else:
-        return scheduler, f"{sched_name}{f' (Karras sigmas)' if available_scheduler_params.get('use_karras_sigmas',False) else ''}{f' (high beta)' if high_beta else ''}"
+        return scheduler, f"{'' if not edm_scheduler else 'EDM_'}{sched_name}{f' (Karras sigmas)' if available_scheduler_params.get('use_karras_sigmas',False) else ''}{f' (high beta)' if high_beta else ''}"
 
 # see diffusers PR: https://github.com/huggingface/diffusers/commit/12a232efa99d7a8c33f54ae515c5a3d6fc5c8f34
 def rescale_prediction(noise_pred:torch.Tensor, noise_pred_text:torch.Tensor, rescale_factor:float=0.66) -> torch.Tensor:
@@ -3339,6 +3379,26 @@ class SDXLPromptEmbedding():
             return SDXLPromptEmbedding(self.prompt_embeds*other, self.pooled_prompt_embeds*other)
         else:
             raise NotImplementedError(f"Division of two {type(self)} is not available.")
+
+# reverse -> scale after encode instead of before decode
+def scale_latents_vae(vae, latents, reverse=False) -> float:
+    override_factor = getattr(vae, "scaling_factor_override", None)
+    scaling_factor = vae.config.get("scaling_factor", 0.18215)
+    if override_factor is not None and isinstance(override_factor, float):
+        scaling_factor = override_factor
+    if vae.config.get("latents_mean", None) is not None and vae.config.get("latents_std", None) is not None:
+        latents_mean = torch.tensor(vae.config.latents_mean).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+        latents_std = torch.tensor(vae.config.latents_std).view(1, 4, 1, 1).to(latents.device, latents.dtype)
+        if not reverse:
+            latents = latents * latents_std * (1/scaling_factor) + latents_mean
+        else:
+            latents = (latents-latents_mean) * (1/latents_std) * scaling_factor
+    else:
+        if not reverse:
+            latents *= 1/scaling_factor
+        else:
+            latents *= scaling_factor
+    return latents
 
 # check if we've ran out of dedicated GPU memory, and are starting to use shared memory
 def cuda_memory_empty() -> bool:
