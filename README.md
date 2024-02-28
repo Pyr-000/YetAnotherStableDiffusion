@@ -15,6 +15,8 @@ Extra scripts for model acquisition or conversion (converting from monolithic si
 > [!NOTE]
 > [Playground v2.5](https://huggingface.co/playgroundai/playground-v2.5-1024px-aesthetic) is supported, but requires schedulers which are only available in diffusers >= 0.27. Currently, only the schedulers `mdpms` (default) and `euler` come with an EDM-variant compatible with this model.
 >
+> To have the correct scheduler variant(s) selected, the model directory must contain the `scheduler` directory with the respective `scheduler_config.json`. When downloading via `download_model_files.py`, this will be acquired automatically (see below).
+>
 > At the time of writing, version 0.27 has not yet been fully released, and must be installed as a development build from the git repository:
 >
 > ```pip install git+https://github.com/huggingface/diffusers.git```
@@ -70,6 +72,8 @@ python download_model_files.py playgroundai/playground-v2-1024px-aesthetic --nam
 python download_model_files.py stabilityai/stable-diffusion-xl-base-1.0
 # download StableDiffusion v2.1 to 'models/stable-diffusion-2-1' (name inferred)
 python download_model_files.py stabilityai/stable-diffusion-2-1
+# download Playground v2.5 (see note above regarding requirements)
+python download_model_files.py playgroundai/playground-v2.5-1024px-aesthetic --name playgroundv2-5_aesthetic
 ```
 - The script should function on 'standard' StableDiffusion models (SD1.x and SD2.x) as well as SDXL models or other models with an analogous architecture (e.g. [Playground v2](https://huggingface.co/playgroundai/playground-v2-1024px-aesthetic))
 - Downloads are performed by `huggingface_hub`. If supported, this will download larger model files to a user cache directory and place symbolic links in the model directory to avoid storing multiple copies. This behavior can be disabled via the `--no-link` flag.
