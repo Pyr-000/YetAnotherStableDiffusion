@@ -12,11 +12,7 @@ import torch
 from transformers import models as transformers_models
 from diffusers import models as diffusers_models
 from transformers import CLIPTextModel, CLIPTokenizer, AutoFeatureExtractor, CLIPSegProcessor, CLIPSegForImageSegmentation
-from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler
-try:
-    from diffusers import EDMDPMSolverMultistepScheduler, EDMEulerScheduler
-except ImportError:
-    EDMDPMSolverMultistepScheduler, EDMEulerScheduler = None, None
+from diffusers import DDIMScheduler, LMSDiscreteScheduler, PNDMScheduler, IPNDMScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler, HeunDiscreteScheduler, DEISMultistepScheduler, UniPCMultistepScheduler, EDMDPMSolverMultistepScheduler, EDMEulerScheduler, SASolverScheduler, TCDScheduler
 from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel
 from diffusers.utils import is_accelerate_available
 import argparse
@@ -87,6 +83,8 @@ ANIMATE_BOOST_VARIANCE = False
 SIGMOID_GS_MULT_COMPRESSION = 50
 # SDXL pooled extra_embeds always use a CLIP skip of 0. Setting this to False would apply per-token skip values of the standard prompt_embeds before pooling
 SDXL_NO_TOKEN_SKIP_ON_POOLED = True
+# Always run VAE in tiled and sliced mode. May help performance when overflowing into shared GPU memory instead of producing an OOM error
+ALWAYS_MINIMIZE_VAE_MEMORY = False
 
 # Switch to using xformers attention if installed. Can be set to False to manually disable xformers attention regardless of availability.
 XFORMERS_ENABLED = True
@@ -113,15 +111,26 @@ SCHEDULER_OPTIONS = {
     "mdpms": DPMSolverMultistepScheduler, "sdpms": DPMSolverSinglestepScheduler,
     "kdpm2": KDPM2DiscreteScheduler, "kdpm2_ancestral": KDPM2AncestralDiscreteScheduler,
     "deis": DEISMultistepScheduler,
-    "unipc": UniPCMultistepScheduler
+    "unipc": UniPCMultistepScheduler,
+    "tcd": TCDScheduler,
 }
 EDM_SCHEDULERS = {"mdpms": EDMDPMSolverMultistepScheduler, "euler": EDMEulerScheduler}
 IMPLEMENTED_SCHEDULERS = list(SCHEDULER_OPTIONS.keys())
 V_PREDICTION_SCHEDULERS = IMPLEMENTED_SCHEDULERS # ["euler", "ddim", "mdpms", "euler_ancestral", "pndm", "lms", "sdpms"]
 IMPLEMENTED_GS_SCHEDULES = [None, "sin", "cos", "isin", "icos", "fsin", "anneal5", "ianneal5", "rand", "frand", "buzz", "th2", "th5", "th7", "ith2", "ith5", "ith7"]
 # preprocessors for controlnet input images
-AUX_PREPROCESSORS = ["detect_pose", "detect_mlsd", "detect_hed"] # , "detect_midas"] # seems to not be in pypi yet, hold until next release
-IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + AUX_PREPROCESSORS
+control_processor_detector_map = {}
+try:
+    import controlnet_aux as ca
+    control_processor_detector_map = {
+        "pose":ca.OpenposeDetector, "mlsd":ca.MLSDdetector, "hed":ca.HEDdetector,
+        "midas":ca.MidasDetector, "zoe":ca.ZoeDetector, "leres":ca.LeresDetector, "normalbae":ca.NormalBaeDetector,
+        "pidi":ca.PidiNetDetector, "lineart":ca.LineartDetector, "lineart_anime":ca.LineartAnimeDetector,
+        "shuffle":ca.ContentShuffleDetector,
+    }
+except ImportError:
+    print(f"unable to import detector(s) for from 'controlnet_aux'. Please install the latest version via 'pip install controlnet_aux --upgrade'")
+IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + list(control_processor_detector_map.keys())
 # short names for specifying controlnet models. will translate requests for name into requests for CONTROLNET_SHORTNAMES[name]
 # Controlnet V1 SD1.x
 CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]}
@@ -131,7 +140,16 @@ CONTROLNET_SHORTNAMES |= {name:f"thibaud/controlnet-{name}-diffusers" for name i
 CONTROLNET_SHORTNAMES |= {name:f"lllyasviel/control_v11p_sd15_{name}" for name in ["canny", "mlsd", "normalbae", "seg", "inpaint", "lineart", "openpose", "scribble", "softedge"]}
 # Controlnet V1.1 SD1.x 'experimental' or with alternate prefix
 CONTROLNET_SHORTNAMES |= {"tile":"lllyasviel/control_v11f1e_sd15_tile", "depth":"lllyasviel/control_v11f1p_sd15_depth", "instruct":"lllyasviel/control_v11e_sd15_ip2p", "shuffle":"lllyasviel/control_v11e_sd15_shuffle", "lineart_anime":"lllyasviel/control_v11p_sd15s2_lineart_anime"}
-
+# SDXL controlnets (diffusers)
+CONTROLNET_SHORTNAMES |= {
+    "xl_canny":"diffusers/controlnet-canny-sdxl-1.0", "xl_depth":"diffusers/controlnet-depth-sdxl-1.0", "xl_zoedepth":"diffusers/controlnet-zoe-depth-sdxl-1.0",
+    "xl_canny_mid":"diffusers/controlnet-canny-sdxl-1.0-mid", "xl_depth_mid":"diffusers/controlnet-depth-sdxl-1.0-mid",
+    "xl_canny_small":"diffusers/controlnet-canny-sdxl-1.0-small", "xl_depth_small":"diffusers/controlnet-depth-sdxl-1.0-small",
+    }
+# SDXL controlnets - NOTE: the listed sdxl inpaint model requires areas to be inpainted to be blank white instead of blank black
+CONTROLNET_SHORTNAMES |= {"xl_openpose":"thibaud/controlnet-openpose-sdxl-1.0", "xl_softedge":"SargeZT/controlnet-sd-xl-1.0-softedge-dexined", "xl_inpaint":"destitech/controlnet-inpaint-dreamer-sdxl|v2"}
+# Other Controlnets
+CONTROLNET_SHORTNAMES |= {"qrcode": "monster-labs/control_v1p_sd15_qrcode_monster|v2", "xl_qrcode": "monster-labs/control_v1p_sdxl_qrcode_monster"}
 
 # sd2.0 default negative prompt
 DEFAULT_NEGATIVE_PROMPT = "" # e.g. dreambot SD2.0 default : "ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft"
@@ -748,7 +766,7 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
     if isinstance(text_encoder, SDXLTextEncoder):
         # we have an SDXL model.
         try:
-            keymap_path = Path("SDXL_unet_key_map.tsv")
+            keymap_path = Path(__file__).parent.joinpath("SDXL_unet_key_map.tsv")
             sdxl_unet_key_map_str = keymap_path.read_text().replace("\r","\n").replace("\n\n","\n") # \r\n -> \n, \r -> \n. if line endings were transformed, return them to form.
             # we already have a string hash function here, should be good enough to serve as a simple validation checksum.
             expected_sdxl_map_seed_hash = 331545443627423047
@@ -848,7 +866,7 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
                     unparsed_keys += 1
                     continue
             else:
-                print(f"LoRA converter keyparse {e} | {key} | {type(curr_layer) if not hasattr(curr_layer, 'weight') else curr_layer.weight.data.shape} | {state_dict[pair_keys[0]].shape} | {state_dict[pair_keys[1]].shape}")
+                print(f"LoRA converter keyparse {e} | {key} | {type(curr_layer) if not hasattr(curr_layer, 'weight') else curr_layer.weight.data.shape} | {state_dict[key].shape}")
                 unparsed_keys += 1
                 continue
 
@@ -951,8 +969,11 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
             lora_conv_down = torch.nn.Conv2d(state_dict[pair_keys[1]].shape[0], curr_layer.out_channels, 1, 1, bias=False)
             lora_conv_up.weight.data = state_dict[pair_keys[0]]
             lora_conv_down.weight.data = state_dict[pair_keys[1]]
-            setattr(curr_layer,"lora_conv_up", lora_conv_up)
-            setattr(curr_layer,"lora_conv_down", lora_conv_down)
+            curr_layer.add_module("lora_conv_up", lora_conv_up)
+            curr_layer.add_module("lora_conv_down", lora_conv_down)
+            keyname = "".join([x if x.isalnum() else '-' for x in key])
+            curr_model.add_module(f"_{keyname}_lora_conv_up", lora_conv_up)
+            curr_model.add_module(f"_{keyname}_lora_conv_down", lora_conv_down)
             # apply default conv forward, then add lora conv forward results, at merge strength
             def hook(module, input, output):
                 # input will be a tuple of "only the positional arguments given to the module", which should only be the input tensor itself.
@@ -960,16 +981,27 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
                 lora_dtype_down = module.lora_conv_up.weight.data.dtype
                 lora_dtype_up = module.lora_conv_down.weight.data.dtype
                 model_lora_strength = getattr(curr_model, "lora_strength", 1.0)
+                if not input.device == module.lora_conv_up.weight.device == module.lora_conv_down.weight.device:
+                    try:
+                        module.lora_conv_up.to(input.device)
+                        module.lora_conv_down.to(input.device)
+                    except Exception as _:
+                        pass
                 return (output.to(lora_dtype_up) + dropout(module.lora_conv_up(module.lora_conv_down(input.to(lora_dtype_down)).to(lora_dtype_up)) * _merge_strength*model_lora_strength).to(input.dtype))
             curr_layer.register_forward_hook(hook)
             parsed_keys += len(pair_keys)
 
-        elif len(state_dict[pair_keys[0]].shape) == 4:
-            weight_up = state_dict[pair_keys[0]].squeeze(3).squeeze(2).to(torch.float32)
-            weight_down = state_dict[pair_keys[1]].squeeze(3).squeeze(2).to(torch.float32)
-            curr_layer.weight.data += _merge_strength * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
-            parsed_keys += len(pair_keys)
-        else:
+        merge_success = False
+        if len(state_dict[pair_keys[0]].shape) == 4:
+            try:
+                weight_up = state_dict[pair_keys[0]].squeeze(3).squeeze(2).to(torch.float32)
+                weight_down = state_dict[pair_keys[1]].squeeze(3).squeeze(2).to(torch.float32)
+                curr_layer.weight.data += _merge_strength * torch.mm(weight_up, weight_down).unsqueeze(2).unsqueeze(3)
+                parsed_keys += len(pair_keys)
+                merge_success = True
+            except Exception as _:
+                pass
+        if not merge_success:
             try:
                 weight_up = state_dict[pair_keys[0]].to(torch.float32)
                 weight_down = state_dict[pair_keys[1]].to(torch.float32)
@@ -977,7 +1009,11 @@ def load_lora_convert(state_dict, unet=None, text_encoder=None, merge_strength:f
                 parsed_keys += len(pair_keys)
             except Exception as _:
                 print_exc(chain=False)
-                print(f"LoRA Key {key} -> {type(state_dict[key]) if not isinstance(state_dict[key], torch.Tensor) else state_dict[key].shape} failed to apply. Unable to parse.")
+                try:
+                    curr_layer_info = curr_layer.weight.data.shape
+                except:
+                    curr_layer_info = type(curr_layer)
+                print(f"LoRA Key {key} -> {type(state_dict[key]) if not isinstance(state_dict[key], torch.Tensor) else state_dict[key].shape} failed to apply to {curr_layer_info}. Unable to parse.")
                 unparsed_keys += 1
 
         # update visited list
@@ -1024,7 +1060,11 @@ def load_controlnet(source:str,device="cpu",cpu_offloading=False):
     source = CONTROLNET_SHORTNAMES.get(source, source)
     controlnet = None
     try:
-        controlnet = ControlNetModel.from_pretrained(source, torch_dtype=torch.float16).to(device)
+        if "|" in source:
+            source, subfolder = source.split("|",1)
+        else:
+            subfolder =""
+        controlnet = ControlNetModel.from_pretrained(source, torch_dtype=torch.float16, subfolder=subfolder).to(device)
         if cpu_offloading:
             if not is_accelerate_available():
                 print("accelerate library is not installed! Unable to utilise CPU offloading!")
@@ -1043,9 +1083,11 @@ def load_controlnet(source:str,device="cpu",cpu_offloading=False):
 def controlnet_preprocess(image:Image.Image, width:int, height:int, preprocessor:str=None):
     image = image.resize((width,height), resample=Image.Resampling.LANCZOS)
     image = image.convert("RGB")
-    if preprocessor == "canny":
+    if preprocessor is None:
+        pass
+    elif preprocessor == "canny":
         image = Image.fromarray(cv2.Canny(np.array(image),100,200)).convert("RGB")
-    elif preprocessor in AUX_PREPROCESSORS:
+    elif preprocessor in control_processor_detector_map or (isinstance(preprocessor, str) and preprocessor.startswith("detect_") and preprocessor.replace("detect_","",1) in control_processor_detector_map):
         processed = controlnet_aux_extractor(preprocessor,image)
         image = image if processed is None else processed
         # controlnet_aux only accepts one value for target resolution. For now, just resize in post.
@@ -1441,7 +1483,7 @@ def generate_segmented(
             setattr(unet, "lora_strength", lora_schedule_mult)
             # predict the noise residual
             with torch.no_grad():
-                down_block_residuals, mid_block_residual, incompatible = apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i)
+                down_block_residuals, mid_block_residual, incompatible = apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i, unet_extra_kwargs.get("added_cond_kwargs",None))
                 if incompatible:
                     tqdm.write(f"Mismatch between controlnet and diffusion UNET! Versions may be mixed between SD1.x / SD2.x / SDXL! Disabling controlnet for this diffusion.")
                     controlnet_input = None
@@ -1594,16 +1636,19 @@ def generate_segmented(
             down_block_additional_residuals=down_block_residuals, mid_block_additional_residual=mid_block_residual,
         )["sample"]
 
-    def apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i=None):
+    def apply_controlnet(controlnet:diffusers_models.controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i=None, extra_cond_kwargs=None):
         incompatible = False
         if controlnet_input is not None:
-            if isinstance(text_embeddings, SDXLPromptEmbedding):
-                print(f"Controlnets for SDXL not yet implemented.")
-                return None, None, True
+            #if isinstance(text_embeddings, SDXLPromptEmbedding):
+            #    print(f"Controlnets for SDXL not yet implemented.")
+            #    return None, None, True
             controlnet_mult = get_gs_mult(controlnet_strength_scheduler, progress_factor, i)
-            cast_controlnet_args = {"device":controlnet.device, "dtype":torch.float16}
+            cast_controlnet_args = {"device":controlnet.device if not controlnet.device==torch.device("meta") else OFFLOAD_EXEC_DEVICE, "dtype":torch.float16}
+            extra_controlnet_args = {}
+            if extra_cond_kwargs is not None:
+                extra_controlnet_args |= {"added_cond_kwargs":extra_cond_kwargs}
             try:
-                down_block_residuals, mid_block_residual = controlnet(latent_model_input.to(**cast_controlnet_args),t.to(**cast_controlnet_args),encoder_hidden_states=text_embeddings.to(**cast_controlnet_args),controlnet_cond=controlnet_input.to(**cast_controlnet_args),return_dict=False)
+                down_block_residuals, mid_block_residual = controlnet(latent_model_input.to(**cast_controlnet_args),t.to(**cast_controlnet_args),encoder_hidden_states=text_embeddings.to(**cast_controlnet_args),controlnet_cond=controlnet_input.to(**cast_controlnet_args),return_dict=False, **extra_controlnet_args)
                 down_block_residuals = [down_block_res_sample * controlnet_strength*controlnet_mult for down_block_res_sample in down_block_residuals]
                 mid_block_residual *= controlnet_strength*controlnet_mult
                 down_block_residuals = [d.to(**cast_unet_args) for d in down_block_residuals]
@@ -1629,7 +1674,7 @@ def generate_segmented(
     # can optionally move the unet out of the way to make space
     @torch.no_grad()
     def vae_with_failover(vae, latents:torch.Tensor, decode=True):
-        results = vae_with_failover_worker(vae, latents, decode=decode)
+        results = vae_with_failover_worker(vae, latents, ALWAYS_MINIMIZE_VAE_MEMORY, decode=decode)
         if results is None: # fully exit the previous context instead of recursively calling to ensure that memory is properly released.
             return vae_with_failover_worker(vae, latents, True, decode=decode)
         return results
@@ -3148,6 +3193,7 @@ def get_scheduler(sched_name, high_beta=False, use_karras_sigmas=False, return_n
             "algorithm_type": "dpmsolver++", "dynamic_thresholding_ratio": 0.995, "euler_at_final": False, "final_sigmas_type": "zero", "lower_order_final": True, "num_train_timesteps": 1000, "prediction_type": "epsilon",
             "rho": 7.0, "sample_max_value": 1.0, "sigma_data": 0.5, "sigma_max": 80.0, "sigma_min": 0.002, "solver_order": 2, "solver_type": "midpoint", "thresholding": False
         }
+    assert scheduler_class is not None, f"Scheduler choice resolved to a missing scheduler class. diffusers may need to be updated to use this scheduler."
     available_scheduler_params = {k:v for k,v in scheduler_params.items() if k in scheduler_class._get_init_keys(scheduler_class)}
     scheduler = scheduler_class(**available_scheduler_params)
     if not return_name:
@@ -3163,17 +3209,17 @@ def rescale_prediction(noise_pred:torch.Tensor, noise_pred_text:torch.Tensor, re
     return noise_pred * (1-rescale_factor) + noise_pred*prediction_scale_factor*rescale_factor
 
 def controlnet_aux_extractor(detector_model, *args, **kwargs):
-    try:
-        import controlnet_aux as ca
-    except ImportError:
-        print(f"unable to import detector for {detector_model} from 'controlnet_aux'. Please install it via 'pip install controlnet_aux'")
-        return None
-    detector_map = {"detect_pose":ca.OpenposeDetector, "detect_mlsd":ca.MLSDdetector, "detect_hed":ca.HEDdetector} # , "detect_midas":ca.MidasDetector} # seems to not be in pypi yet, hold until next release
-    if not detector_model in detector_map:
+    if detector_model.startswith("detect_"):
+        # legacy arg compat
+        detector_model = detector_model.replace("detect_","",1)
+    if not detector_model in control_processor_detector_map:
         print(f"Unknown aux detector model: {detector_model}!")
         return None
-    Detector = detector_map[detector_model]
-    model = Detector.from_pretrained("lllyasviel/ControlNet")
+    Detector = control_processor_detector_map[detector_model]
+    if detector_model in ["shuffle"]:
+        model = Detector()
+    else:
+        model = Detector.from_pretrained("lllyasviel/Annotators")
     results = model(*args, **kwargs)
     del model
     gc.collect()
@@ -3307,6 +3353,10 @@ class SafetyProcessor():
                 new_mask = (data>threshold) * 1.0 # mask any pixels within the threshold
                 mask = new_mask if mask is None else mask+new_mask
             # cumulatively stack masks. Expand mask borders with a blur, resulting values will be thresholded to 1. (Expansion equivalent to the kernel radius, on unscaled segmentation outputs)
+            if len(np.shape(mask)) == 3:
+                # depending on library versions, an extra batch dim of size 1 may be present.
+                assert np.shape(mask)[0] == 1, f"3D blur mask with invalid dimensions was produced! First dim should be of size 1, got: {np.shape(mask)}"
+                mask = mask[0]
             mask = cv2.GaussianBlur(mask, (33,33), 5)
             mask = (mask>0.01) * 1.0
             #mask = cv2.resize(mask, dsize=blursize, interpolation=cv2.INTER_LANCZOS4) # decreasing mask resolution could be used to create more coarse, less detailed mask

@@ -3,8 +3,8 @@ Stable Diffusion script(s) based on huggingface diffusers. Comes with extra conf
 Extra scripts for model acquisition or conversion (converting from monolithic single-file models to diffusers files) are also included.
 ## Recent changes to requirements
 - Updating `diffusers`, `transformers`, `huggingface-hub`, `accelerate`, `pytorch` and `xformers` (if installed) is generally recommended.
+- controlnet_aux can be installed for additional controlnet preprocessors. Users of previous versions should upgrade to >= 0.0.8
 - Upgrading Python from older versions to Python 3.9 is now required.
-- controlnet_aux can be installed for additional controlnet preprocessors (pose extraction, M-LSD segmentation, HED edge detection)
 - xformers can optionally be installed to potentially boost efficiency (testing required for Pytorch2.0+, effectiveness may vary depending on hardware)
   - If xformers is not installed, this implementation should have Diffusers default to [PyTorch2.0 efficient attention](https://huggingface.co/docs/diffusers/optimization/torch2.0). This should perform similarly to xformers efficient attention. Especially without using PyTorch2.0 model compilation (not platform-agnostic), using xformers may still provide slightly better performance.
   - The latest version of xformers often **requires** a specific (usually the latest) version of pytorch. Installing xformers with an older (or newer) version of pytorch may update pytorch to a cpu-only version. [Manually updating pytorch](#install-pytorch-skip-when-using-a-pre-existing-stablediffusion-compatible-environment) to the correct version with CUDA support may be required.
@@ -12,16 +12,6 @@ Extra scripts for model acquisition or conversion (converting from monolithic si
 - [lora_diffusion](https://github.com/cloneofsimo/lora.git) can be installed to load their compatible LoRA embeddings.
 - The `scikit-image` package is required when performing color correction during image cycling
 
-> [!NOTE]
-> [Playground v2.5](https://huggingface.co/playgroundai/playground-v2.5-1024px-aesthetic) is supported, but requires schedulers which are only available in diffusers >= 0.27. Currently, only the schedulers `mdpms` (default) and `euler` come with an EDM-variant compatible with this model.
->
-> To have the correct scheduler variant(s) selected, the model directory must contain the `scheduler` directory with the respective `scheduler_config.json`. When downloading via `download_model_files.py`, this will be acquired automatically (see below).
->
-> At the time of writing, version 0.27 has not yet been fully released, and must be installed as a development build from the git repository:
->
-> ```pip install git+https://github.com/huggingface/diffusers.git```
->
-> Previous versions of diffusers are still supported by this repository to preserve compatibility with the release branch, but will fail to produce any usable output with this model.
 
 # Python Installation
 Python version 3.9+ is required. Testing is currently carried out under Python 3.9.
@@ -239,7 +229,8 @@ python generate.py "a painting of a painter painting a painting"
   - `"kdpm2_ancestral"`: KDPM2AncestralDiscrete
   - `"heun"`: HeunDiscrete
   - `"deis"`: DEISMultistepScheduler (lower-order-final for \<15 timesteps)
-  - `"unipc`" : UniPCMultistepScheduler
+  - `"unipc"` : UniPCMultistepScheduler
+  - `"tcd"`: TCDScheduler (primarily intended for use with a matching TCD LoRA model)
 - `-ks`/`--karras-sigmas` specifies if the scheduler should use a 'Karras' sigma (σ) schedule if available, leading to progressively smaller sigma steps. `True` by default. This may sometimes be referred to as the "Karras" variant of a scheduler. See: [(arXiv:2206.00364)](https://arxiv.org/abs/2206.00364) (see `Eq. (5)`). The ρ (rho) parameter used should be 7 across all schedulers.
 - `-e`/`--ddim-eta` sets the eta (η) parameter when the ddim scheduler is selected. Otherwise, this parameter is ignored. Higher values of eta will increase the amount of additional noise applied during sampling. A value of `0` corresponds to no additional sampling noise.
 - `-es`/`--ddim-eta-seed` sets the seed of the sampling noise when a ddim scheduler with eta > 0 is used.
@@ -328,15 +319,32 @@ When applying image-to-image multiple times sequentially (often with a lower str
 - `-low`/`--lora-weight` can be used to specify the weights with which LoRA embeddings loaded via `-lop` are applied. Sometimes referred to as 'alpha'.
 - `-losc`/`--lora-schedule` will set a schedule for strength of LoRA-like models. Example uses include reducing the changes made to UNET outputs for the last steps with extension models that degrade image quality (e.g.`th7` schedule). This shares scheduler options with `-gsc`, see: [Diffusion Settings](#diffusion-settings). (Effective on adjustment models that contain extra modules, e.g. LoCon. Basic LoRAs are not affected, as their weights are applied directly to the model.)
 ### ControlNet
-- `-com`/`--controlnet-model` can be used to specify a name, path or hub id pointing to a ControlNet model to apply. Custom names can be added to the global variable `CONTROLNET_SHORTNAMES` near the top of `generate.py`. Available names are:
-  - SD 1.x: `"canny","depth","hed","mlsd","normal","openpose","scribble","seg"`, which resolve to their respective [lllyasviel/sd-controlnet](https://huggingface.co/lllyasviel) model. For examples, refer to the [lllyasviel/ControlNet](https://github.com/lllyasviel/ControlNet) repository.
-  - SD 2.1: `"sd21-canny","sd21-depth","sd21-hed","sd21-openpose","sd21-scribble","sd21-zoedepth","sd21-color"`, which resolve to their respective [thibaud/controlnet-sd21](https://huggingface.co/thibaud/controlnet-sd21) model.
+- `-com`/`--controlnet-model` can be used to specify a name, path or hub id pointing to a ControlNet model to apply. A directory name in the given repository may be specified via a `|` separator ('<user>/<reponame>|<subdir>'). Custom names can be added to the global variable `CONTROLNET_SHORTNAMES` near the top of `generate.py`. Available names are:
+  - SD 1.x:
+    - `"canny","depth","hed","mlsd","normal","openpose","scribble","seg"`, which resolve to their respective [lllyasviel/sd-controlnet](https://huggingface.co/lllyasviel) model. For examples, refer to the [lllyasviel/ControlNet](https://github.com/lllyasviel/ControlNet) repository.
+    - `"qrcode"`, which refers to [the SD1.5 qrcode controlnet by monster-labs](https://huggingface.co/monster-labs/control_v1p_sd15_qrcode_monster)
+  - SD 2.1:
+    - `"sd21-canny","sd21-depth","sd21-hed","sd21-openpose","sd21-scribble","sd21-zoedepth","sd21-color"`, which resolve to their respective [thibaud/controlnet-sd21](https://huggingface.co/thibaud/controlnet-sd21) model.
+  - SDXL:
+    - `"xl_canny","xl_canny_mid","xl_canny_small","xl_depth","xl_depth_mid","xl_depth_small","xl_zoedepth"`, which refer to their respective [SDXL controlnets (by diffusers)](https://huggingface.co/collections/diffusers/sdxl-controlnets-64f9c35846f3f06f5abe351f) models. models with suffixes `'_mid'` and `'_small'` are medium-size and small-size distilled variants.
+    - `"xl_qrcode"`, an [SDXL qrcode controlnet by monster-labs](https://huggingface.co/monster-labs/control_v1p_sdxl_qrcode_monster)
+    - `"xl_inpaint"`, an [SDXL inpainting controlnet by destitech](https://huggingface.co/destitech/controlnet-inpaint-dreamer-sdxl). Note that this model is in early alpha, and requires areas to be inpainted to be blank white in the input.
+    - `"xl_softedge"`, a [Softedge controlnet for SDXL by SargeZT](https://huggingface.co/SargeZT/controlnet-sd-xl-1.0-softedge-dexined)
+    - `"xl_openpose"`, an [Openpose controlnet for SDXL by thibaud](https://huggingface.co/thibaud/controlnet-openpose-sdxl-1.0)
 - `-coi`/`--controlnet-input` specifies a path pointing to an input image for the ControlNet.
-- `-cop`/`--controlnet-preprocessor` can be used to specify a preprocessor for ControlNet inputs, applied to the ControlNet input image. Available options are:
+- `-cop`/`--controlnet-preprocessor` can be used to specify a preprocessor for ControlNet inputs, applied to the ControlNet input image. (To support legacy applications, any preprocessors provided by `"controlnet_aux"` may optionally be specified with a `"detect_"` name prefix.) Available options are:
   - `"canny"`: Applies the Canny edge detector to the image before using it in the ControlNet. Performs a coarse, somewhat textured edge detection. Recommended when feeding regular images into a `"canny"` ControlNet model.
-  - `"detect_hed"`: Applies HED edge detection to the input image. Compared to `"canny"`, this will produce soft and smooth edge detection results. Recommended when feeding regular images into an `"hed"` Control net model. (Requires `controlnet_aux` library)
-  - `"detect_pose"`: Attempts to extract an openpose bone image from the input image. Can be used to perform 'pose-transfer'. Recommended when feeding regular images into an `"openpose"` Control net model. (Requires `controlnet_aux` library)
-  - `"detect_mlsd"`: Attempts to produce an M-LSD wireframe segmentation of the input image. Recommended when feeding regular images into an `"mlsd"` Control net model. (Requires `controlnet_aux` library)
+  - `"hed"`: Applies HED edge detection to the input image. Compared to `"canny"`, this will produce soft and smooth edge detection results. Recommended when feeding regular images into an `"hed"` ControlNet model. (Requires `controlnet_aux` library)
+  - `"pidi"`: Applies PiDiNet (PixelDifference) edge detection to the image. Recommended for feeding images into `"scribble"` ControlNet models. May also work well with other softedge or lineart models. (Requires `controlnet_aux` library)
+  - `"lineart"`: Attempts to produce lineart corresponding to the reference image. Recommended for feeding images into `"lineart"` ControlNet models. (Requires `controlnet_aux` library)
+  - `"lineart_anime"`: Attempts to produce lineart corresponding to the reference image, tuned on/for 'anime-style' images. Recommended for feeding images into `"lineart_anime"` ControlNet models. (Requires `controlnet_aux` library)
+  - `"mlsd"`: Attempts to produce an M-LSD wireframe segmentation of the input image. Recommended when feeding regular images into an `"mlsd"` ControlNet model. (Requires `controlnet_aux` library)
+  - `"midas"`: Computes an estimated depth map via MiDaS. Recommended for feeding images into `"midas-depth"` or otherwise unspecified `"depth"` ControlNet models. (Requires `controlnet_aux` library)
+  - `"zoe"`: Computes an estimated depth map via ZoeDepth. This is usually more precise and detailed than MiDaS depth estimates. Recommended for feeding images into `"zoe"` or `"zoedepth"` ControlNet models. As most generic `"depth"` ControlNet models tend to be trained on MiDaS depth estimates, using them with ZoeDepth estimation may yield degraded performance. (Requires `controlnet_aux` library)
+  - `"leres"`: Computes an estimated depth map via LeReS 3d scene shape estimation. This may provide more details than other depth estimation methods, especially on depth gradients. (Requires `controlnet_aux` library)
+  - `"normalbae"`: Computes an estimated normal map via 'Bae's estimation method'. Recommended for feeding images into `"normal"` or `"normalbae"` ControlNet models. (Requires `controlnet_aux` library)
+  - `"pose"`: Attempts to extract an openpose bone image from the input image. Can be used to perform 'pose-transfer'. Recommended when feeding regular images into an `"openpose"` ControlNet model. (Requires `controlnet_aux` library)
+  - `"shuffle"`: 'Shuffles' image content by 'distorting' it via a random flow pattern. Recommended for feeding images into `"shuffle"` ControlNet models. (Requires `controlnet_aux` library)
 - `-cost`/`--controlnet-strength` specifies the strength (guidance scale/cond_scale) with which the ControlNet guidance is applied.
 - `-cosc`/`--controlnet-schedule` can be used to specify a schedule for variable ControlNet strength. Default (None) corresponds to no schedule. This shares scheduler options with `-gsc`, see: [Diffusion Settings](#diffusion-settings).
 
