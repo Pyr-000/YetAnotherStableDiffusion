@@ -62,7 +62,7 @@ python download_model_files.py playgroundai/playground-v2-1024px-aesthetic --nam
 python download_model_files.py stabilityai/stable-diffusion-xl-base-1.0
 # download StableDiffusion v2.1 to 'models/stable-diffusion-2-1' (name inferred)
 python download_model_files.py stabilityai/stable-diffusion-2-1
-# download Playground v2.5 (see note above regarding requirements)
+# download Playground v2.5
 python download_model_files.py playgroundai/playground-v2.5-1024px-aesthetic --name playgroundv2-5_aesthetic
 ```
 - The script should function on 'standard' StableDiffusion models (SD1.x and SD2.x) as well as SDXL models or other models with an analogous architecture (e.g. [Playground v2](https://huggingface.co/playgroundai/playground-v2-1024px-aesthetic))

@@ -1157,7 +1157,7 @@ def generate_segmented(
         embeddings_list_prompt = []
         for raw_item in prompt:
             # create sequence of substrings followed by weight multipliers: substr,w,substr,w,... (w may be empty string - use default: 1, last trailing substr may be empty string)
-            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*\+?);", raw_item)
+            prompt_segments = re.split(";(-[\\.0-9]+|[\\.0-9]*\\+?);", raw_item)
             if len(prompt_segments) == 1:
                 # if the prompt does not specify multiple substrings with weights for mixing, run one encoding on default mode.
                 new_embedding_positive, new_io_data = perform_text_encode_wrapper(prompt_segments, **perform_encode_kwargs)
@@ -2596,7 +2596,7 @@ class QuickGenerator():
 
         # set/modify prompt weights with a given factor
         def process_prompt_weights(prompt,scale_mult):
-            prompt_segments = re.split(";(-[\.0-9]+|[\.0-9]*\+?);", prompt)
+            prompt_segments = re.split(";(-[\\.0-9]+|[\\.0-9]*\\+?);", prompt)
             if prompt_segments[-1] == "":
                 # if last prompt in sequence is terminated by a weight, remove trailing empty segment created by splitting.
                 prompt_segments = prompt_segments[:-1]
@@ -2779,13 +2779,13 @@ def process_prompt_segmentation(tokenizer, prompt, default_skip=0):
     token_weights = [1]
     token_skips = [default_skip]
     # split out segments where custom weights are defined. Use non-greedy content matching to identify the segment: '.+?'
-    weighted_segments = re.split("\((.+?:-?[\.0-9;]+)\)", prompt)
+    weighted_segments = re.split("\\((.+?:-?[\\.0-9;]+)\\)", prompt)
     for segment in weighted_segments:
         segment = segment.strip()
         # empty segments will exclusively show up with zero-length prompts, which produce one empty segment. Their handling can be ignored.
         segment_weight = 1
         segment_skip = default_skip
-        split_by_segment_weight = re.split(":(-?[\.0-9;]+)$",segment)
+        split_by_segment_weight = re.split(":(-?[\\.0-9;]+)$",segment)
         if len(split_by_segment_weight)>1:
             # should result in _exactly_ three segments: prompt, weight capture group, trailing empty segment (caused by the '\)$' at the end of the regex expression
             # multiple captures shall be impossible, as the regex requires the end of the string '$'
@@ -2914,11 +2914,11 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
     io_data = {}
 
     prompt = prompt.strip()
-    clip_skip_prompt_override = re.search('\{cls[0-9]+\}$', prompt) # match only '{cls<int>}' at the end of the prompt
+    clip_skip_prompt_override = re.search('\\{cls[0-9]+\\}$', prompt) # match only '{cls<int>}' at the end of the prompt
     if clip_skip_prompt_override is not None:
         clip_skip_layers = min(int(clip_skip_prompt_override[0][4:-1]), MAX_CLIP_SKIP) # take match, drop leading '{cls' and trailing '}'. Clamp to possible value limit
         # since this only matches on the end of the string, splitting multiple times on unfortunate prompts is not possible
-        prompt = re.split('\{cls[0-9]+\}$', prompt)[0]
+        prompt = re.split('\\{cls[0-9]+\\}$', prompt)[0]
     io_data["clip_skip_layers"] = [clip_skip_layers]
     # set rerun layers *after* checking for skip override. this allows producing of 'special tensors' with a trailing clip skip override
     rerun_self_kwargs = {"tokenizer":tokenizer, "text_encoder":text_encoder, "clip_skip_layers":clip_skip_layers,"pad_to_length":pad_to_length,"prefer_default_length":prefer_default_length,"no_layer_norm":no_layer_norm,"pooled_result":pooled_result}
