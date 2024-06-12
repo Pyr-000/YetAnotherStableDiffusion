@@ -25,6 +25,16 @@ pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingfac
 pip install git+https://github.com/cloneofsimo/lora.git
 ```
 
+> [!IMPORTANT] GPU acceleration on windows without CUDA
+> Experimental support for the [DirectML](https://github.com/microsoft/DirectML) backend (using [torch-directml](https://pypi.org/project/torch-directml/)) should allow windows users to use GPU acceleration on any DirectX 12 capable device without native pytorch support. (This should permit GPU acceleration on e.g. AMD Radeon GPUs)
+>
+> To use directML, install the `torch-directml` library: `pip install torch-directml`
+>
+> When CUDA is unavailable and the `torch-directml` library is detected, it should automatically be set as the default device. When specifying directML as a backend manually, use `"dml"` or `"directml"` as the device name.
+>
+> Note that some features may be broken. In preliminary testing, certain configurations were able to cause the `generate.py` to freeze entirely, neither crashing, nor proceeding. The process may need to be manually terminated when frozen. Known issues include:
+> - Generation can freeze at the text encoder stage when a LoRA is loaded and CPU offload is applied.
+
 #
 # Model Installation
 

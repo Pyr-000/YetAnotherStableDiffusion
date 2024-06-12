@@ -34,6 +34,7 @@ from tokens import get_huggingface_token
 import uuid
 from dataclasses import dataclass
 from json import loads as load_json_str
+from importlib import util as import_util
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -43,12 +44,13 @@ models_local_dir = "models/playgroundv2_aesthetic"
 using_local_unet, using_local_vae = False,False
 # location of textual inversion concepts (if present). (recursively) search for any .bin files. see see: https://huggingface.co/sd-concepts-library
 concepts_dir = "models/concepts"
+_DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "dml" if (import_util.find_spec("torch_directml") is not None) else "cpu"
 # one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl, ideep, hip, ve, ort, mps, xla, lazy, vulkan, meta, hpu
 # devices will be set by argparser if used.
-DIFFUSION_DEVICE = "cuda"
-IO_DEVICE = "cuda"
+DIFFUSION_DEVICE = _DEFAULT_DEVICE
+IO_DEVICE = _DEFAULT_DEVICE
 # execution device when offloading enabled. Required as a global for now.
-OFFLOAD_EXEC_DEVICE = "cuda"
+OFFLOAD_EXEC_DEVICE = _DEFAULT_DEVICE
 # display current image in img2img cycle mode via cv2.
 IMAGE_CYCLE_DISPLAY_CV2 = True
 # display preprocessed image via cv2 when utilising controlnet preprocessing
@@ -186,8 +188,8 @@ def parse_args():
     parser.add_argument("-S","--seed", type=str, default=None, help="initial noise seed for reproducing/modifying outputs (None will select a random seed)", dest="seed")
     parser.add_argument("--unet-full", action='store_false', help="Run diffusion UNET at full precision (fp32). Default is half precision (fp16). Increases memory load.", dest="half")
     parser.add_argument("--latents-half", action='store_true', help="Generate half precision latents (fp16). Default is full precision latents (fp32), memory usage will only reduce by <1MB. Outputs will be slightly different.", dest="half_latents")
-    parser.add_argument("--diff-device", type=str, default="cuda", help="Device for running diffusion process", dest="diffusion_device")
-    parser.add_argument("--io-device", type=str, default="cuda", help="Device for running text encoding and VAE decoding. Keep on CPU for reduced VRAM load.", dest="io_device")
+    parser.add_argument("--diff-device", type=str, default=DIFFUSION_DEVICE, help="Device for running diffusion process", dest="diffusion_device")
+    parser.add_argument("--io-device", type=str, default=IO_DEVICE, help="Device for running text encoding and VAE decoding. Keep on CPU for reduced VRAM load.", dest="io_device")
     parser.add_argument("--animate", action="store_true", help="save animation of generation process. Very slow unless --io_device is set to \"cuda\"", dest="animate")
     parser.add_argument("-in", "--interpolate", nargs=2, type=str, help="Two image paths for generating an interpolation animation", default=None, dest='interpolation_targets')
     parser.add_argument("-inx", "--interpolate_extend", type=float, help="Interpolate beyond the specified images in the latent space by the given factor. Disabled with 0. Unlikely to provide useful results.", default=0, dest='interpolation_extend')
@@ -233,12 +235,31 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    global DIFFUSION_DEVICE, IO_DEVICE
+    global DIFFUSION_DEVICE, IO_DEVICE, OFFLOAD_EXEC_DEVICE
     global model_id, models_local_dir
     global OUTPUT_DIR_BASE, OUTPUTS_DIR, INDIVIDUAL_OUTPUTS_DIR, UNPUB_DIR, ANIMATIONS_DIR
     global DEFAULT_NEGATIVE_PROMPT
     global ACTIVE_LORA, ACTIVE_LORA_WEIGHT
     args = parse_args()
+    try:
+        import torch_directml
+        device_handle = torch_directml.device()
+        device_names = ("dml","directml")
+        using_dml = False
+        if str(args.diffusion_device).lower().strip() in device_names:
+            args.diffusion_device = device_handle
+            using_dml = True
+        if str(args.io_device).lower().strip() in device_names:
+            args.io_device = device_handle
+            using_dml = True
+        if str(OFFLOAD_EXEC_DEVICE).lower().strip() in device_names:
+            OFFLOAD_EXEC_DEVICE = device_handle
+            using_dml = using_dml or args.cpu_offloading
+        if using_dml:
+            print(f"Using DirectML backend! This feature is currently experimental. It may break, and has been observed to freeze the application with no errors in some configurations.")
+        # offload may break with a LoRA loaded (application freezes during text encode)
+    except ImportError:
+        pass
     if args.cpu_offloading:
         args.diffusion_device, args.io_device = OFFLOAD_EXEC_DEVICE, OFFLOAD_EXEC_DEVICE
     DIFFUSION_DEVICE = args.diffusion_device
@@ -595,8 +616,6 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         else:
             unet = UNet2DConditionModel.from_pretrained(unet_model_id, subfolder="unet", use_auth_token=use_auth_token_unet)
 
-        if cpu_offloading:
-            cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         try:
             local_model_path = Path(models_local_dir)
             assert local_model_path.exists() and local_model_path.is_dir()
@@ -609,6 +628,8 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
             pass
         if unet_only:
             patch_wrapper(unet,None,None)
+            if cpu_offloading:
+                cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
             recurse_set_xformers(unet)
             return unet
 
@@ -716,6 +737,7 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
 
     # text encoder should be offloaded after adding custom embeddings to ensure that every embedding is actually on the same device.
     if cpu_offloading:
+        cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         if not isinstance(text_encoder, MultiTextEncoder):
             cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
@@ -1377,10 +1399,12 @@ def generate_segmented(
         eta_seed = eta_seed if eta_seed is not None else random.randint(1, 18446744073709500000)
         SUPPLEMENTARY["io"]["seed"] = seed
         SUPPLEMENTARY["io"]["eta_seed"] = eta_seed
-        generator_eta = torch.manual_seed(eta_seed)
-        if not IO_DEVICE == "meta":
+        try:
+            assert IO_DEVICE != "meta"
+            assert "privateuse" not in str(IO_DEVICE)
+            generator_eta = torch.manual_seed(eta_seed) # this freezes if a dml device is active.
             generator_unet = torch.Generator(IO_DEVICE).manual_seed(seed)
-        else:
+        except:
             generator_unet = torch.Generator("cpu").manual_seed(seed)
 
         sampling_loop_cast_device = UNET_DEVICE #if UNET_DEVICE != "meta" else OFFLOAD_EXEC_DEVICE
@@ -1492,7 +1516,7 @@ def generate_segmented(
                     try:
                         noise_pred = exec_unet_parallel(cast_unet_args, text_embeddings, unet_extra_kwargs, t, latent_model_input, down_block_residuals, mid_block_residual)
                     except RuntimeError as e:
-                        if 'out of memory' in str(e):
+                        if is_out_of_memory_exception(e):
                             unet_sequential_batch = True
                         else:
                             raise e
@@ -1695,7 +1719,7 @@ def generate_segmented(
                     vae.disable_tiling()
             return results
         except RuntimeError as e:
-            if 'out of memory' in str(e):
+            if is_out_of_memory_exception(e):
                 if not minimize_memory:
                     # recursively calling with slicing/tiling enabled after an OOM has occurred does not yield the expected memory reduction. Potential issue with releasing CUDA memory?
                     # exit local context, prompting the wrapper to call again with tiling and slicing enabled.
@@ -1813,7 +1837,7 @@ def generate_segmented(
             try:
                 return generate_two_step_wrapper(prompt=prompt,**exec_args)
             except RuntimeError as e:
-                if 'out of memory' in str(e) and len(prompt) > 1:
+                if is_out_of_memory_exception(e) and len(prompt) > 1:
                     # if an OOM error occurs with batch size >1 in parallel, retry sequentially.
                     tqdm.write("Generating batch in parallel ran out of memory! Switching to sequential generation! To run sequential generation from the start, specify '-seq'.")
                     sequential=True
@@ -2144,6 +2168,9 @@ class SafetyChecker():
         # backwards compatiblity, replacing the former get_safety_checker(*) with SafetyChecker(*)
         return self.check_safety(*args, **kwargs)
 
+
+def is_out_of_memory_exception(e:Exception) -> bool:
+    return 'out of memory' in str(e) or 'There is not enough GPU video memory available' in str(e)
 
 # return LAB colorspace array for image
 def image_to_correction_target(img):
@@ -3335,7 +3362,7 @@ class SafetyProcessor():
             self.segmentation_model.to("cpu")
             return prediction_maps
         except RuntimeError as e:
-            if 'out of memory' in str(e) and self.device !="cpu":
+            if is_out_of_memory_exception(e) and self.device !="cpu":
                 self.device="cpu"
                 return self.get_segmentation(img,prompts)
             else:

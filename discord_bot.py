@@ -46,8 +46,8 @@ available_gs_schedulers = clamp_opt_length(IMPLEMENTED_GS_SCHEDULES)
 # shortnames -> permitted loras (local path only)
 PERMITTED_LORAS = {x.stem:str(x) for x in list(Path("./lora").glob("*.safetensors"))[:25]}
 
-UNET_DEVICE = "cuda"
-IO_DEVICE = "cuda"
+UNET_DEVICE = generate.DIFFUSION_DEVICE
+IO_DEVICE = generate.IO_DEVICE
 SAVE_OUTPUTS_TO_DISK = True
 DEFAULT_HALF_PRECISION = True
 COMMAND_PREFIX = "generate"
