@@ -25,7 +25,8 @@ pip install --upgrade diffusers transformers scipy ftfy opencv-python huggingfac
 pip install git+https://github.com/cloneofsimo/lora.git
 ```
 
-> [!IMPORTANT] GPU acceleration on windows without CUDA
+> [!IMPORTANT]
+> ### GPU acceleration on windows without CUDA
 > Experimental support for the [DirectML](https://github.com/microsoft/DirectML) backend (using [torch-directml](https://pypi.org/project/torch-directml/)) should allow windows users to use GPU acceleration on any DirectX 12 capable device without native pytorch support. (This should permit GPU acceleration on e.g. AMD Radeon GPUs)
 >
 > To use directML, install the `torch-directml` library: `pip install torch-directml`
