@@ -3125,28 +3125,33 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
 
     return text_embeddings, io_data
 
-def reduce_gathered_vectors(vectors:list) -> torch.Tensor:
+def reduce_gathered_vectors(vectors:list, sigma:float=WINDOW_ENCODING_REDUCE_SIGMA) -> torch.Tensor:
     vector_count = len(vectors)
     if vector_count == 1:
         return vectors[0]
-    vector_weights = gaussian_distr_weights(vector_count, WINDOW_ENCODING_REDUCE_SIGMA)
-    vector_norms = [v.norm() for v in vectors]
-    assert len(vector_weights) == len(vectors), f"Gathered vector reduction produced {len(vector_weights)} weights for {len(vectors)} vectors"
-    if (abs(1.0-sum(vector_weights)) > 1e-5) and (not "VECTOR_MAGNITUDE_WARNING_PRINTED" in globals()):
-        print(f"Note: Vector weights when processing prompt window on token did not sum to 1: {sum(vector_weights)}")
-    vector = torch.sum(torch.stack([v*w for v,w in zip(vectors, vector_weights)]), dim=0)
-    if WINDOW_ENCODING_CORRECT_MAGNITUDE:
-        # use the same weights for correction
-        mean_vector_norm = torch.sum(torch.stack([n*w for n,w in zip(vector_norms, vector_weights)]))
-        vector *= mean_vector_norm/vector.norm()
-    return vector
+    if WINDOW_ENCODING_REDUCE_SIGMA is not None:
+        vector_weights = gaussian_distr_weights(vector_count, sigma)
+        vector_norms = [v.norm() for v in vectors]
+        assert len(vector_weights) == len(vectors), f"Gathered vector reduction produced {len(vector_weights)} weights for {len(vectors)} vectors"
+        if (abs(1.0-sum(vector_weights)) > 1e-5) and (not "VECTOR_MAGNITUDE_WARNING_PRINTED" in globals()):
+            print(f"Note: Vector weights when processing prompt window on token did not sum to 1: {sum(vector_weights)}")
+        vector = torch.sum(torch.stack([v*w for v,w in zip(vectors, vector_weights)]), dim=0)
+        if WINDOW_ENCODING_CORRECT_MAGNITUDE:
+            # use the same weights for correction
+            mean_vector_norm = torch.sum(torch.stack([n*w for n,w in zip(vector_norms, vector_weights)]))
+            vector *= mean_vector_norm/vector.norm()
+        return vector
+    else:
+        # for every dim/channel, pick the highest absolute value across all vectors.
+        stacked_vectors = torch.stack(vectors)
+        return stacked_vectors[stacked_vectors.abs().argmax(dim=0),torch.arange(stacked_vectors.shape[1])]
 
 @lru_cache(maxsize=128) # there can never be more than max_embeds (window size) vectors in one stack.
 def gaussian_distr_weights(n_items:int, sigma:float=None) -> float:
     return _gaussian_distr_weights(n_items, sigma)
 def _gaussian_distr_weights(n_items:int, sigma:float=None) -> float:
     assert n_items > 0, f"Unable to compute index weights for 0 items!"
-    sigma = sigma if sigma is not None else float(n_items)
+    sigma = sigma if sigma is not None and sigma >= 0 else float(n_items)
     if sigma <= 0:
         # with zero spread, 'pick' the center index
         results = [0.0]*n_items
