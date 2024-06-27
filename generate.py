@@ -35,6 +35,7 @@ import uuid
 from dataclasses import dataclass
 from json import loads as load_json_str
 from importlib import util as import_util
+from functools import lru_cache
 
 # for automated downloads via huggingface hub
 model_id = "CompVis/stable-diffusion-v1-4"
@@ -87,6 +88,14 @@ SIGMOID_GS_MULT_COMPRESSION = 50
 SDXL_NO_TOKEN_SKIP_ON_POOLED = True
 # Always run VAE in tiled and sliced mode. May help performance when overflowing into shared GPU memory instead of producing an OOM error
 ALWAYS_MINIMIZE_VAE_MEMORY = False
+# For prompts that go beyond the encoder token limit, use the previous chunked processing method instead of moving window encoding.
+USE_CHUNKED_LONG_PROMPTS = False
+# sigma value of the gaussian distribution used to mix embedding vectors of a token when using window encoding. The higher the value, the less the weighting prioritises the instances closest to the window center.
+WINDOW_ENCODING_REDUCE_SIGMA = 1.0
+# when using window encoding, after mixing embedding vectors of a token, correct norm to the mean norm of all source vectors (counteract potential vector magnitude shrinking due to mixing)
+WINDOW_ENCODING_CORRECT_MAGNITUDE = True
+# when processing very long prompts in window encoding mode, the batch may become very large (one batch item per token over 77). this may significantly boost speed (8-10x observed in preliminary testing, likely depends on hardware.).
+MODEL_OFFLOAD_TEXT_ENCODERS = True
 
 # Switch to using xformers attention if installed. Can be set to False to manually disable xformers attention regardless of availability.
 XFORMERS_ENABLED = True
@@ -764,10 +773,15 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         cpu_offload(unet, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         cpu_offload(vae, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
         if not isinstance(text_encoder, MultiTextEncoder):
-            cpu_offload(text_encoder, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+            encoders = [text_encoder]
         else:
-            for item in text_encoder.get_encoders():
+            encoders = text_encoder.get_encoders()
+        for item in encoders:
+            if not MODEL_OFFLOAD_TEXT_ENCODERS:
                 cpu_offload(item, execution_device=OFFLOAD_EXEC_DEVICE, offload_buffers=True)
+            else:
+                item.to("cpu")
+                setattr(item, "_MODEL_OFFLOAD_DEVICE", OFFLOAD_EXEC_DEVICE)
 
     # due to the recursive attribute search approach of recurse_set_xformers, it already works with MultiTextEncoder/MultiTokenizer
     recurse_set_xformers([tokenizer, text_encoder, unet, vae, rate_nsfw])
@@ -1187,6 +1201,7 @@ def generate_segmented(
     # done: read and respect force_zeros_for_empty_prompt attr of text encoder(s)
     @torch.no_grad()
     def encode_prompt(prompt, encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False, extended_length_enforce_minimum=False, drop_zero_weight_encodings=CONCAT_DROP_ZERO_WEIGHT_EMBEDDINGS):
+        encode_progress = tqdm(total=0, desc="Prompt encoding")
         # invalid (too small) lengths -> use model default
         static_length = tokenizer.model_max_length if (static_length is not None) and (static_length <= 2) else static_length
         perform_encode_kwargs = {
@@ -1194,6 +1209,7 @@ def generate_segmented(
             "text_encoder":text_encoder,
             "clip_skip_layers":clip_skip_layers,
             "pad_to_length":static_length,
+            "pbar":encode_progress,
             #"prefer_default_length":not dynamic_length_mode,
         }
         def io_data_template():
@@ -1322,6 +1338,10 @@ def generate_segmented(
                 prompt_embeds_list = [x.prompt_embeds for x in embeddings_list]
                 pooled_prompt_embeds_list = [x.pooled_prompt_embeds for x in embeddings_list]
                 return SDXLPromptEmbedding(pack_embeddings_list(prompt_embeds_list), pack_embeddings_list(pooled_prompt_embeds_list))
+
+        # We're done with prompt encoding.
+        encode_progress.close()
+        perform_encode_kwargs["pbar"] = None # remove reference to the closed progress bar
         # stack list of text encodings to be processed back into a tensor
         text_embeddings = pack_embeddings_list(embeddings_list_prompt)
         # get the resulting batch size
@@ -2757,12 +2777,12 @@ class QuickGenerator():
             animation_files_basepath = save_animations([frames])
         return out,SUPPLEMENTARY, (full_image, full_metadata, metadata_items)
 
-def perform_text_encode_wrapper(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False):
+def perform_text_encode_wrapper(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False, pbar:tqdm=None):
     prompt = unpack_encapsulated_lists(prompt) # [prompt] may end up being passed at the crossover point of interpolations
     if not isinstance(prompt, str):
         raise ValueError(f"prompt should be str, got {type(prompt)}: {prompt}")
     sdxl_conds = [isinstance(text_encoder, SDXLTextEncoder), isinstance(tokenizer, SDXLTokenizer), getattr(text_encoder, "is_SDXL", False)]
-    perform_enc_exec_args = {"prompt":prompt, "clip_skip_layers":clip_skip_layers, "pad_to_length":pad_to_length, "prefer_default_length":prefer_default_length}
+    perform_enc_exec_args = {"prompt":prompt, "clip_skip_layers":clip_skip_layers, "pad_to_length":pad_to_length, "prefer_default_length":prefer_default_length, "pbar":pbar}
     if not any(sdxl_conds):
         embeddings, io_data = perform_text_encode(tokenizer=tokenizer, text_encoder=text_encoder, **perform_enc_exec_args)
         # likely unnecessary, this attribute isn't really found outside of SDXL architectures
@@ -2778,6 +2798,8 @@ def perform_text_encode_wrapper(prompt, tokenizer, text_encoder, clip_skip_layer
         else: # is_SDXL property refers to the pipeline that diffusers would use being the SDXL pipeline.
             # SDXL pipeline: standard prompt embeds are seemingly non-normed and skip the last layer of CLIP by default
             base_exec_args = {**perform_enc_exec_args, "clip_skip_layers":max(perform_enc_exec_args["clip_skip_layers"], 1), "no_layer_norm":True}
+            if pbar is not None:
+                pbar.set_description(f"Prompt encoding (multistage)")
             embeddings_base, io_data_base = multiencoder_encode_wrapper(prompt, tokenizer, text_encoder, base_exec_args)
             # extra pooled_prompt_embeds contain the pooled final layer output regardless of CLIP skip setting.
             pooled_exec_args = {**perform_enc_exec_args, "clip_skip_layers":0, "no_layer_norm":False, "pooled_result":True}
@@ -2924,7 +2946,16 @@ def pool_hidden_state(hidden_state, input_ids, text_encoder):
         ]
     return pooled_output
 
-def encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, default_clip_skip:int=0, no_layer_norm:bool=False):
+def encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, default_clip_skip:int=0, no_layer_norm:bool=False, pbar:tqdm=None):
+    kwargs = locals()
+    if not hasattr(text_encoder, "_MODEL_OFFLOAD_DEVICE"):
+        return _encode_embedding_vectors(**kwargs)
+    else:
+        text_encoder.to(getattr(text_encoder, "_MODEL_OFFLOAD_DEVICE"))
+        result = _encode_embedding_vectors(**kwargs)
+        text_encoder.to("cpu")
+        return result
+def _encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, default_clip_skip:int=0, no_layer_norm:bool=False, pbar:tqdm=None):
     if all([skip <= 0 for skip in token_skips]): # a value of 0 (index: [-1]) would yield the final layer output, equivalent to default behavior
         # unpack state, batch dim from every encode
         processed_chunks = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask)[0][0] for text_chunk in text_chunks]
@@ -2935,13 +2966,21 @@ def encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_sk
     else:
         if not no_layer_norm:
             def norm_fn(hidden_states, skip_level):
-                return text_encoder.text_model.final_layer_norm(hidden_states[-(skip_level+1)])[0]
+                state = hidden_states[-(skip_level+1)].to(IO_DEVICE)
+                result = text_encoder.text_model.final_layer_norm(state)[0].cpu()
+                state.cpu()
+                return result
         else:
             def norm_fn(hidden_states, skip_level):
                 return hidden_states[-(skip_level+1)][0] # nn.LayerNorm in_shape == out_shape -> indexing remains the same
         # [text_encoder.text_model.final_layer_norm(text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states[-(clip_skip_layers+1)]) for text_chunk in text_chunks]
         # encode every chunk, retrieve all hidden layers
-        text_chunks_hidden_states = [text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states for text_chunk in text_chunks]
+        if pbar is not None:
+            pbar.total = len(text_chunks)+1 if not isinstance(pbar.total, int) else pbar.total+len(text_chunks)
+        text_chunks_hidden_states = []
+        for text_chunk in text_chunks:
+            text_chunks_hidden_states.append(tuple(state.cpu() for state in text_encoder(text_chunk.to(IO_DEVICE), attention_mask=attention_mask, output_hidden_states=True).hidden_states))
+            pbar.update(1)
         # embeddings must be available for any token skip level requested, as well as for the default skip level (applied on start/end/padding tokens)
         embedding_vectors = {
             required_skip_level : torch.cat([norm_fn(chunk_hidden_states, required_skip_level) for chunk_hidden_states in text_chunks_hidden_states])
@@ -2962,7 +3001,7 @@ def encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_sk
         return embedding_vectors, token_counts
 
 @torch.no_grad()
-def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False, no_layer_norm=False, pooled_result=False):
+def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad_to_length=None, prefer_default_length=False, no_layer_norm=False, pooled_result=False, pbar:tqdm=None):
     io_data = {}
 
     prompt = prompt.strip()
@@ -2973,7 +3012,7 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
         prompt = re.split('\\{cls[0-9]+\\}$', prompt)[0]
     io_data["clip_skip_layers"] = [clip_skip_layers]
     # set rerun layers *after* checking for skip override. this allows producing of 'special tensors' with a trailing clip skip override
-    rerun_self_kwargs = {"tokenizer":tokenizer, "text_encoder":text_encoder, "clip_skip_layers":clip_skip_layers,"pad_to_length":pad_to_length,"prefer_default_length":prefer_default_length,"no_layer_norm":no_layer_norm,"pooled_result":pooled_result}
+    rerun_self_kwargs = {"tokenizer":tokenizer, "text_encoder":text_encoder, "clip_skip_layers":clip_skip_layers,"pad_to_length":pad_to_length,"prefer_default_length":prefer_default_length,"no_layer_norm":no_layer_norm,"pooled_result":pooled_result,"pbar":pbar}
 
     # apply all prompt substitutions. Process longest substitution first, to avoid substring collisions.
     sorted_substitutions = sorted([(k,PROMPT_SUBST[k],uuid.uuid4()) for k in PROMPT_SUBST], key=lambda x: len(x[0]), reverse=True)
@@ -3024,11 +3063,6 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
     except:
         io_data["weights"] = ""
 
-    chunk_count = (len(text_input.input_ids[0]) // tokenizer.model_max_length) + (1 if (len(text_input.input_ids[0])%tokenizer.model_max_length) > 0 else 0)
-    text_chunks = torch.chunk(text_input.input_ids[0], chunk_count)
-    # reassemble chunk items into batches of size 1
-    text_chunks = [torch.stack([chunk]) for chunk in text_chunks]
-
     if hasattr(text_encoder.config, "use_attention_mask") and text_encoder.config.use_attention_mask:
         attention_mask = text_input.attention_mask.to(IO_DEVICE)
     else:
@@ -3038,11 +3072,49 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
         # the pooled embeds on SDXL are always at a skip of 0 regardless of requested skip level. Unless overriden by the global, ignore per-token skip settings.
         token_skips = [0 for _ in token_skips]
 
-    embedding_vectors, io_data["tokens"] = encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, clip_skip_layers, no_layer_norm)
+    tokens_count = len(text_input.input_ids[0])
+    tokens_limit = tokenizer.model_max_length
+    if tokens_count <= tokens_limit or USE_CHUNKED_LONG_PROMPTS:
+        chunk_count = (tokens_count // tokens_limit) + (1 if (tokens_count % tokens_limit) > 0 else 0)
+        text_chunks = torch.chunk(text_input.input_ids[0], chunk_count)
+        # reassemble chunk items into batches of size 1
+        text_chunks = [torch.stack([chunk]) for chunk in text_chunks]
+
+        embedding_vectors, io_data["tokens"] = encode_embedding_vectors(text_encoder, text_chunks, attention_mask, token_skips, clip_skip_layers, no_layer_norm, pbar)
+    else:
+        # TODO: maybe add a window stride for very long prompts?
+        # for every token beyond the limit, we will have to perform one extra forward pass in the encoder
+        sequences_count = 1 + (tokens_count - tokens_limit)
+        offset_sequences, concatenated_token_skips, token_indices = [], [], []
+        for i in range(sequences_count):
+            offset_sequences.append(text_input.input_ids[0][i:tokens_limit+i].unsqueeze(0))
+            concatenated_token_skips += token_skips[i:tokens_limit+i]
+            token_indices.append([i+index_in_sequence for index_in_sequence in range(tokens_limit)])
+        embedding_vectors_segments, _tokens = encode_embedding_vectors(text_encoder, offset_sequences, attention_mask, concatenated_token_skips, clip_skip_layers, no_layer_norm, pbar)
+        vectors_count = embedding_vectors_segments.shape[0]
+        assert vectors_count % tokens_limit == 0, f"Windowed text encode produced invalid result! Produced embedding length should match n*{tokens_limit} vectors, got {vectors_count}={vectors_count//tokens_limit}*{tokens_limit}+{vectors_count%tokens_limit}"
+        assert sequences_count == vectors_count // tokens_limit, f"Windowed text encode yielded {vectors_count//tokens_limit} output segments for {sequences_count} input segments!"
+        segments = torch.chunk(embedding_vectors_segments, sequences_count)
+        gathered_prompt_vectors = [list() for _ in range(tokens_count)]
+        for segment_indices, segment_vectors in zip(token_indices, segments):
+            for idx, vector in zip(segment_indices, segment_vectors):
+                gathered_prompt_vectors[idx].append(vector)
+        assert len(gathered_prompt_vectors) == tokens_count, f"Windowed text encode: {tokens_count} tokens produced {len(gathered_prompt_vectors)} embedding vectors!"
+        assert all([len(x)>0 for x in gathered_prompt_vectors]), f"Windowed text encode resulted in at least one index without any embedding vectors! ({len(gathered_prompt_vectors)} indices, {[i for i,x in enumerate(gathered_prompt_vectors) if len(x)==0]} are empty)"
+        embedding_vectors = [reduce_gathered_vectors(vs) for vs in gathered_prompt_vectors]
+        io_data["tokens"] = f"{tokens_count}({len(segments)}w)"
+        """
+        for i in range(tokens_count):
+            # the last segment which can still contain an embedding vector for token i is segment i (segment i+1 starts at token i+1)
+            # if there are less than i segments, the window never moves beyond token i. The last segment with an embedding vector will be the final segment.
+            last_segment_idx_with_vector = min(i, len(segments)-1)
+            # the first segment which could contain an embedding vector for token i is the segment that starts (tokens_limit-1) indices before i
+            first_segment_idx_with_vector = max(0, i - (tokens_limit-1))"""
 
     embedding_vectors = apply_embedding_vector_weights(embedding_vectors, token_weights)
     # repack batch dimension around the embedding vectors
-    text_embeddings = torch.stack([embedding_vectors])
+    text_embeddings = torch.stack([embedding_vectors]).to(IO_DEVICE)
+    torch.save(text_embeddings, f"{int(time()*10)}.pt")
 
     special_embeddings = get_special_embeddings(prompt.strip(), rerun_self_kwargs)
     if special_embeddings is not None:
@@ -3053,6 +3125,44 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
         text_embeddings = pool_hidden_state(text_embeddings, text_input.input_ids[0], text_encoder)
 
     return text_embeddings, io_data
+
+def reduce_gathered_vectors(vectors:list) -> torch.Tensor:
+    vector_count = len(vectors)
+    if vector_count == 1:
+        return vectors[0]
+    vector_weights = gaussian_distr_weights(vector_count, WINDOW_ENCODING_REDUCE_SIGMA)
+    vector_norms = [v.norm() for v in vectors]
+    assert len(vector_weights) == len(vectors), f"Gathered vector reduction produced {len(vector_weights)} weights for {len(vectors)} vectors"
+    if (abs(1.0-sum(vector_weights)) > 1e-5) and (not "VECTOR_MAGNITUDE_WARNING_PRINTED" in globals()):
+        print(f"Note: Vector weights when processing prompt window on token did not sum to 1: {sum(vector_weights)}")
+    vector = torch.sum(torch.stack([v*w for v,w in zip(vectors, vector_weights)]), dim=0)
+    if WINDOW_ENCODING_CORRECT_MAGNITUDE:
+        # use the same weights for correction
+        mean_vector_norm = torch.sum(torch.stack([n*w for n,w in zip(vector_norms, vector_weights)]))
+        vector *= mean_vector_norm/vector.norm()
+    return vector
+
+@lru_cache(maxsize=128) # there can never be more than max_embeds (window size) vectors in one stack.
+def gaussian_distr_weights(n_items:int, sigma:float=None) -> float:
+    return _gaussian_distr_weights(n_items, sigma)
+def _gaussian_distr_weights(n_items:int, sigma:float=None) -> float:
+    assert n_items > 0, f"Unable to compute index weights for 0 items!"
+    sigma = sigma if sigma is not None else float(n_items)
+    if sigma <= 0:
+        # with zero spread, 'pick' the center index
+        results = [0.0]*n_items
+        picked_idx = int(np.mean(range(n_items)))
+        results[picked_idx] = 1.0
+        return results
+    points = list(range(n_items))
+    mu = np.mean(points) # gaussian around the midpoint of all values
+    def value(x):
+        return np.exp(-(((x-mu)/sigma)**2)/2) #/ (np.sqrt(np.pi*2)*sigma) # we will norm the results anyways, this is not neccessary.
+    vals = [value(x) for x in points]
+    if sum(vals) <= 1e-23:
+        # when both the segment length and sigma are very small, we can end up causing divide by zero errors when norming the weights.
+        return _gaussian_distr_weights(n_items, sigma=sigma*2)
+    return [x/sum(vals) for x in vals]
 
 def get_special_embeddings(prompt, run_encode_kwargs):
     if prompt == "<damaged_uncond>":
