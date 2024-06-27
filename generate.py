@@ -3114,7 +3114,6 @@ def perform_text_encode(prompt, tokenizer, text_encoder, clip_skip_layers=0, pad
     embedding_vectors = apply_embedding_vector_weights(embedding_vectors, token_weights)
     # repack batch dimension around the embedding vectors
     text_embeddings = torch.stack([embedding_vectors]).to(IO_DEVICE)
-    torch.save(text_embeddings, f"{int(time()*10)}.pt")
 
     special_embeddings = get_special_embeddings(prompt.strip(), rerun_self_kwargs)
     if special_embeddings is not None:
