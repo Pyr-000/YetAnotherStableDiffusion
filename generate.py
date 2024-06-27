@@ -416,6 +416,10 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
     vae_model_id = model_id
     text_encoder_id = "openai/clip-vit-large-patch14" # sd 1.x default
     tokenizer_id = "openai/clip-vit-large-patch14" # sd 1.x default
+    xl_vae_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+    # pipe '|' splits the model path from the subdir here
+    xl_text_encoder_id = ("stabilityai/stable-diffusion-xl-base-1.0|text_encoder","stabilityai/stable-diffusion-xl-base-1.0|text_encoder_2")
+    xl_tokenizer_id = ("stabilityai/stable-diffusion-xl-base-1.0|tokenizer","stabilityai/stable-diffusion-xl-base-1.0|tokenizer_2")
     use_auth_token_unet=get_huggingface_token()
     use_auth_token_vae=get_huggingface_token()
 
@@ -430,6 +434,17 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
             print(f"Using local unet model files! ({models_local_dir})")
             unet_model_id = unet_dir
             using_local_unet = True
+            try:
+                unet_config_path = Path(unet_dir).joinpath("config.json")
+                assert unet_config_path.exists() and unet_config_path.is_file() # should always be true, we checked for model files when selecting 'local unet'
+                unet_config = load_json_str(unet_config_path.read_text())
+                if unet_config["addition_embed_type"] == "text_time":
+                    # somewhat crude SDXL check on the unet config, but this holds true for base SDXL and PGv2.5
+                    vae_model_id = xl_vae_model_id
+                    text_encoder_id = xl_text_encoder_id
+                    tokenizer_id = xl_tokenizer_id
+            except Exception:
+                pass
         else:
             print(f"Using unet '{unet_model_id}' (no local data present at {unet_dir})")
         vae_dir = os.path.join(models_local_dir, "vae")
@@ -451,7 +466,10 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                 text_encoder_id = text_encoder_dir
                 print(f"Using local text encoder! ({models_local_dir})")
         else:
-            print(f"Using text encoder '{text_encoder_id}' (no local data present at {text_encoder_dir})")
+            if not isinstance(text_encoder_id, tuple):
+                print(f"Using text encoder '{text_encoder_id}' (no local data present at {text_encoder_dir})")
+            else:
+                print(f"Using text encoder '{text_encoder_id[0].split('|')[0]} [SDXL]' (no local data present at {text_encoder_dir})")
         tokenizer_dir = os.path.join(models_local_dir, "tokenizer")
         tokenizer_2_dir = os.path.join(models_local_dir, "tokenizer_2")
         filegroups_tokenizer = [["merges.txt"],["vocab.json"]]
@@ -463,7 +481,10 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
                 print(f"Using local tokenizer! ({models_local_dir})")
                 tokenizer_id = tokenizer_dir
         else:
-            print(f"Using tokenizer '{tokenizer_id}' (no local data present at {tokenizer_dir})")
+            if not isinstance(tokenizer_id, tuple):
+                print(f"Using tokenizer '{tokenizer_id}' (no local data present at {tokenizer_dir})")
+            else:
+                print(f"Using tokenizer '{tokenizer_id[0].split('|')[0]} [SDXL]' (no local data present at {tokenizer_dir})")
 
         # crude check to find out if a v_prediction model is present. To be replaced by proper "model default config" at some point.
         global V_PREDICTION_MODEL
@@ -662,15 +683,18 @@ def load_models(half_precision=False, unet_only=False, cpu_offloading=False, vae
         # not SDXL
         tokenizer = CLIPTokenizer.from_pretrained(tokenizer_id)
         text_encoder = CLIPTextModel.from_pretrained(text_encoder_id)
-    elif all([isinstance(tokenizer_id, tuple), isinstance(text_encoder_id, tuple), len(tokenizer_id)==2, len(text_encoder_id)==2]):
-        tokenizer = SDXLTokenizer(*[CLIPTokenizer.from_pretrained(tok_id) for tok_id in tokenizer_id])
-        text_encoder = SDXLTextEncoder(*[CLIPTextModel.from_pretrained(te_id) for te_id in text_encoder_id])
-    else: # this case should currently be unreachable. Either the model dir is malformed, or someone released a new diffusion model with 3+ text encoders.
+    else:
         tokenizer_id = tokenizer_id if isinstance(tokenizer_id, tuple) else (tokenizer_id,)
         text_encoder_id = text_encoder_id if isinstance(text_encoder_id, tuple) else (text_encoder_id,)
-        assert len(tokenizer_id) == len(text_encoder_id), f"Tokenizer count {len(tokenizer_id)} must match TextEncoder count {len(text_encoder_id)}!"
-        tokenizer = MultiTokenizer(*[CLIPTokenizer.from_pretrained(tok_id) for tok_id in tokenizer_id])
-        text_encoder = MultiTextEncoder(*[CLIPTextModel.from_pretrained(te_id) for te_id in text_encoder_id])
+        tokenizers = [CLIPTokenizer.from_pretrained(tok_id) if "|" not in tok_id else CLIPTokenizer.from_pretrained(tok_id.split("|",1)[0], subfolder=tok_id.split("|",1)[1]) for tok_id in tokenizer_id]
+        text_encoders = [CLIPTextModel.from_pretrained(te_id) if "|" not in te_id else CLIPTextModel.from_pretrained(te_id.split("|",1)[0], subfolder=te_id.split("|",1)[1]) for te_id in text_encoder_id]
+        if len(tokenizers)==2 and len(text_encoders)==2:
+            tokenizer = SDXLTokenizer(*tokenizers)
+            text_encoder = SDXLTextEncoder(*text_encoders)
+        else: # this case should currently be unreachable. Either the model dir is malformed, or someone released a new diffusion model with 3+ text encoders.
+            assert len(tokenizer_id) == len(text_encoder_id), f"Tokenizer count {len(tokenizer_id)} must match TextEncoder count {len(text_encoder_id)}!"
+            tokenizer = MultiTokenizer(*tokenizers)
+            text_encoder = MultiTextEncoder(*text_encoders)
 
     force_zeros_for_empty_prompt = None
     is_SDXL = None
@@ -1389,6 +1413,7 @@ def generate_segmented(
         # truncate incorrect input dimensions to a multiple of 64
         if isinstance(prompt, str):
             prompt = [prompt]
+        prompt = [p.replace("\\n","\n") for p in prompt]
         height = int(height/8.0)*8
         width = int(width/8.0)*8
         SUPPLEMENTARY["io"]["height"] = height
@@ -3453,7 +3478,7 @@ class SDXLPromptEmbedding():
             raise NotImplementedError(f"Multiplication of two {type(self)} is not available.")
     def __truediv__(self, other):
         if not isinstance(other, SDXLPromptEmbedding):
-            return SDXLPromptEmbedding(self.prompt_embeds*other, self.pooled_prompt_embeds*other)
+            return SDXLPromptEmbedding(self.prompt_embeds/other, self.pooled_prompt_embeds/other)
         else:
             raise NotImplementedError(f"Division of two {type(self)} is not available.")
 
