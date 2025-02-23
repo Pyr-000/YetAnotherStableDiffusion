@@ -35,12 +35,14 @@ _controlnet_options_raw = list(CONTROLNET_SHORTNAMES.keys())
 _controlnet_options_preprocessors = {"canny":"canny","openpose":"detect_pose", "mlsd":"detect_mlsd", "hed":"detect_hed", "sd21-canny":"canny","sd21-openpose":"detect_pose", "sd21-hed":"detect_hed"}
 CONTROLNET_PREPROCESS_PREFIX = "process_"
 # split into two, because discord limits us to 25 options per parameter
-controlnet_options_sd1 = [opt for opt in _controlnet_options_raw if not opt.startswith("sd21-")] + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys() if not x.startswith("sd21-")]
+controlnet_options_sd1 = [opt for opt in _controlnet_options_raw if not opt.startswith("sd21-")] + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys() if not (x.startswith("sd21-") or x.startswith("xl_"))]
 controlnet_options_sd21 = [opt for opt in _controlnet_options_raw if opt.startswith("sd21-")] + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys() if x.startswith("sd21-")]
+controlnet_options_sdxl = [opt for opt in _controlnet_options_raw if opt.startswith("xl_")] + [f"{CONTROLNET_PREPROCESS_PREFIX}{x}" for x in _controlnet_options_preprocessors.keys() if x.startswith("xl_")]
 def clamp_opt_length(option_list):
     return [x for x in option_list if x is not None][:24]
 controlnet_options_sd1 = clamp_opt_length(controlnet_options_sd1)
 controlnet_options_sd21 = clamp_opt_length(controlnet_options_sd21)
+controlnet_options_sdxl = clamp_opt_length(controlnet_options_sdxl)
 available_schedulers = clamp_opt_length(IMPLEMENTED_SCHEDULERS)
 available_gs_schedulers = clamp_opt_length(IMPLEMENTED_GS_SCHEDULES)
 # shortnames -> permitted loras (local path only)

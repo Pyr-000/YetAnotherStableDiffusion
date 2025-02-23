@@ -264,6 +264,7 @@ python generate.py "a painting of a painter painting a painting"
     - `"th2"`, `"th5"`, `"th7"`: (smoothly) switching from 1 to 0 at a threshold of respectively 25%, 50% and 75% of the overall steps.
     - `"ith2"`, `"ith5"`, `"ith7"`: (smoothly) switching from 0 to 1 at a threshold of respectively 25%, 50% and 75% of the overall steps.
 - `-gr`/`--guidance-rescale` sets the guidance rescale factor 'φ' to improve image exposure distribution and (potentially _significantly_ increase adherence to both the prompt and training data). Disable with a value of 0. The authors of [the paper that introduces this correction (arxiv:2305.08891)](https://arxiv.org/abs/2305.08891) (see `(4)` and `5.2`) empirically recommend values between 0.5 and 0.75.
+- `-fup`/ `--freeu-parameters` specifies FreeU parameters b1, b2, s1, s2 in-order. Disabled with a value of 0 (or 0 0 0 0) by default. Set -1 to automatically select the defaults recommended by the authors of this enhancement. See: [ChenyangSi/FreeU](https://github.com/ChenyangSi/FreeU)
 
 ### Device, Performace and Optimization settings
 - `--unet-full` will switch from using a half precision (fp16) UNET to using a full precision (fp32) UNET. This will increase memory usage significantly.
@@ -345,6 +346,7 @@ When applying image-to-image multiple times sequentially (often with a lower str
     - `"xl_inpaint"`, an [SDXL inpainting controlnet by destitech](https://huggingface.co/destitech/controlnet-inpaint-dreamer-sdxl). Note that this model is in early alpha, and requires areas to be inpainted to be blank white in the input.
     - `"xl_softedge"`, a [Softedge controlnet for SDXL by SargeZT](https://huggingface.co/SargeZT/controlnet-sd-xl-1.0-softedge-dexined)
     - `"xl_openpose"`, an [Openpose controlnet for SDXL by thibaud](https://huggingface.co/thibaud/controlnet-openpose-sdxl-1.0)
+    - `"xl_union","xl_union_promax","xl_openpose_2","xl_tile","xl_depth_2","xl_canny_2","xl_lines","xl_scribble_anime"` which refer to their respective [SDXL controlnets by xinsir](https://huggingface.co/xinsir)
 - `-coi`/`--controlnet-input` specifies a path pointing to an input image for the ControlNet.
 - `-cop`/`--controlnet-preprocessor` can be used to specify a preprocessor for ControlNet inputs, applied to the ControlNet input image. (To support legacy applications, any preprocessors provided by `"controlnet_aux"` may optionally be specified with a `"detect_"` name prefix.) Available options are:
   - `"canny"`: Applies the Canny edge detector to the image before using it in the ControlNet. Performs a coarse, somewhat textured edge detection. Recommended when feeding regular images into a `"canny"` ControlNet model.
@@ -359,6 +361,7 @@ When applying image-to-image multiple times sequentially (often with a lower str
   - `"normalbae"`: Computes an estimated normal map via 'Bae's estimation method'. Recommended for feeding images into `"normal"` or `"normalbae"` ControlNet models. (Requires `controlnet_aux` library)
   - `"pose"`: Attempts to extract an openpose bone image from the input image. Can be used to perform 'pose-transfer'. Recommended when feeding regular images into an `"openpose"` ControlNet model. (Requires `controlnet_aux` library)
   - `"shuffle"`: 'Shuffles' image content by 'distorting' it via a random flow pattern. Recommended for feeding images into `"shuffle"` ControlNet models. (Requires `controlnet_aux` library)
+  - `"blur"`: Blurs image content using gaussian blur. Recommended for use with 'blur' or 'tile deblur' ControlNet models.
 - `-cost`/`--controlnet-strength` specifies the strength (guidance scale/cond_scale) with which the ControlNet guidance is applied.
 - `-cosc`/`--controlnet-schedule` can be used to specify a schedule for variable ControlNet strength. Default (None) corresponds to no schedule. This shares scheduler options with `-gsc`, see: [Diffusion Settings](#diffusion-settings).
 

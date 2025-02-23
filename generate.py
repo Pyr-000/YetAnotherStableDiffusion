@@ -91,7 +91,7 @@ ALWAYS_MINIMIZE_VAE_MEMORY = False
 # For prompts that go beyond the encoder token limit, use the previous chunked processing method instead of moving window encoding.
 USE_CHUNKED_LONG_PROMPTS = False
 # sigma value of the gaussian distribution used to mix embedding vectors of a token when using window encoding. The higher the value, the less the weighting prioritises the instances closest to the window center.
-WINDOW_ENCODING_REDUCE_SIGMA = 1.0
+WINDOW_ENCODING_REDUCE_SIGMA = 0.0
 # when using window encoding, after mixing embedding vectors of a token, correct norm to the mean norm of all source vectors (counteract potential vector magnitude shrinking due to mixing)
 WINDOW_ENCODING_CORRECT_MAGNITUDE = True
 # when processing very long prompts in window encoding mode, the batch may become very large (one batch item per token over 77). this may significantly boost speed (8-10x observed in preliminary testing, likely depends on hardware.).
@@ -141,7 +141,7 @@ try:
     }
 except ImportError:
     print(f"unable to import detector(s) for from 'controlnet_aux'. Please install the latest version via 'pip install controlnet_aux --upgrade'")
-IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny"] + list(control_processor_detector_map.keys())
+IMPLEMENTED_CONTROLNET_PREPROCESSORS = ["canny", "blur"] + list(control_processor_detector_map.keys())
 # short names for specifying controlnet models. will translate requests for name into requests for CONTROLNET_SHORTNAMES[name]
 # Controlnet V1 SD1.x
 CONTROLNET_SHORTNAMES = {name:f"lllyasviel/sd-controlnet-{name}" for name in ["canny","depth","hed","mlsd","normal","openpose","scribble","seg"]}
@@ -159,6 +159,13 @@ CONTROLNET_SHORTNAMES |= {
     }
 # SDXL controlnets - NOTE: the listed sdxl inpaint model requires areas to be inpainted to be blank white instead of blank black
 CONTROLNET_SHORTNAMES |= {"xl_openpose":"thibaud/controlnet-openpose-sdxl-1.0", "xl_softedge":"SargeZT/controlnet-sd-xl-1.0-softedge-dexined", "xl_inpaint":"destitech/controlnet-inpaint-dreamer-sdxl|v2"}
+CONTROLNET_SHORTNAMES |= {
+    "xl_union":"xinsir/controlnet-union-sdxl-1.0", "xl_union_promax":"xinsir/controlnet-union-sdxl-1.0|promax|pr/23",
+    "xl_openpose_2":"xinsir/controlnet-openpose-sdxl-1.0",
+    "xl_tile":"xinsir/controlnet-tile-sdxl-1.0",
+    "xl_depth_2":"xinsir/controlnet-depth-sdxl-1.0",
+    "xl_canny_2":"xinsir/controlnet-canny-sdxl-1.0", "xl_lines":"xinsir/controlnet-scribble-sdxl-1.0", "xl_scribble_anime":"xinsir/anime-painter",
+    }
 # Other Controlnets
 CONTROLNET_SHORTNAMES |= {"qrcode": "monster-labs/control_v1p_sd15_qrcode_monster|v2", "xl_qrcode": "monster-labs/control_v1p_sdxl_qrcode_monster"}
 
@@ -170,6 +177,14 @@ PROMPT_SUBST = {}
 # Custom combinations of "shortname":"substitution string", could be added here.
 CUSTOM_PROMPT_SUBST = {
     "<negative>":"ugly, tiling, poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, blurry, bad anatomy, blurred, watermark, grainy, signature, cut off, draft",
+}
+
+# Reference parameters: https://github.com/ChenyangSi/FreeU?tab=readme-ov-file#parameters - may need adjustment depending on custom models/usage/etc.
+# Authors recommend: b1 in [1.0, 1.2] (not reflective of their reference values?), b2 in [1.2, 1.6], s1 <= 1.0, s2 <= 1.0
+FREEU_DEFAULT_PARAMS = {
+    "SD1": {"b1": 1.5, "b2": 1.6, "s1": 0.9, "s2": 0.2}, # SD1.5 reference value
+    "SD2": {"b1": 1.4, "b2": 1.6, "s1": 0.9, "s2": 0.2},
+    "SDXL": {"b1": 1.3, "b2": 1.4, "s1": 0.9, "s2": 0.2},
 }
 
 # active LoRA, if any. Stored globally for easy access when writing metadata on outputs
@@ -220,6 +235,7 @@ def parse_args():
     parser.add_argument("-co", "--cpu-offload", action='store_true', help="Set to enable CPU offloading through accelerate. This should enable compatibility with minimal VRAM at the cost of speed.", dest="cpu_offloading")
     parser.add_argument("-gsc","--gs-schedule", type=str, default=None, choices=IMPLEMENTED_GS_SCHEDULES, help="Set a schedule for variable guidance scale. Default (None) corresponds to no schedule.", dest="gs_schedule")
     parser.add_argument("-ks","--karras-sigmas", type=bool, default=True, help="Set to have the scheduler use 'Karras Sigmas' if available.", dest="karras_sigmas")
+    parser.add_argument("-fup","--freeu-parameters", type=float, default=(0,0,0,0), nargs="+", help="Set FreeU parameters b1, b2, s1, s2. Set -1 to autoselect or 0 to disable.", dest="freeu_params")
     parser.add_argument("-om","--online-model", type=str, default=None, help="Set an online model id for acquisition from huggingface hub.", dest="online_model")
     parser.add_argument("-lm","--local-model", type=str, default=None, help="Set a path to a directory containing local model files (should contain unet and vae dirs, see local install in readme).", dest="local_model")
     parser.add_argument("-od","--output-dir", type=str, default=None, help="Set an override for the base output directory. The directory will be created if not already present.", dest="output_dir")
@@ -363,7 +379,7 @@ def main():
         args.negative_prompt_mixing, args.clip_skip_layers, args.static_length, args.mix_mode_concat,
         controlnet_model, args.controlnet_strength, args.controlnet_preprocessor, args.controlnet_schedule,
         args.safety_processing_level, args.guidance_rescale, args.second_pass_resize, args.second_pass_steps, args.second_pass_use_controlnet,
-        use_karras_sigmas=args.karras_sigmas, lora_schedule=args.lora_schedule
+        use_karras_sigmas=args.karras_sigmas, lora_schedule=args.lora_schedule, freeu_params=args.freeu_params
     )
 
     init_image = None if args.init_img_path is None else Image.open(args.init_img_path).convert("RGB")
@@ -1120,11 +1136,18 @@ def load_controlnet(source:str,device="cpu",cpu_offloading=False):
     source = CONTROLNET_SHORTNAMES.get(source, source)
     controlnet = None
     try:
-        if "|" in source:
-            source, subfolder = source.split("|",1)
+        extra_controlnet_load_kwargs = {}
+        if isinstance(source, (str, Path)):
+            if isinstance(source, str) and "|" in source:
+                _source = source.split("|")
+                source = _source[0]
+                if len(source) > 1:
+                    extra_controlnet_load_kwargs["subfolder"] = _source[1]
+                if len(source) > 2:
+                    extra_controlnet_load_kwargs["revision"] = _source[2]
+            controlnet = ControlNetModel.from_pretrained(source, torch_dtype=torch.float16, **extra_controlnet_load_kwargs).to(device)
         else:
-            subfolder =""
-        controlnet = ControlNetModel.from_pretrained(source, torch_dtype=torch.float16, subfolder=subfolder).to(device)
+            raise TypeError(f"Invalid type {type(source)} for controlnet source")
         if cpu_offloading:
             if not is_accelerate_available():
                 print("accelerate library is not installed! Unable to utilise CPU offloading!")
@@ -1147,6 +1170,10 @@ def controlnet_preprocess(image:Image.Image, width:int, height:int, preprocessor
         pass
     elif preprocessor == "canny":
         image = Image.fromarray(cv2.Canny(np.array(image),100,200)).convert("RGB")
+    elif preprocessor == "blur":
+        _kernel = int(np.round(np.sqrt(max(image.size)), decimals=0))
+        _kernel = _kernel if _kernel%2==1 else _kernel+1
+        image = Image.fromarray(cv2.GaussianBlur(np.array(image),(_kernel,_kernel),0)).convert("RGB")
     elif preprocessor in control_processor_detector_map or (isinstance(preprocessor, str) and preprocessor.startswith("detect_") and preprocessor.replace("detect_","",1) in control_processor_detector_map):
         processed = controlnet_aux_extractor(preprocessor,image)
         image = image if processed is None else processed
@@ -1384,12 +1411,36 @@ def generate_segmented(
             animate=False, init_image=None, img_strength=0.5, save_latents=False, gs_schedule=None, animate_pred_diff=True,
             encoder_level_negative_prompts=False, clip_skip_layers=0, static_length=None, mix_mode_concat=False,
             controlnet:ControlNetModel=None,controlnet_input=None,controlnet_strength=1.0,controlnet_preprocessor=None,controlnet_strength_scheduler=None,
-            guidance_rescale=0.66, use_karras_sigmas=True, lora_schedule=None, *args, **kwargs
+            guidance_rescale=0.66, use_karras_sigmas=True, lora_schedule=None, freeu_params=None,
+            *args, **kwargs
         ):
         gc.collect()
         if "cuda" in [IO_DEVICE, DIFFUSION_DEVICE] or ("meta" in [IO_DEVICE, DIFFUSION_DEVICE] and OFFLOAD_EXEC_DEVICE == "cuda"):
             torch.cuda.empty_cache()
         START_TIME = time()
+
+        if freeu_params is not None:
+            try:
+                model_type = "SDXL" if isinstance(text_encoder, SDXLTextEncoder) else "SD2" if V_PREDICTION_MODEL else "SD1"
+                if isinstance(freeu_params, (list,tuple)):
+                    freeu_params = [float(x) for x in list(freeu_params)[:4]]
+                    #b1, b2, s1, s2 - this unpacking order is consistent with the order in the FreeU repo - Diffusers seems to use args in order s1, s2, b1, b2
+                    freeu_params = get_freeu_params(*freeu_params, model_type=model_type)
+                elif isinstance(freeu_params, dict):
+                    freeu_params = get_freeu_params(**freeu_params, model_type=model_type)
+                else:
+                    _p = float(freeu_params) # should allow e.g. a single -1 as an input.
+                    get_freeu_params(_p,_p,_p,_p, model_type=model_type)
+                if all([v == 0 for k,v in freeu_params.items()]):
+                    freeu_params = None
+                else:
+                    unet.enable_freeu(**freeu_params)
+            except Exception as e:
+                print_exc()
+                print(f"Failed to apply FreeU for parameters: {freeu_params}: {e}")
+                freeu_params = None
+        if freeu_params is None:
+            unet.disable_freeu()
 
         SUPPLEMENTARY = {
             "io" : {
@@ -1410,6 +1461,7 @@ def generate_segmented(
                 "weights" : [],
                 "unet_model" : f"{models_local_dir} (local)" if using_local_unet else model_id,
                 "vae_model" : f"{models_local_dir} (local)" if using_local_vae else model_id,
+                "freeu": freeu_params,
                 "encoder_level_negative" : encoder_level_negative_prompts,
                 "clip_skip_layers" : [clip_skip_layers], # will be overridden by encode_prompt
                 "static_length" : static_length,
@@ -1705,7 +1757,7 @@ def generate_segmented(
             down_block_additional_residuals=down_block_residuals, mid_block_additional_residual=mid_block_residual,
         )["sample"]
 
-    def apply_controlnet(controlnet:diffusers_models.controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i=None, extra_cond_kwargs=None):
+    def apply_controlnet(controlnet, controlnet_input, controlnet_strength, controlnet_strength_scheduler, text_embeddings, t, latent_model_input, progress_factor, cast_unet_args, i=None, extra_cond_kwargs=None):
         incompatible = False
         if controlnet_input is not None:
             #if isinstance(text_embeddings, SDXLPromptEmbedding):
@@ -2199,7 +2251,7 @@ class SafetyChecker():
         assert len(images) == len(eval_results)
         if any([x["nsfw"]>0 for x in eval_results]):
             detected_nsfw_concepts = [{**item["nsfw_concepts"]["detected_concepts"], **{-1-k:x for k,x in item["special_care"]["detected_concepts"].items()}} for item in eval_results]
-            detected_concepts_repr = [str(item).replace(" ","").replace(":0.",":.") for item in detected_nsfw_concepts]
+            detected_concepts_repr = [str({k:f"{v:.4f}" for k,v in item.items()}).replace(" ","").replace(":0.",":.") for item in detected_nsfw_concepts]
             tqdm.write(f"Potential NSFW content detected! ({len([x['nsfw'] for x in eval_results if x['nsfw']>0])} instances, levels {[x['nsfw'] for x in eval_results]}, labels {detected_concepts_repr})")
         for image,result in zip(images, eval_results):
             # Due to potential detection reliability issues with using CLIPSeg directly on "bad concept" labels, the standard safety checker is first employed to detect label presence.
@@ -2471,12 +2523,14 @@ class QuickGenerator():
             second_pass_use_controlnet:bool=placeholder,
             use_karras_sigmas:bool=placeholder,
             lora_schedule:str=placeholder,
+            freeu_params:tuple=placeholder,
         ):
         settings = locals()
         # if no additional processing is performed on an option, automate setting it on self:
         unmodified_options = [
             "guidance_scale","seed","ddim_eta","eta_seed","animate","sequential_samples","save_latents","display_with_cv2","animate_pred_diff","encoder_level_negative_prompts","clip_skip_layers","static_length","mix_mode_concat",
             "controlnet","controlnet_strength","controlnet_preprocessor","controlnet_strength_scheduler","guidance_rescale","second_pass_resize","second_pass_steps","second_pass_use_controlnet", "use_karras_sigmas", "lora_schedule",
+            "freeu_params",
         ]
         for option in unmodified_options:
             if not isinstance(settings[option], Placeholder):
@@ -2597,6 +2651,7 @@ class QuickGenerator():
             second_pass_use_controlnet=self.second_pass_use_controlnet,
             use_karras_sigmas=self.use_karras_sigmas,
             lora_schedule=self.lora_schedule,
+            freeu_params=self.freeu_params,
         )
         argdict = SUPPLEMENTARY["io"]
         final_latent = SUPPLEMENTARY['latent']['final_latent']
@@ -2640,6 +2695,8 @@ class QuickGenerator():
             argdict.pop("sequential")
         if argdict.get("lora_schedule", "") is None:
             argdict.pop("lora_schedule")
+        if argdict.get("freeu") is None:
+            argdict.pop("freeu")
         full_image, full_metadata, metadata_items = save_output(prompts, out, argdict, save_images, final_latent, self.display_with_cv2)
         if self.animate:
             # init frames by image list
@@ -3630,6 +3687,14 @@ def cuda_memory_empty() -> bool:
                 global _PRINTED_CUDA_MEM_EMPTY_WARNING
                 _PRINTED_CUDA_MEM_EMPTY_WARNING = True
             return False
+
+def get_freeu_params(b1:float=-1, b2:float=-1, s1:float=-1, s2:float=-1, model_type:str=""):
+    model_type = model_type if model_type in ("SDXL", "SD2", "SD1") else "SDXL" # SDXL reference parameters are the lower than for SD1.5 / SD2.1. Use them as defaults when nothing is specified.
+    defaults = FREEU_DEFAULT_PARAMS.get(model_type, {"b1": 1.3, "b2": 1.4, "s1": 0.9, "s2": 0.2}) # sdxl reference default if the model name is missing from the defaults somehow
+    params = {"b1":b1, "b2":b2, "s1":s1, "s2":s2}
+    # start with the defaults, then override with the requested parameters (as long as they are >0)
+    params = {**defaults, **{k:float(v) for k,v in params.items() if float(v) >= 0}}
+    return params
 
 def choose_int(upper_bound:int):
     if upper_bound <= 1:
